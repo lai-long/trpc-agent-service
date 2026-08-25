@@ -12,6 +12,8 @@ coverage.html
 *.exe
 
 vendor/
+node_modules/
+cmd/testweb
 
 data/*
 !data/README.md
