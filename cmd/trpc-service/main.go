@@ -21,6 +21,7 @@ import (
 	plog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/storage"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/web"
+	sessionredis "trpc.group/trpc-go/trpc-agent-go/session/redis"
 )
 
 func main() {
@@ -77,6 +78,9 @@ func serve() error {
 	ch.RegisterRoutes(mux, web.EnqueueHandler{Stream: stream})
 	srv := &http.Server{Addr: cfg.HTTPAddr, Handler: mux}
 
+	processor, cleanup := buildProcessor(ctx, cfg)
+	defer cleanup()
+
 	consumer := fmt.Sprintf("%s-%d", "allinone", os.Getpid())
 	g, gctx := errgroup.WithContext(ctx)
 
@@ -88,7 +92,7 @@ func serve() error {
 		}
 		return nil
 	})
-	worker := &agent.Worker{Stream: stream, Processor: agent.EchoProcessor{}, Name: consumer + "-w"}
+	worker := &agent.Worker{Stream: stream, Processor: processor, Name: consumer + "-w"}
 	g.Go(func() error { return worker.Run(gctx) })
 
 	sender := &channels.Sender{
@@ -108,4 +112,34 @@ func serve() error {
 	})
 
 	return g.Wait()
+}
+
+// buildProcessor assembles the Runner-backed processor (llmagent + session/redis).
+// Falls back to EchoProcessor when the model key is missing, so the pipeline
+// stays demoable without LLM access. The returned cleanup closes resources.
+func buildProcessor(ctx context.Context, cfg config.Config) (agent.Processor, func()) {
+	noop := func() {}
+
+	resolver := config.NewFileResolver(cfg.SecretsDir)
+	apiKey, err := resolver.Resolve(ctx, cfg.ModelAPIKeyRef)
+	if err != nil {
+		plog.Warnf("model key %q unavailable (%v), falling back to echo processor", cfg.ModelAPIKeyRef, err)
+		return agent.EchoProcessor{}, noop
+	}
+
+	sess, err := sessionredis.NewService(sessionredis.WithRedisClientURL("redis://" + cfg.RedisAddr))
+	if err != nil {
+		plog.Warnf("session service unavailable (%v), falling back to echo processor", err)
+		return agent.EchoProcessor{}, noop
+	}
+
+	p := agent.NewRunnerProcessor(agent.RunnerConfig{
+		AppName:        "trpc-service",
+		BaseURL:        cfg.ModelBaseURL,
+		APIKey:         apiKey,
+		ModelName:      cfg.ModelName,
+		SessionService: sess,
+	})
+	plog.Infof("runner processor ready (model=%s)", cfg.ModelName)
+	return p, func() { _ = p.Close(); _ = sess.Close() }
 }

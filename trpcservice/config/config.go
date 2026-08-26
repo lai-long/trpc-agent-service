@@ -22,6 +22,10 @@ type Config struct {
 	LogLevel   string // TRPC_LOG_LEVEL: debug/info/warn/error
 	LogFormat  string // TRPC_LOG_FORMAT: "json" for JSON output, anything else for console
 	SecretsDir string // TRPC_SECRETS_DIR: key directory for the local file-based SecretResolver
+
+	ModelBaseURL   string // TRPC_MODEL_BASE_URL: OpenAI-compatible endpoint (DeepSeek default)
+	ModelName      string // TRPC_MODEL_NAME: model name, e.g. deepseek-v4-flash (cheapest)
+	ModelAPIKeyRef string // TRPC_MODEL_APIKEY_REF: secret ref (NOT the key itself) resolved via SecretResolver
 }
 
 // Load reads configuration from environment variables, filling defaults for
@@ -36,6 +40,10 @@ func Load() Config {
 		LogLevel:   getenv("TRPC_LOG_LEVEL", "info"),
 		LogFormat:  getenv("TRPC_LOG_FORMAT", "console"),
 		SecretsDir: getenv("TRPC_SECRETS_DIR", "data/secrets"),
+
+		ModelBaseURL:   getenv("TRPC_MODEL_BASE_URL", "https://api.deepseek.com"),
+		ModelName:      getenv("TRPC_MODEL_NAME", "deepseek-v4-flash"),
+		ModelAPIKeyRef: getenv("TRPC_MODEL_APIKEY_REF", "deepseek-apikey"),
 	}
 }
 
