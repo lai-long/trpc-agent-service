@@ -14,6 +14,7 @@ coverage.html
 vendor/
 node_modules/
 cmd/testweb
+trpcservice/channels/testweb
 
 data/*
 !data/README.md
