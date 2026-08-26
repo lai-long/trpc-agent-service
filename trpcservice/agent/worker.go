@@ -1,7 +1,7 @@
-// Package agent owns agent definitions and Runner assembly. This file lands
-// the Worker skeleton first: consume stream:inbound, process, and produce to
-// stream:outbound. Processor is currently an echo placeholder, swapped for a
-// real implementation when the tRPC-Agent-Go Runner is integrated.
+// Package agent owns agent definitions and Runner assembly.
+//
+// The Worker consumes stream:inbound, processes each message through a
+// Processor, and produces replies to stream:outbound.
 package agent
 
 import (
@@ -18,15 +18,16 @@ import (
 )
 
 // Processor handles one inbound message and produces a reply.
-// During the MVP it is backed by EchoProcessor; the real implementation
-// assembles a runner.Runner (consume its event channel to completion, and
-// drain it after context cancellation to avoid goroutine leaks).
+// Runner-backed implementations must consume the framework event channel to
+// completion, and drain it after context cancellation, to avoid goroutine
+// leaks.
 type Processor interface {
 	Process(ctx context.Context, msg channels.InboundMessage) (channels.OutboundMessage, error)
 }
 
-// EchoProcessor echoes the input verbatim; it stands where the Runner will
-// be, to bring up the pipeline end to end.
+// EchoProcessor echoes the input verbatim. It exercises the pipeline end to
+// end without LLM access and serves as the fallback when no model key is
+// configured.
 type EchoProcessor struct{}
 
 // Process implements Processor.
@@ -84,8 +85,7 @@ func (w *Worker) handle(ctx context.Context, m storage.Message) {
 	var msg channels.InboundMessage
 	if err := json.Unmarshal(m.Payload, &msg); err != nil {
 		// Poison message (can never be unmarshaled): Ack and drop it so it
-		// cannot block the queue with endless redeliveries. A dead-letter
-		// queue is on the backlog; the error log keeps it traceable for now.
+		// cannot block the queue with endless redeliveries.
 		plog.Errorf("worker %s drop poison message %s: %v", w.Name, m.ID, err)
 		_ = w.Stream.Ack(ctx, storage.StreamInbound, "workers", m.ID)
 		return

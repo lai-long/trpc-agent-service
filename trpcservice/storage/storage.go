@@ -2,9 +2,7 @@
 // platform's data layer.
 //
 // The storage layer owns the multi-backend implementations and tenant-level
-// routing of the Session/Memory/Knowledge/Artifact interfaces. This file
-// lands the basics first: Redis/PG connection construction with ping
-// (fail fast); upper-level semantics are added incrementally.
+// routing of the Session/Memory/Knowledge/Artifact interfaces.
 //
 // Only the cmd layer creates connections (constructed, injected and closed
 // at the process entry by role); business packages receive ready-made

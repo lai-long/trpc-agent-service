@@ -18,8 +18,7 @@ type SecretResolver interface {
 
 // FileResolver is the local-development implementation: ref is a file name
 // under SecretsDir and the file content (trimmed) is the plaintext secret.
-// Replace it with a KMS implementation in production; the interface stays
-// the same.
+// Production deployments use a KMS implementation of the same interface.
 type FileResolver struct {
 	dir string
 }

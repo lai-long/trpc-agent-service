@@ -1,6 +1,4 @@
 // Package web provides the Admin API and the Gateway HTTP entry points.
-// This file lands the Gateway's inbound handler first; the Admin API
-// (tenant/app/binding CRUD) comes later.
 package web
 
 import (
@@ -20,9 +18,8 @@ import (
 // An empty OutboundMessage.Text means "accepted, reply follows
 // asynchronously" (see the channels.Handler contract).
 //
-// The full version adds two steps before enqueue (simplified away in the
-// single-tenant MVP): tenant routing via a channel_binding lookup by
-// webhook_path, and per-tenant token-bucket rate limiting.
+// Tenant routing (channel_binding lookup by webhook_path) and per-tenant
+// token-bucket rate limiting belong before the enqueue.
 type EnqueueHandler struct {
 	Stream *storage.Stream
 }

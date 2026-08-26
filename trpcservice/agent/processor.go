@@ -16,9 +16,8 @@ import (
 	plog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
 )
 
-// RunnerProcessor processes messages with the tRPC-Agent-Go runner.Runner
-// (replacing EchoProcessor). Session persistence is delegated to the
-// framework's session.Service (the MVP uses the session/redis backend).
+// RunnerProcessor processes messages with the tRPC-Agent-Go runner.Runner.
+// Session persistence is delegated to the framework's session.Service.
 type RunnerProcessor struct {
 	runner runner.Runner
 }
@@ -34,9 +33,8 @@ type RunnerConfig struct {
 	SessionService session.Service
 }
 
-// NewRunnerProcessor assembles llmagent + runner. Generation is non-streaming
-// (the MVP returns the full reply in one piece; IM long-reply splitting and
-// streaming cards are handled when the wecom/wechat channels land).
+// NewRunnerProcessor assembles llmagent + runner with non-streaming
+// generation: the full reply is returned in one piece.
 func NewRunnerProcessor(cfg RunnerConfig) *RunnerProcessor {
 	m := openai.New(cfg.ModelName,
 		openai.WithBaseURL(cfg.BaseURL),

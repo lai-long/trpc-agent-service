@@ -14,9 +14,7 @@ import (
 
 // Sender consumes stream:outbound as part of consumer group "senders" and
 // dispatches each message to the Send of its Channel. A message is Acked
-// only after a successful send; failures stay pending for retry (dead-letter
-// handling and outbound idempotency via the sent: key come in a later
-// iteration).
+// only after a successful send; failures stay pending for retry.
 type Sender struct {
 	Stream   *storage.Stream
 	Channels map[string]Channel // channel name → channel implementation
@@ -68,8 +66,7 @@ func (s *Sender) handle(ctx context.Context, m storage.Message) {
 	}
 
 	if err := ch.Send(ctx, msg); err != nil {
-		// No Ack: leave it pending for retry; duplicate sends are covered by
-		// outbound idempotency (sent: key, later iteration).
+		// No Ack: leave it pending for retry.
 		plog.Errorf("sender %s send via %s failed: %v", s.Name, msg.Channel, err)
 		return
 	}

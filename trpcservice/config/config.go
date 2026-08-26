@@ -29,9 +29,8 @@ type Config struct {
 }
 
 // Load reads configuration from environment variables, filling defaults for
-// unset ones. All items are currently optional (the mock pipeline needs
-// neither PG nor Redis); worker/admin roles should validate PGDSN/RedisAddr
-// themselves at startup and fail fast.
+// unset ones. Roles that need PG/Redis (gateway/worker/admin) validate those
+// fields at startup and fail fast.
 func Load() Config {
 	return Config{
 		HTTPAddr:   getenv("TRPC_HTTP_ADDR", ":8080"),
