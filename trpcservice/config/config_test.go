@@ -20,8 +20,8 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.LogLevel != "info" {
 		t.Errorf("LogLevel default = %q, want info", cfg.LogLevel)
 	}
-	if cfg.RedisAddr != "localhost:6379" {
-		t.Errorf("RedisAddr default = %q", cfg.RedisAddr)
+	if cfg.RedisAddr != "localhost:6380" {
+		t.Errorf("RedisAddr default = %q, want localhost:6380", cfg.RedisAddr)
 	}
 }
 

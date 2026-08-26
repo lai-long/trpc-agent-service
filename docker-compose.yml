@@ -1,0 +1,65 @@
+# Minimal runnable dev environment: PG + Redis + MinIO.
+# The trpc-service binary itself runs locally via `go run` / `./start.sh`
+# and is deliberately not in compose (easier debugging).
+#
+#   docker compose up -d      # start all dependencies
+#   docker compose down       # stop (data persists in named volumes)
+#   docker compose down -v    # stop and wipe data (init.sql reruns on next start)
+
+services:
+  postgres:
+    # Official pgvector image = postgres:16 + the vector extension
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: trpc
+      POSTGRES_PASSWORD: trpc-dev-only # local dev only; production goes through KMS
+      POSTGRES_DB: trpc
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Genesis script: executed only on first startup of an empty volume
+      - ./deploy/db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U trpc -d trpc"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7
+    # AOF everysec: persistence backstop for Streams, dedup keys and locks
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    ports:
+      # Host port 6379 is often taken by other local services; expose 6380 instead
+      - "6380:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  minio:
+    # Artifact file storage (S3-compatible)
+    image: minio/minio
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: trpc
+      MINIO_ROOT_PASSWORD: trpc-dev-only # local dev only
+    ports:
+      - "9000:9000" # S3 API
+      - "9001:9001" # console
+    volumes:
+      - miniodata:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  pgdata:
+  redisdata:
+  miniodata:

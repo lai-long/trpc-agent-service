@@ -32,7 +32,7 @@ func Load() Config {
 	return Config{
 		HTTPAddr:   getenv("TRPC_HTTP_ADDR", ":8080"),
 		PGDSN:      getenv("TRPC_PG_DSN", ""),
-		RedisAddr:  getenv("TRPC_REDIS_ADDR", "localhost:6379"),
+		RedisAddr:  getenv("TRPC_REDIS_ADDR", "localhost:6380"), // host 6379 is often taken by other local services; compose maps 6380
 		LogLevel:   getenv("TRPC_LOG_LEVEL", "info"),
 		LogFormat:  getenv("TRPC_LOG_FORMAT", "console"),
 		SecretsDir: getenv("TRPC_SECRETS_DIR", "data/secrets"),
