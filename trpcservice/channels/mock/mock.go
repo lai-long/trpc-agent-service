@@ -8,12 +8,14 @@ package mock
 import (
 	"context"
 	"encoding/json"
-	"log"
 	"net/http"
 	"sync"
 	"time"
 
+	"go.uber.org/zap"
+
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
+	plog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
 )
 
 // callbackRequest 是模拟 IM 平台推送过来的回调报文。
@@ -61,7 +63,8 @@ func (c *Channel) RegisterRoutes(mux *http.ServeMux, h channels.Handler) {
 
 		// 2. 幂等去重：对应设计 5.1.4 的 SETNX dedup:{channel}:{msg_id}。
 		if !c.markSeen(req.MsgID) {
-			log.Printf("[mock] duplicate msg %s dropped", req.MsgID)
+			zap.L().Warn("duplicate message dropped",
+				zap.String(plog.FieldChannel, c.Name()), zap.String(plog.FieldMsgID, req.MsgID))
 			// 重复消息照样回 success，让 IM 不再重推（设计 5.2.2）。
 			writeReply(w, "duplicate", "")
 			return
@@ -102,7 +105,11 @@ func (c *Channel) Send(_ context.Context, msg channels.OutboundMessage) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.sent = append(c.sent, msg)
-	log.Printf("[mock] send to %s: %q", msg.SessionKey, msg.Text)
+	zap.L().Info("reply sent",
+		zap.String(plog.FieldChannel, msg.Channel),
+		zap.String(plog.FieldSessionKey, msg.SessionKey),
+		zap.String(plog.FieldTraceID, msg.TraceID),
+		zap.String("text", msg.Text))
 	return nil
 }
 
