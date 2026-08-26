@@ -84,17 +84,23 @@ func (c *Channel) RegisterRoutes(mux *http.ServeMux, h channels.Handler) {
 			ReceivedAt: time.Now(),
 		}
 
-		// 4. Hand over to the upper layer (real: write to Redis Stream for a
-		//    worker to consume asynchronously; minimal: synchronous call with
-		//    the reply returned inline).
+		// 4. Hand over to the upper layer (formal chain: gateway enqueues to
+		//    stream:inbound and returns an empty "accepted" reply; sync/debug
+		//    path: the handler returns the reply inline).
 		out, err := h.Handle(r.Context(), msg)
 		if err != nil {
 			http.Error(w, "handle error: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
 
-		// 5. Send the reply (real: outbound queue → IM message/send; mock:
-		//    record it in the in-memory inbox).
+		// Empty reply = accepted, the reply is delivered asynchronously
+		// (see the Handler contract: sync ack + async consume).
+		if out.Text == "" {
+			writeReply(w, "accepted", "")
+			return
+		}
+
+		// 5. Sync reply path (debug): record it in the in-memory inbox.
 		if err := c.Send(r.Context(), out); err != nil {
 			http.Error(w, "send error: "+err.Error(), http.StatusInternalServerError)
 			return

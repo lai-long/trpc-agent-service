@@ -1,8 +1,10 @@
 // Package channels adapts IM platforms (WeCom, WeChat, Telegram, etc.)
 // into tRPC-Agent-Go Runner inputs, following the OpenClaw Channel model.
 //
-// 设计文档第 3 节：Channel Adapter 负责验签/加解密、消息编解码、调 IM 主动发送接口。
-// 本文件定义与具体 IM 无关的最小抽象，各通道（mock / wecom / ...）实现 Channel 接口。
+// A Channel Adapter owns signature verification, encryption/decryption,
+// message encoding/decoding, and the IM proactive-send API. This file
+// defines the minimal IM-agnostic abstraction; each channel (mock / wecom /
+// ...) implements the Channel interface.
 package channels
 
 import (
@@ -12,37 +14,40 @@ import (
 	"time"
 )
 
-// InboundMessage 是归一化后的入站消息。
-// 在完整架构中它是 stream:inbound 的载荷（设计 5.1.4），由 Gateway 写入队列；
-// 最基础版本中由 Channel 直接同步交给 Handler。
+// InboundMessage is a normalized inbound message.
+// In the full architecture it is the payload of stream:inbound, written by
+// the Gateway; in the minimal version the Channel hands it to the Handler
+// synchronously.
 type InboundMessage struct {
-	Channel    string    // 渠道类型：mock / wecom / wechat_kf ...
-	MsgID      string    // IM 平台消息 ID，用于幂等去重（dedup:{channel}:{msg_id}）
-	SessionKey string    // 应用内会话唯一键，见 SessionKey()
-	UserID     string    // IM 侧用户 ID（企微 external_userid / 微信 openid）
-	ChatID     string    // 群聊 ID，单聊为空
-	Text       string    // 文本内容（最基础版只支持文本）
-	TraceID    string    // 链路追踪 ID，贯穿回调→Worker→回复
-	ReceivedAt time.Time // 回调到达时间
+	Channel    string    // channel type: mock / wecom / wechat_kf ...
+	MsgID      string    // IM platform message ID, for idempotent dedup (dedup:{channel}:{msg_id})
+	SessionKey string    // unique conversation key within an app, see SessionKey()
+	UserID     string    // user ID on the IM side (wecom external_userid / wechat openid)
+	ChatID     string    // group chat ID; empty for direct chats
+	Text       string    // text content (the minimal version supports text only)
+	TraceID    string    // trace ID, spanning callback → Worker → reply
+	ReceivedAt time.Time // when the callback arrived
 }
 
-// OutboundMessage 是归一化后的出站回复。
-// 在完整架构中它由 Worker 写入 stream:outbound，发送方消费后调 IM 主动发送接口；
-// 最基础版本中由 Handler 直接返回，Channel 同步调用 Send 发出。
+// OutboundMessage is a normalized outbound reply.
+// In the full architecture the Worker writes it to stream:outbound and a
+// sender delivers it via the IM proactive-send API; in the minimal version
+// the Handler returns it and the Channel sends it synchronously.
 type OutboundMessage struct {
-	Channel    string // 回哪个渠道
-	SessionKey string // 回复所属会话（出站幂等键 sent:{session_id}:{event_seq} 的组成部分）
-	UserID     string // 接收人（单聊必填）
-	ChatID     string // 接收群（群聊必填）
+	Channel    string // which channel to reply on
+	SessionKey string // conversation the reply belongs to (part of the outbound idempotency key sent:{session_id}:{event_seq})
+	UserID     string // recipient (required for direct chats)
+	ChatID     string // recipient group (required for group chats)
 	Text       string
 	TraceID    string
 }
 
-// SessionKey 生成会话唯一键（设计 5.1.3）：
-//   - 单聊：dm:{channel}:{user_id}，同一用户跨天复用同一会话
-//   - 群聊：group:{channel}:{chat_id}，机器人在群里的上下文按群共享
+// SessionKey builds the unique conversation key:
+//   - direct chat: dm:{channel}:{user_id} — a user reuses one session across days
+//   - group chat: group:{channel}:{chat_id} — the bot's context is shared per group
 //
-// 会话唯一性最终由 (app_id, session_key) 保证，app 隶属租户，跨租户天然隔离。
+// Uniqueness is ultimately enforced by (app_id, session_key); since an app
+// belongs to a tenant, isolation across tenants comes for free.
 func SessionKey(channel, userID, chatID string) string {
 	if chatID != "" {
 		return fmt.Sprintf("group:%s:%s", channel, chatID)
@@ -50,14 +55,17 @@ func SessionKey(channel, userID, chatID string) string {
 	return fmt.Sprintf("dm:%s:%s", channel, userID)
 }
 
-// Handler 处理一条归一化入站消息并产出回复。
-// 后续版本中它由 Gateway（投递 Redis Stream）和 Worker（Runner 执行）协作实现；
-// 最基础版本里它是一个同步函数，便于打通最小闭环。
+// Handler processes one normalized inbound message.
+//
+// Reply contract: a non-empty OutboundMessage.Text is a synchronous reply
+// (the local debug path); an empty one means accepted, with the reply sent
+// asynchronously (the formal chain: the Gateway writes to stream:inbound
+// and the reply is delivered via stream:outbound).
 type Handler interface {
 	Handle(ctx context.Context, msg InboundMessage) (OutboundMessage, error)
 }
 
-// HandlerFunc 让普通函数可以直接用作 Handler。
+// HandlerFunc lets a plain function be used as a Handler.
 type HandlerFunc func(ctx context.Context, msg InboundMessage) (OutboundMessage, error)
 
 // Handle implements Handler.
@@ -65,13 +73,16 @@ func (f HandlerFunc) Handle(ctx context.Context, msg InboundMessage) (OutboundMe
 	return f(ctx, msg)
 }
 
-// Channel 对接一类 IM 平台。
-// 每个通道实现两个方向：RegisterRoutes 接 IM 回调（进来），Send 主动发消息（出去）。
+// Channel integrates one kind of IM platform.
+// Each channel implements both directions: RegisterRoutes receives IM
+// callbacks (inbound), Send proactively pushes messages (outbound).
 type Channel interface {
-	// Name 返回渠道标识，如 "mock"、"wecom"。
+	// Name returns the channel identifier, e.g. "mock", "wecom".
 	Name() string
-	// RegisterRoutes 把 IM 回调路由挂到 HTTP mux；收到消息后归一化并交给 h 处理。
+	// RegisterRoutes mounts the IM callback routes onto the HTTP mux;
+	// received messages are normalized and handed to h.
 	RegisterRoutes(mux *http.ServeMux, h Handler)
-	// Send 调用 IM 主动发送接口（企微 message/send、微信客服 kf 消息等），把回复送达用户。
+	// Send calls the IM proactive-send API (wecom message/send, wechat kf
+	// messages, etc.) to deliver the reply to the user.
 	Send(ctx context.Context, msg OutboundMessage) error
 }

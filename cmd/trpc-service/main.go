@@ -2,24 +2,34 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"go.uber.org/zap"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/agent"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels/mock"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/config"
 	plog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/storage"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/web"
 )
 
 func main() {
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
 		case "serve":
-			serve()
+			if err := serve(); err != nil {
+				zap.L().Fatal("serve exited", zap.Error(err))
+			}
 			return
 		case "-h", "--help":
 			fmt.Fprintf(os.Stderr, "usage: %s [serve]\n", os.Args[0])
@@ -32,32 +42,70 @@ func main() {
 	fmt.Fprintf(os.Stderr, "usage: %s [serve]\n", os.Args[0])
 }
 
-// serve 启动最基础的单进程服务：Mock Channel + echo Handler。
-// 后续演进：Handler 换成「写 Redis Stream」，另起 Worker 消费并调 Runner。
-func serve() {
+// serve runs the all-in-one role: gateway + worker + sender in one process,
+// backed by the Redis Streams from docker-compose.
+//
+// Chain (sync ack + async consume):
+//
+//	mock callback → EnqueueHandler → stream:inbound → Worker(echo) → stream:outbound → Sender → channel.Send
+func serve() error {
 	cfg := config.Load()
 	plog.Init(cfg.LogLevel, cfg.LogFormat != "json")
 	defer plog.Sync()
 
-	// echo Handler 站在将来 Worker/Runner 的位置，先用来打通链路。
-	echo := channels.HandlerFunc(func(_ context.Context, msg channels.InboundMessage) (channels.OutboundMessage, error) {
-		return channels.OutboundMessage{
-			Channel:    msg.Channel,
-			SessionKey: msg.SessionKey,
-			UserID:     msg.UserID,
-			ChatID:     msg.ChatID,
-			Text:       "echo: " + msg.Text,
-			TraceID:    msg.TraceID,
-		}, nil
-	})
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	// Infra connections are created here at the entry point, then injected;
+	// business packages never dial by themselves.
+	rdb, err := storage.NewRedis(ctx, cfg.RedisAddr)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = rdb.Close() }()
+
+	stream := storage.NewStream(rdb)
+	if err := stream.EnsureGroup(ctx, storage.StreamInbound, "workers"); err != nil {
+		return err
+	}
+	if err := stream.EnsureGroup(ctx, storage.StreamOutbound, "senders"); err != nil {
+		return err
+	}
 
 	ch := mock.New()
 	mux := http.NewServeMux()
-	ch.RegisterRoutes(mux, echo)
+	ch.RegisterRoutes(mux, web.EnqueueHandler{Stream: stream})
+	srv := &http.Server{Addr: cfg.HTTPAddr, Handler: mux}
 
-	zap.L().Info("listening",
-		zap.String("addr", cfg.HTTPAddr), zap.String("mock_callback", "POST /mock/callback"))
-	if err := http.ListenAndServe(cfg.HTTPAddr, mux); err != nil {
-		zap.L().Fatal("server exited", zap.Error(err))
+	consumer := fmt.Sprintf("%s-%d", "allinone", os.Getpid())
+	g, gctx := errgroup.WithContext(ctx)
+
+	g.Go(func() error {
+		zap.L().Info("listening",
+			zap.String("addr", cfg.HTTPAddr), zap.String("mock_callback", "POST /mock/callback"))
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			return err
+		}
+		return nil
+	})
+	worker := &agent.Worker{Stream: stream, Processor: agent.EchoProcessor{}, Name: consumer + "-w"}
+	g.Go(func() error { return worker.Run(gctx) })
+
+	sender := &channels.Sender{
+		Stream:   stream,
+		Channels: map[string]channels.Channel{ch.Name(): ch},
+		Name:     consumer + "-s",
 	}
+	g.Go(func() error { return sender.Run(gctx) })
+
+	// Graceful shutdown: stop pulling new messages first, let in-flight
+	// processing finish, then close the HTTP server.
+	g.Go(func() error {
+		<-gctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		return srv.Shutdown(shutdownCtx)
+	})
+
+	return g.Wait()
 }
