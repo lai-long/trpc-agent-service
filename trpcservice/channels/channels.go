@@ -17,25 +17,27 @@ import (
 // InboundMessage is a normalized inbound message: the Channel builds it from
 // the platform-specific callback payload and hands it to the Handler.
 type InboundMessage struct {
-	Channel    string    // channel type: mock / wecom / wechat_kf ...
-	MsgID      string    // IM platform message ID, for idempotent dedup (dedup:{channel}:{msg_id})
-	SessionKey string    // unique conversation key within an app, see SessionKey()
-	UserID     string    // user ID on the IM side (wecom external_userid / wechat openid)
-	ChatID     string    // group chat ID; empty for direct chats
-	Text       string    // text content
-	TraceID    string    // trace ID, spanning callback → Worker → reply
-	ReceivedAt time.Time // when the callback arrived
+	Channel     string    // channel type: mock / wecom / wechat_kf ...
+	MsgID       string    // IM platform message ID, for idempotent dedup (dedup:{channel}:{msg_id})
+	SessionKey  string    // unique conversation key within an app, see SessionKey()
+	UserID      string    // user ID on the IM side (wecom external_userid / wechat openid)
+	ChatID      string    // group chat ID; empty for direct chats
+	Text        string    // text content
+	TraceID     string    // trace ID, spanning callback → Worker → reply
+	TraceParent string    // W3C traceparent, carries the trace across the Stream boundary
+	ReceivedAt  time.Time // when the callback arrived
 }
 
 // OutboundMessage is a normalized outbound reply, produced by the Handler and
 // delivered through the Channel's Send.
 type OutboundMessage struct {
-	Channel    string // which channel to reply on
-	SessionKey string // conversation the reply belongs to (part of the outbound idempotency key sent:{session_id}:{event_seq})
-	UserID     string // recipient (required for direct chats)
-	ChatID     string // recipient group (required for group chats)
-	Text       string
-	TraceID    string
+	Channel     string // which channel to reply on
+	SessionKey  string // conversation the reply belongs to (part of the outbound idempotency key sent:{session_id}:{event_seq})
+	UserID      string // recipient (required for direct chats)
+	ChatID      string // recipient group (required for group chats)
+	Text        string
+	TraceID     string
+	TraceParent string // W3C traceparent, carried through to the outbound span
 }
 
 // SessionKey builds the unique conversation key:

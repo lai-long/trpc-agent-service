@@ -59,6 +59,21 @@ services:
       timeout: 5s
       retries: 10
 
+  jaeger:
+    # Trace backend for local dev: receives OTLP gRPC on 4317, UI on 16686.
+    # Point the service at it with OTEL_EXPORTER_OTLP_ENDPOINT=localhost:4317
+    # (gRPC exporter wants host:port, no scheme)
+    image: jaegertracing/jaeger:2.5.0
+    ports:
+      - "4317:4317"   # OTLP gRPC
+      - "4318:4318"   # OTLP HTTP
+      - "16686:16686" # UI
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:16686/api/services >/dev/null 2>&1 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
 volumes:
   pgdata:
   redisdata:

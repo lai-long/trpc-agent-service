@@ -26,19 +26,30 @@ func TestWorkerSenderRoundTrip(t *testing.T) {
 	defer func() { _ = rdb.Close() }()
 
 	stream := storage.NewStream(rdb)
-	if err := stream.EnsureGroup(ctx, storage.StreamInbound, "workers"); err != nil {
+	// Dedicated streams per test run: a concurrently running service consumes
+	// the platform streams, sharing them would race for messages.
+	inbound := "test:inbound:" + t.Name()
+	outbound := "test:outbound:" + t.Name()
+	t.Cleanup(func() {
+		rdb.Del(context.Background(), inbound, outbound)
+	})
+	if err := stream.EnsureGroup(ctx, inbound, "workers"); err != nil {
 		t.Fatal(err)
 	}
-	if err := stream.EnsureGroup(ctx, storage.StreamOutbound, "senders"); err != nil {
+	if err := stream.EnsureGroup(ctx, outbound, "senders"); err != nil {
 		t.Fatal(err)
 	}
 
 	mockCh := mock.New()
-	worker := &agent.Worker{Stream: stream, Processor: agent.EchoProcessor{}, Name: "test-w"}
+	worker := &agent.Worker{
+		Stream: stream, Processor: agent.EchoProcessor{}, Name: "test-w",
+		InStream: inbound, OutStream: outbound,
+	}
 	sender := &channels.Sender{
 		Stream:   stream,
 		Channels: map[string]channels.Channel{mockCh.Name(): mockCh},
 		Name:     "test-s",
+		InStream: outbound,
 	}
 	go func() { _ = worker.Run(ctx) }()
 	go func() { _ = sender.Run(ctx) }()
@@ -55,7 +66,7 @@ func TestWorkerSenderRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := stream.Add(ctx, storage.StreamInbound, payload); err != nil {
+	if _, err := stream.Add(ctx, inbound, payload); err != nil {
 		t.Fatal(err)
 	}
 

@@ -19,6 +19,7 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels/mock"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/config"
 	plog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/metrics"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/storage"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/web"
 	sessionredis "trpc.group/trpc-go/trpc-agent-go/session/redis"
@@ -56,6 +57,17 @@ func serve() error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// Tracing goes up before anything that emits spans. Endpoint comes from
+	// OTEL_EXPORTER_OTLP_ENDPOINT; the platform adds spans around the callback,
+	// the Stream hop and the send, on top of the framework's own spans.
+	shutdownTrace, err := metrics.InitTracing(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = shutdownTrace()
+	}()
 
 	// Infra connections are created here at the entry point, then injected;
 	// business packages never dial by themselves.
@@ -136,7 +148,13 @@ func buildProcessor(ctx context.Context, cfg config.Config) (agent.Processor, fu
 		return agent.EchoProcessor{}, noop
 	}
 
-	sess, err := sessionredis.NewService(sessionredis.WithRedisClientURL("redis://" + cfg.RedisAddr))
+	// WithEnableTracing is required beyond observability: with tracing disabled,
+	// the session service's startSpan falls back to the caller's active span and
+	// its defer span.End() would end OUR worker span prematurely (framework quirk).
+	sess, err := sessionredis.NewService(
+		sessionredis.WithRedisClientURL("redis://"+cfg.RedisAddr),
+		sessionredis.WithEnableTracing(true),
+	)
 	if err != nil {
 		plog.Warnf("session service unavailable (%v), falling back to echo processor", err)
 		return agent.EchoProcessor{}, noop

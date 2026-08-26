@@ -6,9 +6,16 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/propagation"
+
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/metrics"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/storage"
 )
+
+var tracer = otel.Tracer("trpc-agent-service/gateway")
 
 // EnqueueHandler implements channels.Handler as the Gateway's inbound core
 // (sync ack + async consume): a message is written to stream:inbound and
@@ -25,7 +32,24 @@ type EnqueueHandler struct {
 }
 
 // Handle implements channels.Handler.
+//
+// Starts the root span of the message trace and stamps the message with the
+// real trace ID + traceparent, so the Worker continues the same trace after
+// the async Stream hop.
 func (h EnqueueHandler) Handle(ctx context.Context, msg channels.InboundMessage) (channels.OutboundMessage, error) {
+	ctx, span := tracer.Start(ctx, "gateway.enqueue")
+	defer span.End()
+	span.SetAttributes(
+		attribute.String("channel", msg.Channel),
+		attribute.String("session_key", msg.SessionKey),
+		attribute.String("user_id", msg.UserID),
+	)
+
+	msg.TraceID = span.SpanContext().TraceID().String()
+	carrier := propagation.MapCarrier{}
+	metrics.InjectTraceparent(ctx, carrier)
+	msg.TraceParent = carrier.Get("traceparent")
+
 	payload, err := json.Marshal(msg)
 	if err != nil {
 		return channels.OutboundMessage{}, fmt.Errorf("marshal inbound message: %w", err)
