@@ -48,7 +48,7 @@ func main() {
 //
 // Chain (sync ack + async consume):
 //
-//	mock callback → EnqueueHandler → stream:inbound → Worker(echo) → stream:outbound → Sender → channel.Send
+//	mock callback → EnqueueHandler → stream:inbound → Worker(Runner) → stream:outbound → Sender → channel.Send
 func serve() error {
 	cfg := config.Load()
 	plog.Init(cfg.LogLevel, cfg.LogFormat != "json")
@@ -76,7 +76,16 @@ func serve() error {
 	ch := mock.New()
 	mux := http.NewServeMux()
 	ch.RegisterRoutes(mux, web.EnqueueHandler{Stream: stream})
-	srv := &http.Server{Addr: cfg.HTTPAddr, Handler: mux}
+	srv := &http.Server{
+		Addr:    cfg.HTTPAddr,
+		Handler: mux,
+		// Timeouts against slow/lazy clients (Slowloris): callback bodies are
+		// small and replies are immediate in the async chain, so tight limits
+		// are safe. WriteTimeout stays unset to leave room for future SSE.
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
 
 	processor, cleanup := buildProcessor(ctx, cfg)
 	defer cleanup()

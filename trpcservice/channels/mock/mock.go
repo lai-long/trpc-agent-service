@@ -1,9 +1,8 @@
 // Package mock provides a Mock Channel that depends on no real IM platform.
 //
-// It exists so the full pipeline (callback → normalization → handling →
-// reply) can be exercised before a real WeCom test account is available;
-// the real adapter later just implements the same channels.Channel
-// interface and slots in.
+// It exercises the full pipeline (callback → normalization → handling →
+// reply) without external IM accounts; a real adapter implements the same
+// channels.Channel interface and slots in.
 package mock
 
 import (
@@ -45,12 +44,7 @@ func (c *Channel) Name() string { return "mock" }
 // RegisterRoutes implements channels.Channel.
 // POST /mock/callback simulates the IM webhook callback.
 func (c *Channel) RegisterRoutes(mux *http.ServeMux, h channels.Handler) {
-	mux.HandleFunc("/mock/callback", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
+	mux.HandleFunc("POST /mock/callback", func(w http.ResponseWriter, r *http.Request) {
 		// 1. Decode the IM callback payload (a real implementation verifies
 		//    the signature and decrypts before this step).
 		var req callbackRequest
