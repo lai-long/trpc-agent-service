@@ -59,6 +59,36 @@ type Worker struct {
 
 	InStream  string // empty means storage.StreamInbound
 	OutStream string // empty means storage.StreamOutbound
+
+	// ReapInterval is how often pending messages are scanned for takeover.
+	// MaxIdle is how long a message must stay pending before it counts as
+	// orphaned; it must exceed the p95 processing time, or healthy in-flight
+	// work would be double-processed. MaxAttempts caps redeliveries before a
+	// message is dead-lettered.
+	ReapInterval time.Duration
+	MaxIdle      time.Duration
+	MaxAttempts  int64
+}
+
+func (w *Worker) reapInterval() time.Duration {
+	if w.ReapInterval > 0 {
+		return w.ReapInterval
+	}
+	return 30 * time.Second
+}
+
+func (w *Worker) maxIdle() time.Duration {
+	if w.MaxIdle > 0 {
+		return w.MaxIdle
+	}
+	return 10 * time.Minute
+}
+
+func (w *Worker) maxAttempts() int64 {
+	if w.MaxAttempts > 0 {
+		return w.MaxAttempts
+	}
+	return 5
 }
 
 func (w *Worker) inStream() string {
@@ -76,10 +106,18 @@ func (w *Worker) outStream() string {
 }
 
 // Run consumes until ctx is canceled; a nil return means a clean shutdown.
+// Every reapInterval it also takes over pending messages orphaned by crashed
+// consumers (XCLAIM semantics via XAUTOCLAIM).
 func (w *Worker) Run(ctx context.Context) error {
+	lastReap := time.Now()
 	for {
 		if ctx.Err() != nil {
 			return nil
+		}
+
+		if time.Since(lastReap) >= w.reapInterval() {
+			w.reap(ctx)
+			lastReap = time.Now()
 		}
 
 		msgs, err := w.Stream.Read(ctx, w.inStream(), "workers", w.Name, 10, 2*time.Second)
@@ -157,4 +195,35 @@ func (w *Worker) handle(ctx context.Context, m storage.Message) {
 	zap.L().Debug("message processed",
 		zap.String(plog.FieldSessionKey, msg.SessionKey),
 		zap.String(plog.FieldTraceID, msg.TraceID))
+}
+
+// reap takes over pending messages idle longer than maxIdle (their consumers
+// crashed) and reprocesses them. A message that keeps failing past
+// maxAttempts is dead-lettered so it cannot loop forever.
+func (w *Worker) reap(ctx context.Context) {
+	if err := w.Stream.EnsureGroup(ctx, w.inStream(), "workers"); err != nil {
+		plog.Warnf("worker %s ensure group before reap: %v", w.Name, err)
+		return
+	}
+	msgs, err := w.Stream.AutoClaim(ctx, w.inStream(), "workers", w.Name, w.maxIdle(), 50)
+	if err != nil {
+		plog.Warnf("worker %s autoclaim: %v", w.Name, err)
+		return
+	}
+	for _, m := range msgs {
+		attempts, err := w.Stream.Attempts(ctx, w.inStream(), m.ID)
+		if err != nil {
+			plog.Warnf("worker %s count attempts %s: %v", w.Name, m.ID, err)
+			continue
+		}
+		if attempts > w.maxAttempts() {
+			plog.Errorf("worker %s dead-letters %s after %d attempts", w.Name, m.ID, attempts)
+			if err := w.Stream.DeadLetter(ctx, w.inStream(), "workers", m); err != nil {
+				plog.Errorf("worker %s deadletter %s: %v", w.Name, m.ID, err)
+			}
+			continue
+		}
+		plog.Infof("worker %s takes over %s (attempt %d)", w.Name, m.ID, attempts)
+		w.handle(ctx, m)
+	}
 }

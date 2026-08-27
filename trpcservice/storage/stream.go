@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -15,6 +16,8 @@ const (
 	StreamInbound = "stream:inbound"
 	// StreamOutbound is the Worker→Channel Adapter outbound queue (consumer group senders).
 	StreamOutbound = "stream:outbound"
+	// StreamDeadletter receives messages that exhausted redelivery attempts.
+	StreamDeadletter = "stream:deadletter"
 
 	// streamMaxLen caps the queue length (XADD MAXLEN ~) so a backlog cannot
 	// exhaust Redis memory; crossing the threshold should trigger an alert.
@@ -101,6 +104,64 @@ func (s *Stream) Ack(ctx context.Context, stream, group string, ids ...string) e
 		return fmt.Errorf("xack %s %s: %w", stream, group, err)
 	}
 	return nil
+}
+
+// AutoClaim transfers ownership of pending messages idle for longer than
+// minIdle to consumer, and returns them for reprocessing. This is how a
+// surviving node takes over the messages of a crashed consumer.
+func (s *Stream) AutoClaim(ctx context.Context, stream, group, consumer string, minIdle time.Duration, count int64) ([]Message, error) {
+	var msgs []Message
+	start := "0"
+	for {
+		xms, next, err := s.rdb.XAutoClaim(ctx, &redis.XAutoClaimArgs{
+			Stream:   stream,
+			Group:    group,
+			Consumer: consumer,
+			MinIdle:  minIdle,
+			Start:    start,
+			Count:    count,
+		}).Result()
+		if err != nil && !errors.Is(err, redis.Nil) {
+			return msgs, fmt.Errorf("xautoclaim %s %s: %w", stream, group, err)
+		}
+		for _, xm := range xms {
+			payload, _ := xm.Values[payloadField].(string)
+			msgs = append(msgs, Message{ID: xm.ID, Payload: []byte(payload)})
+		}
+		if next == "0" || len(xms) == 0 {
+			return msgs, nil
+		}
+		start = next
+	}
+}
+
+// Attempts increments the redelivery counter of a message. The Worker uses it
+// to cut off poison messages that keep failing after every takeover.
+func (s *Stream) Attempts(ctx context.Context, stream, id string) (int64, error) {
+	key := fmt.Sprintf("retry:%s:%s", stream, id)
+	n, err := s.rdb.Incr(ctx, key).Result()
+	if err != nil {
+		return 0, fmt.Errorf("incr %s: %w", key, err)
+	}
+	if n == 1 {
+		// Bound the counter's lifetime; the message itself resolves or dies first.
+		s.rdb.Expire(ctx, key, DedupTTL)
+	}
+	return n, nil
+}
+
+// DeadLetter moves a message to stream:deadletter (kept for manual
+// intervention and alerting) and acks it in the origin group.
+func (s *Stream) DeadLetter(ctx context.Context, stream, group string, m Message) error {
+	payload, _ := json.Marshal(map[string]string{
+		"origin_stream": stream,
+		"origin_id":     m.ID,
+		"payload":       string(m.Payload),
+	})
+	if _, err := s.Add(ctx, StreamDeadletter, payload); err != nil {
+		return fmt.Errorf("deadletter %s: %w", m.ID, err)
+	}
+	return s.Ack(ctx, stream, group, m.ID)
 }
 
 func isBusyGroup(err error) bool {
