@@ -54,6 +54,7 @@ func NewRunnerProcessor(cfg RunnerConfig) *RunnerProcessor {
 func (p *RunnerProcessor) Process(ctx context.Context, msg channels.InboundMessage) (channels.OutboundMessage, error) {
 	out := channels.OutboundMessage{
 		Channel:    msg.Channel,
+		MsgID:      msg.MsgID,
 		SessionKey: msg.SessionKey,
 		UserID:     msg.UserID,
 		ChatID:     msg.ChatID,

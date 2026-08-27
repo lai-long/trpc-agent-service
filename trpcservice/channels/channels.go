@@ -33,7 +33,8 @@ type InboundMessage struct {
 // delivered through the Channel's Send.
 type OutboundMessage struct {
 	Channel     string // which channel to reply on
-	SessionKey  string // conversation the reply belongs to (part of the outbound idempotency key sent:{session_id}:{event_seq})
+	MsgID       string // the inbound message this replies to (outbound idempotency unit sent:{channel}:{msg_id})
+	SessionKey  string // conversation the reply belongs to
 	UserID      string // recipient (required for direct chats)
 	ChatID      string // recipient group (required for group chats)
 	Text        string

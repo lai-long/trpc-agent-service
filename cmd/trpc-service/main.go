@@ -118,6 +118,7 @@ func serve() error {
 
 	sender := &channels.Sender{
 		Stream:   stream,
+		Sent:     storage.NewSentMarker(rdb),
 		Channels: map[string]channels.Channel{ch.Name(): ch},
 		Name:     consumer + "-s",
 	}

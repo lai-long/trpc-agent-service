@@ -40,6 +40,7 @@ type EchoProcessor struct{}
 func (EchoProcessor) Process(_ context.Context, msg channels.InboundMessage) (channels.OutboundMessage, error) {
 	return channels.OutboundMessage{
 		Channel:    msg.Channel,
+		MsgID:      msg.MsgID,
 		SessionKey: msg.SessionKey,
 		UserID:     msg.UserID,
 		ChatID:     msg.ChatID,
