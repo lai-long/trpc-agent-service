@@ -153,7 +153,7 @@ CREATE TABLE audit_log (
     session_id        uuid,
     agent_name        varchar(128),
     tool_name         varchar(128),
-    decision          varchar(32)  NOT NULL, -- allow / deny / review
+    decision          varchar(32)  NOT NULL, -- allow / deny / review / review_timeout
     latency_ms        int,
     error_type        varchar(64),
     cost              numeric(12, 6),

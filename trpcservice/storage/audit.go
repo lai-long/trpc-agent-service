@@ -18,7 +18,7 @@ type AuditEvent struct {
 	SessionID        string // session UUID; empty means NULL (session_key is not a UUID)
 	AgentName        string
 	ToolName         string
-	Decision         string // allow / deny / review
+	Decision         string // allow / deny / review / review_timeout
 	LatencyMs        int
 	ErrorType        string
 	Cost             float64
