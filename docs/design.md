@@ -498,10 +498,10 @@ PG 要求分区键包含在所有唯一约束中，与 `(session_id, event_seq)`
 | `sent:{session_id}:{event_seq}` | String | `sent:8b3c...:1024` | IM 返回的消息 ID | 24 小时 | 出站回复幂等，防发送重试造成 IM 侧重复消息 |
 
 Session 存储优先复用框架后端（`session/redis` / `session/postgres`），平台不自建会话缓存层。
-是否自研 `session.Service` 由 Spike S2 裁决：框架后端须同时满足三点——`(session_id, event_seq)` 级
-幂等唯一约束、summary 覆盖游标语义、`tenant_id` 维度与按月归档的 schema 可控性；不满足的点才在
-`storage/` 内自实现。无论复用还是自研，语义统一为「事件追加 + 快照」：**事件序列是 source of truth，
-state 只是物化快照**；PG 后端落 5.1.3 的 `session_event` / `session` 表（或框架等价表结构）。
+框架后端须同时满足三点——`(session_id, event_seq)` 级幂等唯一约束、summary 覆盖游标语义、
+`tenant_id` 维度与按月归档的 schema 可控性；不满足的点在 `storage/` 内自实现。无论复用还是
+自研，语义统一为「事件追加 + 快照」：**事件序列是 source of truth，state 只是物化快照**；
+PG 后端落 5.1.3 的 `session_event` / `session` 表（或框架等价表结构）。
 
 分布式锁规则：
 
@@ -683,19 +683,11 @@ Go 并发安全专项（Worker 长进程不泄漏）：
 
 总周期：8/26 – 9/9（15 天，其中 11 个工作日），1 人。
 
-前置验证任务（Spike）：以下三项框架能力未经验证，安排在周期的最前段，结论直接影响后续工期。
-
-| # | 验证项 | 验证方式 | 通过标准 |
-|---|---|---|---|
-| S1 | OpenClaw Channel 对企微验签、AES 加解密、「5s 内应答」的覆盖程度 | 测试号跑通「回调→解密→主动发消息」最小闭环（1–2 天） | 明确 Channel Adapter 需自建的 scope，据此重估工期 |
-| S2 | 框架 `session/redis` / `session/postgres` 后端的并发行为与 schema 能力 | 并发压测用例（多 goroutine 模拟多 Worker）+ 框架 schema 审查 | 并发写无脏数据、事件顺序正确；schema 满足三点：`(session_id, event_seq)` 幂等唯一约束、summary 覆盖游标、`tenant_id` 维度与归档可控——不满足的点列入 `storage/` 自研范围 |
-| S3 | pgvector 在十万级向量下的检索延迟与召回 | 灌入模拟数据实测 | 满足知识库查询 P95 要求，否则启用 Qdrant/Milvus 替换路径 |
-
 里程碑：
 
 | 阶段 | 内容 | 产出物 | 时间 |
 |---|---|---|---|
-| 阶段 0：前置验证 | Spike S1–S3；开发环境搭建（compose、PG schema、Redis） | spike 结论报告；可运行的开发环境 | 8/26 – 8/28（3 天） |
+| 阶段 0：环境准备 | 开发环境搭建（compose、PG schema、Redis）；企微测试号/接口权限申请发起 | 可运行的开发环境 | 8/26 – 8/28（3 天） |
 | 阶段 1：MVP 最小闭环 | Mock Channel 先行打通「回调→去重入队→Worker/Runner→PG/Redis 存储→出站回复」；企微真实接入并行开发 | 单租户 all-in-one 端到端可演示链路 | 8/31 – 9/3（4 天） |
 | 阶段 2：功能完善 | 多租户模型与路由、Storage Adapter 双后端、Guardrail 链、审计异步写、OTel 全链路、Memory/Knowledge 接入 | 多租户完整功能 + 单测覆盖核心链路 | 9/4 – 9/7（2 工作日 + 周末机动） |
 | 阶段 3：灰度上线 | Admin API、微信客服通道、监控告警、compose 交付、文档收尾、对照 6.3 验收自查 | 可交付版本 + 验收自查表 | 9/8 – 9/9（2 天） |
@@ -704,22 +696,22 @@ Go 并发安全专项（Worker 长进程不泄漏）：
 
 | 模块 | 工作量 | 备注 |
 |---|---:|---|
-| Spike ×3 | 3 | 阶段 0 |
 | 基础设施（compose / schema / config / log） | 1 | |
-| `channels`（Mock + 企微） | 2 | 依赖 S1 结论，企微加解密若需全自建则 +1 |
+| `channels`（Mock + 企微） | 2 | 企微加解密若需全自建则 +1 |
 | Gateway + Stream 收发 + 幂等 | 1 | |
-| Worker + Runner 装配 + 分布式锁 | 1.5 | 依赖 S2 结论 |
+| Worker + Runner 装配 + 分布式锁 | 1.5 | |
 | `storage` Adapter（Redis/PG） | 1 | |
 | `tenant` 路由 + Admin API | 1 | |
 | Guardrail + 审计 | 0.5 | |
 | OTel + metrics | 0.5 | |
 | 联调、测试、文档收尾 | 1.5 | |
-| **合计** | **13** | 11 个工作日 + 4 天周末机动覆盖 |
+| **合计** | **10** | 11 个工作日可覆盖，周末机动留给返工 |
 
 依赖与风险：
 
 - 企微测试号/接口权限申请（风险 7）须在第 0 阶段就发起，Mock Channel 保证其阻塞不影响主线。
-- S1/S2 的结论可能触发工期重估：企微加解密全自建 +1 天，redis session 行为异常需自建兜底则 +1~2 天，超出部分从阶段 2 的周末机动中扣。
+- 企微加解密若需全自建（+1 天）、框架 session 后端不满足三点要求需自研兜底（+1~2 天）会触发
+  工期重估，超出部分从阶段 2 的周末机动中扣。
 - 微信客服通道排在阶段 3，若时间不足可降级为「设计覆盖、实现留接口」，优先保证企微通道完整交付。
 
 ## 8. 风险评估
