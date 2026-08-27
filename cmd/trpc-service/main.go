@@ -113,7 +113,7 @@ func serve() error {
 		}
 		return nil
 	})
-	worker := &agent.Worker{Stream: stream, Processor: processor, Name: consumer + "-w"}
+	worker := &agent.Worker{Stream: stream, Lock: storage.NewLock(rdb), Processor: processor, Name: consumer + "-w"}
 	g.Go(func() error { return worker.Run(gctx) })
 
 	sender := &channels.Sender{

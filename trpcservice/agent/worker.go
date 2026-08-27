@@ -54,6 +54,7 @@ func (EchoProcessor) Process(_ context.Context, msg channels.InboundMessage) (ch
 // over via XCLAIM (a crash loses no messages).
 type Worker struct {
 	Stream    *storage.Stream
+	Lock      *storage.Lock // nil disables session locking (single-replica dev)
 	Processor Processor
 	Name      string // consumer name identifying pending ownership (e.g. hostname-pid)
 
@@ -68,6 +69,12 @@ type Worker struct {
 	ReapInterval time.Duration
 	MaxIdle      time.Duration
 	MaxAttempts  int64
+
+	// LockTTL is the session lock lease, renewed by the watchdog every
+	// TTL/3 while processing runs. LockWait is how long a message spins for
+	// the lock before being re-queued.
+	LockTTL  time.Duration
+	LockWait time.Duration
 }
 
 func (w *Worker) reapInterval() time.Duration {
@@ -89,6 +96,20 @@ func (w *Worker) maxAttempts() int64 {
 		return w.MaxAttempts
 	}
 	return 5
+}
+
+func (w *Worker) lockTTL() time.Duration {
+	if w.LockTTL > 0 {
+		return w.LockTTL
+	}
+	return 10 * time.Second
+}
+
+func (w *Worker) lockWait() time.Duration {
+	if w.LockWait > 0 {
+		return w.LockWait
+	}
+	return 15 * time.Second
 }
 
 func (w *Worker) inStream() string {
@@ -161,6 +182,24 @@ func (w *Worker) handle(ctx context.Context, m storage.Message) {
 		attribute.String("session_key", msg.SessionKey),
 	)
 
+	// Session lock: serialize concurrent processing of the same session
+	// across replicas. Deferred calls run LIFO: the watchdog stops first,
+	// then the lock is released.
+	if w.Lock != nil {
+		owner, stopWatchdog, ok := w.acquireSession(ctx, m, msg.SessionKey)
+		if !ok {
+			return // re-queued or shutting down
+		}
+		defer func() {
+			releaseCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			if err := w.Lock.Release(releaseCtx, msg.SessionKey, owner); err != nil {
+				plog.Warnf("worker %s release lock %s: %v", w.Name, msg.SessionKey, err)
+			}
+		}()
+		defer stopWatchdog()
+	}
+
 	out, err := w.Processor.Process(ctx, msg)
 	if err != nil {
 		// No Ack: leave it pending for redelivery. Redelivery produces
@@ -226,4 +265,64 @@ func (w *Worker) reap(ctx context.Context) {
 		plog.Infof("worker %s takes over %s (attempt %d)", w.Name, m.ID, attempts)
 		w.handle(ctx, m)
 	}
+}
+
+// acquireSession spins for the session lock until lockWait. On timeout the
+// message is re-queued (as a new entry) and the original acked, so a busy
+// session delays the message instead of failing it. The returned stop ends
+// the renewal watchdog.
+func (w *Worker) acquireSession(ctx context.Context, m storage.Message, sessionKey string) (owner string, stop func(), ok bool) {
+	owner = w.Name + ":" + m.ID
+	deadline := time.Now().Add(w.lockWait())
+	for {
+		acquired, err := w.Lock.TryAcquire(ctx, sessionKey, owner, w.lockTTL())
+		if err != nil {
+			plog.Warnf("worker %s acquire lock %s: %v", w.Name, sessionKey, err)
+		}
+		if acquired {
+			return owner, w.startLockWatchdog(ctx, sessionKey, owner), true
+		}
+		if time.Now().After(deadline) {
+			if _, err := w.Stream.Add(ctx, w.inStream(), m.Payload); err != nil {
+				plog.Errorf("worker %s re-queue %s: %v", w.Name, m.ID, err)
+				return "", nil, false // stays pending, the reaper will retry
+			}
+			if err := w.Stream.Ack(ctx, w.inStream(), "workers", m.ID); err != nil {
+				plog.Warnf("worker %s ack after re-queue %s: %v", w.Name, m.ID, err)
+			}
+			plog.Infof("worker %s re-queued %s: session %s is busy", w.Name, m.ID, sessionKey)
+			return "", nil, false
+		}
+		select {
+		case <-ctx.Done():
+			return "", nil, false
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+}
+
+// startLockWatchdog renews the session lock every TTL/3 so long tool calls
+// and slow generations cannot outlive the lease. It exits when ctx is
+// canceled, the lock is lost, or the returned stop is called.
+func (w *Worker) startLockWatchdog(ctx context.Context, sessionKey, owner string) (stop func()) {
+	done := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(w.lockTTL() / 3)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				ok, err := w.Lock.Extend(ctx, sessionKey, owner, w.lockTTL())
+				if err != nil || !ok {
+					plog.Warnf("worker %s lost session lock %s (extended=%v, err=%v)", w.Name, sessionKey, ok, err)
+					return
+				}
+			}
+		}
+	}()
+	return func() { close(done) }
 }

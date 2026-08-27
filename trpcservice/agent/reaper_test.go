@@ -148,3 +148,67 @@ func TestWorkerDeadLettersPoisonMessage(t *testing.T) {
 	}
 	t.Fatal("poison message was not dead-lettered within 8s")
 }
+
+// A message for a session locked by another worker is re-queued and processed
+// after the lock expires.
+func TestWorkerRequeuesWhenSessionLocked(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	rdb, err := storage.NewRedis(ctx, "localhost:6380")
+	if err != nil {
+		t.Skipf("redis unavailable (%v), skipping integration test", err)
+	}
+	defer func() { _ = rdb.Close() }()
+
+	stream := storage.NewStream(rdb)
+	inbound := "test:lock:in:" + t.Name()
+	outbound := "test:lock:out:" + t.Name()
+	lockSess := "dm:mock:busy"
+	t.Cleanup(func() {
+		rdb.Del(context.Background(), inbound, outbound, "lock:sess:"+lockSess)
+	})
+	for _, gs := range [][2]string{{inbound, "workers"}, {outbound, "senders"}} {
+		if err := stream.EnsureGroup(ctx, gs[0], gs[1]); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Another worker holds the session lock; it expires on its own (crash).
+	lock := storage.NewLock(rdb)
+	if ok, err := lock.TryAcquire(ctx, lockSess, "crashed-worker", 1500*time.Millisecond); err != nil || !ok {
+		t.Fatalf("pre-lock failed: ok=%v err=%v", ok, err)
+	}
+
+	mockCh := mock.New()
+	worker := fastWorker(stream, agent.EchoProcessor{}, inbound, outbound)
+	worker.Lock = lock
+	worker.LockWait = 400 * time.Millisecond
+	sender := &channels.Sender{
+		Stream:   stream,
+		Channels: map[string]channels.Channel{mockCh.Name(): mockCh},
+		Name:     "test-s", InStream: outbound,
+	}
+	go func() { _ = worker.Run(ctx) }()
+	go func() { _ = sender.Run(ctx) }()
+
+	in := channels.InboundMessage{
+		Channel: "mock", MsgID: "locked-1", SessionKey: lockSess,
+		UserID: "u11", Text: "wait for the lock", TraceID: "trace-lock",
+	}
+	payload, _ := json.Marshal(in)
+	if _, err := stream.Add(ctx, inbound, payload); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(6 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, m := range mockCh.Sent() {
+			if m.TraceID == "trace-lock" {
+				return // re-queued, then processed after the lock expired
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatal("message was not processed after the session lock expired")
+}
