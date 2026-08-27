@@ -70,10 +70,14 @@ func install(development bool) {
 	}
 
 	core := redactCore{zapcore.NewCore(enc, zapcore.Lock(os.Stderr), level)}
-	zap.ReplaceGlobals(zap.New(core, zap.AddCaller()))
+	// Stacktraces at Error and above: error paths are rare and exactly where
+	// the stack pays off; lower levels stay lean.
+	opts := []zap.Option{zap.AddCaller(), zap.AddStacktrace(zapcore.ErrorLevel)}
+	zap.ReplaceGlobals(zap.New(core, opts...))
 	// Package-level functions need AddCallerSkip(1) so the caller points at
 	// the real call site, not inside this package.
-	sugar = zap.New(core, zap.AddCaller(), zap.AddCallerSkip(1)).Sugar()
+	sugarOpts := append([]zap.Option{zap.AddCallerSkip(1)}, opts...)
+	sugar = zap.New(core, sugarOpts...).Sugar()
 }
 
 // sugar backs the package-level convenience functions.

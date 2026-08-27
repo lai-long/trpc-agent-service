@@ -138,3 +138,23 @@ func TestWithAttachesAndRedacts(t *testing.T) {
 		t.Errorf("sensitive With-field should be redacted, got %q", fields[1].String)
 	}
 }
+
+// Error-and-above logs carry a stacktrace; Warn does not.
+func TestStacktraceOnlyAtError(t *testing.T) {
+	core, logs := observer.New(zapcore.DebugLevel)
+	l := zap.New(redactCore{core}, zap.AddStacktrace(zapcore.ErrorLevel))
+
+	l.Warn("warn")
+	l.Error("boom")
+
+	entries := logs.All()
+	if len(entries) != 2 {
+		t.Fatalf("expected 2 entries, got %d", len(entries))
+	}
+	if entries[0].Stack != "" {
+		t.Error("warn should not carry a stacktrace")
+	}
+	if !strings.Contains(entries[1].Stack, "TestStacktraceOnlyAtError") {
+		t.Error("error should carry a stacktrace containing the test frame")
+	}
+}
