@@ -34,7 +34,7 @@ type Config struct {
 func Load() Config {
 	return Config{
 		HTTPAddr:   getenv("TRPC_HTTP_ADDR", ":8080"),
-		PGDSN:      getenv("TRPC_PG_DSN", ""),
+		PGDSN:      getenv("TRPC_PG_DSN", "postgres://trpc:trpc-dev-only@localhost:5432/trpc?sslmode=disable"),
 		RedisAddr:  getenv("TRPC_REDIS_ADDR", "localhost:6380"), // host 6379 is often taken by other local services; compose maps 6380
 		LogLevel:   getenv("TRPC_LOG_LEVEL", "info"),
 		LogFormat:  getenv("TRPC_LOG_FORMAT", "console"),

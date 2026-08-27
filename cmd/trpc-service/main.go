@@ -85,6 +85,12 @@ func serve() error {
 		return err
 	}
 
+	// Audit: async batch lane for routine events, sync lane for critical
+	// decisions. PG down at startup degrades to no audit with a warning — the
+	// message pipeline must not depend on it.
+	auditor, auditCleanup := startAuditor(ctx, cfg)
+	defer auditCleanup()
+
 	ch := mock.New()
 	mux := http.NewServeMux()
 	ch.RegisterRoutes(mux, web.EnqueueHandler{Stream: stream, Dedup: storage.NewDeduper(rdb)})
@@ -120,7 +126,7 @@ func serve() error {
 		}
 		return nil
 	})
-	worker := &agent.Worker{Stream: stream, Lock: storage.NewLock(rdb), Processor: processor, Name: consumer + "-w"}
+	worker := &agent.Worker{Stream: stream, Lock: storage.NewLock(rdb), Auditor: auditor, Processor: processor, Name: consumer + "-w"}
 	g.Go(func() error { return worker.Run(gctx) })
 
 	sender := &channels.Sender{
@@ -141,6 +147,26 @@ func serve() error {
 	})
 
 	return g.Wait()
+}
+
+// startAuditor connects to PG and starts the audit flush loop. PG being down
+// degrades to no-audit with a warning; the message pipeline does not depend on
+// it (audit catches up from logs/traces during the outage). The returned
+// cleanup flushes pending events and closes the pool.
+func startAuditor(ctx context.Context, cfg config.Config) (*storage.Auditor, func()) {
+	noop := func() {}
+	pool, err := storage.NewPG(ctx, cfg.PGDSN)
+	if err != nil {
+		plog.Warnf("audit unavailable, PG unreachable: %v", err)
+		return nil, noop
+	}
+	a := storage.NewAuditor(pool)
+	a.Start()
+	plog.Infof("audit enabled")
+	return a, func() {
+		a.Close()
+		pool.Close()
+	}
 }
 
 // buildProcessor assembles the Runner-backed processor (llmagent + session/redis).

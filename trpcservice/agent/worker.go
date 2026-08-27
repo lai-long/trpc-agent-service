@@ -60,7 +60,8 @@ func (EchoProcessor) Process(_ context.Context, msg channels.InboundMessage) (ch
 // over via XCLAIM (a crash loses no messages).
 type Worker struct {
 	Stream    *storage.Stream
-	Lock      *storage.Lock // nil disables session locking (single-replica dev)
+	Lock      *storage.Lock    // nil disables session locking (single-replica dev)
+	Auditor   *storage.Auditor // nil disables auditing
 	Processor Processor
 	Name      string // consumer name identifying pending ownership (e.g. hostname-pid)
 
@@ -188,6 +189,8 @@ func (w *Worker) handle(ctx context.Context, m storage.Message) {
 		attribute.String("session_key", msg.SessionKey),
 	)
 	started := time.Now()
+	var processErr error
+	defer func() { w.audit(msg, started, processErr) }()
 
 	// Session lock: serialize concurrent processing of the same session
 	// across replicas. Deferred calls run LIFO: the watchdog stops first,
@@ -213,6 +216,7 @@ func (w *Worker) handle(ctx context.Context, m storage.Message) {
 		// No Ack: leave it pending for redelivery. Redelivery produces
 		// duplicate events, deduplicated by the (session_id, event_seq)
 		// unique constraint.
+		processErr = err
 		metrics.ProcessErrorTotal.Add(ctx, 1, processAttr(msg))
 		plog.Errorf("worker %s process %s failed: %v", w.Name, m.ID, err)
 		span.RecordError(err)
@@ -243,6 +247,26 @@ func (w *Worker) handle(ctx context.Context, m storage.Message) {
 	zap.L().Debug("message processed",
 		zap.String(plog.FieldSessionKey, msg.SessionKey),
 		zap.String(plog.FieldTraceID, msg.TraceID))
+}
+
+// audit records one routine (allow) event per processed message on the async
+// lane. tenant_id is the zero UUID until the tenant module wires real tenants.
+func (w *Worker) audit(msg channels.InboundMessage, started time.Time, processErr error) {
+	if w.Auditor == nil {
+		return
+	}
+	ev := storage.AuditEvent{
+		TenantID:  "00000000-0000-0000-0000-000000000000",
+		Channel:   msg.Channel,
+		UserID:    msg.UserID,
+		Decision:  "allow",
+		LatencyMs: int(time.Since(started).Milliseconds()),
+		TraceID:   msg.TraceID,
+	}
+	if processErr != nil {
+		ev.ErrorType = "process_error"
+	}
+	w.Auditor.LogAsync(ev)
 }
 
 // reap takes over pending messages idle longer than maxIdle (their consumers
