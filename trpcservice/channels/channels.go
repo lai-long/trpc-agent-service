@@ -9,6 +9,7 @@ package channels
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
@@ -59,9 +60,16 @@ func SessionKey(channel, userID, chatID string) string {
 // (the local debug path); an empty one means accepted, with the reply sent
 // asynchronously (the formal chain: the Gateway writes to stream:inbound
 // and the reply is delivered via stream:outbound).
+//
+// Error contract: ErrDuplicate means the message was seen before; the channel
+// layer answers 200 so the IM stops redelivering.
 type Handler interface {
 	Handle(ctx context.Context, msg InboundMessage) (OutboundMessage, error)
 }
+
+// ErrDuplicate is returned by Handler when the message ID was already seen.
+// It is a success outcome, not a failure: the IM must not redeliver.
+var ErrDuplicate = errors.New("duplicate message")
 
 // HandlerFunc lets a plain function be used as a Handler.
 type HandlerFunc func(ctx context.Context, msg InboundMessage) (OutboundMessage, error)

@@ -87,7 +87,7 @@ func serve() error {
 
 	ch := mock.New()
 	mux := http.NewServeMux()
-	ch.RegisterRoutes(mux, web.EnqueueHandler{Stream: stream})
+	ch.RegisterRoutes(mux, web.EnqueueHandler{Stream: stream, Dedup: storage.NewDeduper(rdb)})
 	srv := &http.Server{
 		Addr:    cfg.HTTPAddr,
 		Handler: mux,

@@ -8,6 +8,7 @@ package mock
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"sync"
 	"time"
@@ -29,13 +30,12 @@ type callbackRequest struct {
 // Channel is the mock implementation of channels.Channel.
 type Channel struct {
 	mu   sync.Mutex
-	seen map[string]struct{}        // in-memory dedup set; the real implementation uses Redis
 	sent []channels.OutboundMessage // inbox of sent replies, for inspection in tests
 }
 
 // New creates a mock Channel.
 func New() *Channel {
-	return &Channel{seen: make(map[string]struct{})}
+	return &Channel{}
 }
 
 // Name implements channels.Channel.
@@ -57,16 +57,7 @@ func (c *Channel) RegisterRoutes(mux *http.ServeMux, h channels.Handler) {
 			return
 		}
 
-		// 2. Idempotent dedup, mirroring SETNX dedup:{channel}:{msg_id}.
-		if !c.markSeen(req.MsgID) {
-			zap.L().Warn("duplicate message dropped",
-				zap.String(plog.FieldChannel, c.Name()), zap.String(plog.FieldMsgID, req.MsgID))
-			// Duplicates still get a success reply so the IM stops retrying.
-			writeReply(w, "duplicate", "")
-			return
-		}
-
-		// 3. Normalize the external payload into the platform-wide InboundMessage.
+		// 2. Normalize the external payload into the platform-wide InboundMessage.
 		msg := channels.InboundMessage{
 			Channel:    c.Name(),
 			MsgID:      req.MsgID,
@@ -74,14 +65,21 @@ func (c *Channel) RegisterRoutes(mux *http.ServeMux, h channels.Handler) {
 			UserID:     req.UserID,
 			ChatID:     req.ChatID,
 			Text:       req.Text,
-			TraceID:    req.MsgID, // the minimal version reuses msg_id as trace_id; the real one uses OTel
+			TraceID:    req.MsgID, // the gateway stamps the real trace ID over it
 			ReceivedAt: time.Now(),
 		}
 
-		// 4. Hand over to the upper layer (formal chain: gateway enqueues to
+		// 3. Hand over to the upper layer (the gateway dedups, enqueues to
 		//    stream:inbound and returns an empty "accepted" reply; sync/debug
 		//    path: the handler returns the reply inline).
 		out, err := h.Handle(r.Context(), msg)
+		if errors.Is(err, channels.ErrDuplicate) {
+			zap.L().Warn("duplicate message dropped",
+				zap.String(plog.FieldChannel, c.Name()), zap.String(plog.FieldMsgID, req.MsgID))
+			// Duplicates still get a success reply so the IM stops retrying.
+			writeReply(w, "duplicate", "")
+			return
+		}
 		if err != nil {
 			http.Error(w, "handle error: "+err.Error(), http.StatusInternalServerError)
 			return
@@ -122,17 +120,6 @@ func (c *Channel) Sent() []channels.OutboundMessage {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return append([]channels.OutboundMessage(nil), c.sent...)
-}
-
-// markSeen reports whether msgID arrives for the first time.
-func (c *Channel) markSeen(msgID string) bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if _, ok := c.seen[msgID]; ok {
-		return false
-	}
-	c.seen[msgID] = struct{}{}
-	return true
 }
 
 func writeReply(w http.ResponseWriter, status, text string) {

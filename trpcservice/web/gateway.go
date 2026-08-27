@@ -29,6 +29,7 @@ var tracer = otel.Tracer("trpc-agent-service/gateway")
 // token-bucket rate limiting belong before the enqueue.
 type EnqueueHandler struct {
 	Stream *storage.Stream
+	Dedup  *storage.Deduper
 }
 
 // Handle implements channels.Handler.
@@ -37,6 +38,19 @@ type EnqueueHandler struct {
 // real trace ID + traceparent, so the Worker continues the same trace after
 // the async Stream hop.
 func (h EnqueueHandler) Handle(ctx context.Context, msg channels.InboundMessage) (channels.OutboundMessage, error) {
+	// Inbound idempotency gate: first arrival passes, duplicates get
+	// ErrDuplicate so the channel layer answers 200 and the IM stops
+	// redelivering.
+	if h.Dedup != nil {
+		first, err := h.Dedup.Check(ctx, msg.Channel, msg.MsgID)
+		if err != nil {
+			return channels.OutboundMessage{}, fmt.Errorf("dedup check: %w", err)
+		}
+		if !first {
+			return channels.OutboundMessage{}, channels.ErrDuplicate
+		}
+	}
+
 	ctx, span := tracer.Start(ctx, "gateway.enqueue")
 	defer span.End()
 	span.SetAttributes(
