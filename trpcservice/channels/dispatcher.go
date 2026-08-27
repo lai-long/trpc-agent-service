@@ -8,6 +8,7 @@ import (
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	otelmetric "go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/propagation"
 	"go.uber.org/zap"
 
@@ -17,6 +18,13 @@ import (
 )
 
 var senderTracer = otel.Tracer("trpc-agent-service/sender")
+
+func sendAttr(msg OutboundMessage, result string) otelmetric.MeasurementOption {
+	return otelmetric.WithAttributes(
+		attribute.String("channel", msg.Channel),
+		attribute.String("result", result),
+	)
+}
 
 // Sender consumes the outbound stream as part of consumer group "senders" and
 // dispatches each message to the Send of its Channel.
@@ -94,6 +102,7 @@ func (s *Sender) handle(ctx context.Context, m storage.Message) {
 		}
 		if sent {
 			plog.Infof("sender %s skip already-sent reply for msg %s", s.Name, msg.MsgID)
+			metrics.OutboundTotal.Add(ctx, 1, sendAttr(msg, "skipped_duplicate"))
 			_ = s.Stream.Ack(ctx, s.inStream(), "senders", m.ID)
 			return
 		}
@@ -110,10 +119,12 @@ func (s *Sender) handle(ctx context.Context, m storage.Message) {
 
 	if err := ch.Send(ctx, msg); err != nil {
 		// No Ack: leave it pending for retry.
+		metrics.OutboundTotal.Add(ctx, 1, sendAttr(msg, "error"))
 		plog.Errorf("sender %s send via %s failed: %v", s.Name, msg.Channel, err)
 		span.RecordError(err)
 		return
 	}
+	metrics.OutboundTotal.Add(ctx, 1, sendAttr(msg, "ok"))
 	if s.Sent != nil && msg.MsgID != "" {
 		if err := s.Sent.MarkSent(ctx, msg.Channel, msg.MsgID, ""); err != nil {
 			plog.Warnf("sender %s mark sent %s: %v", s.Name, m.ID, err)

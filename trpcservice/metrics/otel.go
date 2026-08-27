@@ -1,16 +1,5 @@
-// Package metrics owns observability for the platform: tracing init and
-// shared instrumentation helpers.
-//
-// Tracing is delegated to the framework's telemetry package: atrace.Start
-// installs a global OTLP tracer provider and activates the framework's own
-// spans (Runner / Tool / Model / Session), so platform spans and framework
-// spans land in the same trace. The endpoint is configured through the
-// standard OTEL_EXPORTER_OTLP_ENDPOINT env var.
-//
-// Platform-side spans cover the parts the framework cannot see: the IM
-// callback, the Stream enqueue/consume boundary, and outbound delivery.
-// The trace crosses the async Stream boundary via a W3C traceparent field
-// carried in the message payload.
+// Tracing init and traceparent propagation helpers (package doc lives in
+// metrics.go).
 package metrics
 
 import (

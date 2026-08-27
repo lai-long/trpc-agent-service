@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"strings"
 
+	"go.opentelemetry.io/otel/attribute"
+	otelmetric "go.opentelemetry.io/otel/metric"
 	"go.uber.org/zap"
 	"trpc.group/trpc-go/trpc-agent-go/agent/llmagent"
 	"trpc.group/trpc-go/trpc-agent-go/model"
@@ -14,6 +16,7 @@ import (
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
 	plog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/metrics"
 )
 
 // RunnerProcessor processes messages with the tRPC-Agent-Go runner.Runner.
@@ -72,6 +75,10 @@ func (p *RunnerProcessor) Process(ctx context.Context, msg channels.InboundMessa
 			plog.Warnf("runner event error: %s", evt.Error.Message)
 			continue
 		}
+		if evt.Response != nil && evt.Response.Usage != nil {
+			metrics.TokensTotal.Add(ctx, int64(evt.Response.Usage.PromptTokens), tokenAttr("prompt"))
+			metrics.TokensTotal.Add(ctx, int64(evt.Response.Usage.CompletionTokens), tokenAttr("completion"))
+		}
 		if evt.IsFinalResponse() && evt.Response != nil && len(evt.Response.Choices) > 0 {
 			reply.WriteString(evt.Response.Choices[0].Message.Content)
 		}
@@ -90,3 +97,8 @@ func (p *RunnerProcessor) Process(ctx context.Context, msg channels.InboundMessa
 
 // Close shuts down the underlying runner (call at process exit).
 func (p *RunnerProcessor) Close() error { return p.runner.Close() }
+
+// tokenAttr tags token usage by kind (prompt / completion).
+func tokenAttr(kind string) otelmetric.MeasurementOption {
+	return otelmetric.WithAttributes(attribute.String("kind", kind))
+}

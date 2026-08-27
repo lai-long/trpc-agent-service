@@ -12,6 +12,7 @@ import (
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	otelmetric "go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/propagation"
 	"go.uber.org/zap"
 
@@ -22,6 +23,10 @@ import (
 )
 
 var tracer = otel.Tracer("trpc-agent-service/worker")
+
+func processAttr(msg channels.InboundMessage) otelmetric.MeasurementOption {
+	return otelmetric.WithAttributes(attribute.String("channel", msg.Channel))
+}
 
 // Processor handles one inbound message and produces a reply.
 // Runner-backed implementations must consume the framework event channel to
@@ -182,6 +187,7 @@ func (w *Worker) handle(ctx context.Context, m storage.Message) {
 		attribute.String("channel", msg.Channel),
 		attribute.String("session_key", msg.SessionKey),
 	)
+	started := time.Now()
 
 	// Session lock: serialize concurrent processing of the same session
 	// across replicas. Deferred calls run LIFO: the watchdog stops first,
@@ -202,10 +208,12 @@ func (w *Worker) handle(ctx context.Context, m storage.Message) {
 	}
 
 	out, err := w.Processor.Process(ctx, msg)
+	metrics.ProcessDuration.Record(ctx, float64(time.Since(started).Milliseconds()), processAttr(msg))
 	if err != nil {
 		// No Ack: leave it pending for redelivery. Redelivery produces
 		// duplicate events, deduplicated by the (session_id, event_seq)
 		// unique constraint.
+		metrics.ProcessErrorTotal.Add(ctx, 1, processAttr(msg))
 		plog.Errorf("worker %s process %s failed: %v", w.Name, m.ID, err)
 		span.RecordError(err)
 		return

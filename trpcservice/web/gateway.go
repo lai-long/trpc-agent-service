@@ -8,6 +8,7 @@ import (
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	otelmetric "go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/propagation"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
@@ -47,6 +48,7 @@ func (h EnqueueHandler) Handle(ctx context.Context, msg channels.InboundMessage)
 			return channels.OutboundMessage{}, fmt.Errorf("dedup check: %w", err)
 		}
 		if !first {
+			metrics.DedupDroppedTotal.Add(ctx, 1, chAttr(msg))
 			return channels.OutboundMessage{}, channels.ErrDuplicate
 		}
 	}
@@ -73,5 +75,10 @@ func (h EnqueueHandler) Handle(ctx context.Context, msg channels.InboundMessage)
 		// retries later.
 		return channels.OutboundMessage{}, fmt.Errorf("enqueue inbound: %w", err)
 	}
+	metrics.InboundTotal.Add(ctx, 1, chAttr(msg))
 	return channels.OutboundMessage{}, nil
+}
+
+func chAttr(msg channels.InboundMessage) otelmetric.AddOption {
+	return otelmetric.WithAttributes(attribute.String("channel", msg.Channel))
 }

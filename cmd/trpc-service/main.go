@@ -88,6 +88,13 @@ func serve() error {
 	ch := mock.New()
 	mux := http.NewServeMux()
 	ch.RegisterRoutes(mux, web.EnqueueHandler{Stream: stream, Dedup: storage.NewDeduper(rdb)})
+
+	metricsHandler, err := metrics.InitMetrics()
+	if err != nil {
+		return err
+	}
+	mux.Handle("GET /metrics", metricsHandler)
+
 	srv := &http.Server{
 		Addr:    cfg.HTTPAddr,
 		Handler: mux,
