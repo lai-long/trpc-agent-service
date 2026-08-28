@@ -22,8 +22,12 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/metrics"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/storage"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/tool"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/web"
 	sessionredis "trpc.group/trpc-go/trpc-agent-go/session/redis"
+	ttool "trpc.group/trpc-go/trpc-agent-go/tool"
+
+	"github.com/redis/go-redis/v9"
 )
 
 func main() {
@@ -118,7 +122,7 @@ func serve() error {
 		IdleTimeout:       60 * time.Second,
 	}
 
-	processor, cleanup := buildProcessor(ctx, cfg)
+	processor, cleanup := buildProcessor(ctx, cfg, rdb, auditor)
 	defer cleanup()
 
 	consumer := fmt.Sprintf("%s-%d", "allinone", os.Getpid())
@@ -132,7 +136,7 @@ func serve() error {
 		}
 		return nil
 	})
-	worker := &agent.Worker{Stream: stream, Lock: storage.NewLock(rdb), Auditor: auditor, Processor: processor, Name: consumer + "-w"}
+	worker := &agent.Worker{Stream: stream, Lock: storage.NewLock(rdb), Processor: processor, Name: consumer + "-w"}
 	g.Go(func() error { return worker.Run(gctx) })
 
 	sender := &channels.Sender{
@@ -177,17 +181,32 @@ func startPGConsumers(ctx context.Context, cfg config.Config) (*storage.Auditor,
 	}
 }
 
-// buildProcessor assembles the Runner-backed processor (llmagent + session/redis).
-// Falls back to EchoProcessor when the model key is missing, so the pipeline
-// stays demoable without LLM access. The returned cleanup closes resources.
-func buildProcessor(ctx context.Context, cfg config.Config) (agent.Processor, func()) {
+// buildProcessor assembles the processing chain: the platform tool registry,
+// the dangerous-tool Approver, the Runner-backed inner processor (llmagent +
+// session/redis), and the Guarded guardrail wrapper that owns input/output
+// checks and message-level auditing. It falls back to EchoProcessor when the
+// model key is missing, so the pipeline stays demoable without LLM access.
+// The returned cleanup closes resources.
+func buildProcessor(ctx context.Context, cfg config.Config, rdb *redis.Client, auditor *storage.Auditor) (agent.Processor, func()) {
 	noop := func() {}
+
+	registry := tool.DemoTools()
+	approver := agent.NewApprover(rdb, registry, 0)
+	wrap := func(inner agent.Processor) agent.Processor {
+		return &agent.Guarded{
+			Inner:    inner,
+			Approver: approver,
+			Auditor:  auditor,
+			Input:    []agent.InputChecker{agent.SensitiveWordInput(agent.DefaultBlockedWords)},
+			Output:   []agent.OutputChecker{agent.RedactOutput()},
+		}
+	}
 
 	resolver := config.NewFileResolver(cfg.SecretsDir)
 	apiKey, err := resolver.Resolve(ctx, cfg.ModelAPIKeyRef)
 	if err != nil {
 		plog.Warnf("model key %q unavailable (%v), falling back to echo processor", cfg.ModelAPIKeyRef, err)
-		return agent.EchoProcessor{}, noop
+		return wrap(agent.EchoProcessor{}), noop
 	}
 
 	// WithEnableTracing is required beyond observability: with tracing disabled,
@@ -199,16 +218,19 @@ func buildProcessor(ctx context.Context, cfg config.Config) (agent.Processor, fu
 	)
 	if err != nil {
 		plog.Warnf("session service unavailable (%v), falling back to echo processor", err)
-		return agent.EchoProcessor{}, noop
+		return wrap(agent.EchoProcessor{}), noop
 	}
 
+	callbacks := ttool.NewCallbacks().RegisterBeforeTool(approver.BeforeTool)
 	p := agent.NewRunnerProcessor(agent.RunnerConfig{
 		AppName:        "trpc-service",
 		BaseURL:        cfg.ModelBaseURL,
 		APIKey:         apiKey,
 		ModelName:      cfg.ModelName,
 		SessionService: sess,
+		Tools:          registry.All(),
+		ToolCallbacks:  callbacks,
 	})
 	plog.Infof("runner processor ready (model=%s)", cfg.ModelName)
-	return p, func() { _ = p.Close(); _ = sess.Close() }
+	return wrap(p), func() { _ = p.Close(); _ = sess.Close() }
 }

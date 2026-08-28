@@ -13,6 +13,7 @@ import (
 	"trpc.group/trpc-go/trpc-agent-go/model/openai"
 	"trpc.group/trpc-go/trpc-agent-go/runner"
 	"trpc.group/trpc-go/trpc-agent-go/session"
+	"trpc.group/trpc-go/trpc-agent-go/tool"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
 	plog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
@@ -34,6 +35,10 @@ type RunnerConfig struct {
 	APIKey         string // resolved model key in plaintext (never log it)
 	ModelName      string
 	SessionService session.Service
+	// Tools and ToolCallbacks wire the platform tool registry and the
+	// guardrail's dangerous-tool interception into the agent.
+	Tools         []tool.Tool
+	ToolCallbacks *tool.Callbacks
 }
 
 // NewRunnerProcessor assembles llmagent + runner with non-streaming
@@ -43,10 +48,17 @@ func NewRunnerProcessor(cfg RunnerConfig) *RunnerProcessor {
 		openai.WithBaseURL(cfg.BaseURL),
 		openai.WithAPIKey(cfg.APIKey),
 	)
-	llm := llmagent.New("assistant",
+	opts := []llmagent.Option{
 		llmagent.WithModel(m),
 		llmagent.WithGenerationConfig(model.GenerationConfig{Stream: false}),
-	)
+	}
+	if len(cfg.Tools) > 0 {
+		opts = append(opts, llmagent.WithTools(cfg.Tools))
+	}
+	if cfg.ToolCallbacks != nil {
+		opts = append(opts, llmagent.WithToolCallbacks(cfg.ToolCallbacks))
+	}
+	llm := llmagent.New("assistant", opts...)
 	r := runner.NewRunner(cfg.AppName, llm, runner.WithSessionService(cfg.SessionService))
 	return &RunnerProcessor{runner: r}
 }
