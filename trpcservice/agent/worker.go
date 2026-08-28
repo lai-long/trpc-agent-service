@@ -25,7 +25,10 @@ import (
 var tracer = otel.Tracer("trpc-agent-service/worker")
 
 func processAttr(msg channels.InboundMessage) otelmetric.MeasurementOption {
-	return otelmetric.WithAttributes(attribute.String("channel", msg.Channel))
+	return otelmetric.WithAttributes(
+		attribute.String("channel", msg.Channel),
+		attribute.String("tenant_id", msg.TenantID),
+	)
 }
 
 // Processor handles one inbound message and produces a reply.
@@ -50,6 +53,7 @@ func (EchoProcessor) Process(_ context.Context, msg channels.InboundMessage) (ch
 		UserID:     msg.UserID,
 		ChatID:     msg.ChatID,
 		Text:       "echo: " + msg.Text,
+		TenantID:   msg.TenantID,
 		TraceID:    msg.TraceID,
 	}, nil
 }
@@ -186,6 +190,7 @@ func (w *Worker) handle(ctx context.Context, m storage.Message) {
 	defer span.End()
 	span.SetAttributes(
 		attribute.String("channel", msg.Channel),
+		attribute.String("tenant_id", msg.TenantID),
 		attribute.String("session_key", msg.SessionKey),
 	)
 	started := time.Now()
@@ -250,13 +255,18 @@ func (w *Worker) handle(ctx context.Context, m storage.Message) {
 }
 
 // audit records one routine (allow) event per processed message on the async
-// lane. tenant_id is the zero UUID until the tenant module wires real tenants.
+// lane. TenantID comes from gateway routing; messages that bypassed routing
+// (dev fallback) are filed under the zero UUID.
 func (w *Worker) audit(msg channels.InboundMessage, started time.Time, processErr error) {
 	if w.Auditor == nil {
 		return
 	}
+	tenantID := msg.TenantID
+	if tenantID == "" {
+		tenantID = "00000000-0000-0000-0000-000000000000"
+	}
 	ev := storage.AuditEvent{
-		TenantID:  "00000000-0000-0000-0000-000000000000",
+		TenantID:  tenantID,
 		Channel:   msg.Channel,
 		UserID:    msg.UserID,
 		Decision:  "allow",

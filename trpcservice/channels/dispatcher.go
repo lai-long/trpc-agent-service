@@ -22,6 +22,7 @@ var senderTracer = otel.Tracer("trpc-agent-service/sender")
 func sendAttr(msg OutboundMessage, result string) otelmetric.MeasurementOption {
 	return otelmetric.WithAttributes(
 		attribute.String("channel", msg.Channel),
+		attribute.String("tenant_id", msg.TenantID),
 		attribute.String("result", result),
 	)
 }

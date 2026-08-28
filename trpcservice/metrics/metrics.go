@@ -30,7 +30,8 @@ import (
 )
 
 // Platform instruments. Labels reuse the log field names (channel, ...);
-// tenant_id joins them when the tenant module lands.
+// tenant_id is stamped by the Gateway after tenant routing (empty when
+// routing is disabled).
 //
 // Instruments are created at package load through the global meter, which
 // defers to the provider installed by InitMetrics — before that (e.g. in

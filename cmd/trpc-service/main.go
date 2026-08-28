@@ -21,6 +21,7 @@ import (
 	plog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/metrics"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/storage"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/web"
 	sessionredis "trpc.group/trpc-go/trpc-agent-go/session/redis"
 )
@@ -85,15 +86,20 @@ func serve() error {
 		return err
 	}
 
-	// Audit: async batch lane for routine events, sync lane for critical
-	// decisions. PG down at startup degrades to no audit with a warning — the
-	// message pipeline must not depend on it.
-	auditor, auditCleanup := startAuditor(ctx, cfg)
-	defer auditCleanup()
+	// PG serves two consumers: the Auditor (async batch lane for routine
+	// events, sync lane for critical decisions) and the tenant Resolver
+	// (gateway routing). PG down at startup degrades both to off with a
+	// warning — the message pipeline must not depend on them.
+	auditor, resolver, pgCleanup := startPGConsumers(ctx, cfg)
+	defer pgCleanup()
 
 	ch := mock.New()
 	mux := http.NewServeMux()
-	ch.RegisterRoutes(mux, web.EnqueueHandler{Stream: stream, Dedup: storage.NewDeduper(rdb)})
+	ch.RegisterRoutes(mux, web.EnqueueHandler{
+		Stream: stream,
+		Dedup:  storage.NewDeduper(rdb),
+		Routes: resolver,
+	})
 
 	metricsHandler, err := metrics.InitMetrics()
 	if err != nil {
@@ -149,21 +155,23 @@ func serve() error {
 	return g.Wait()
 }
 
-// startAuditor connects to PG and starts the audit flush loop. PG being down
-// degrades to no-audit with a warning; the message pipeline does not depend on
-// it (audit catches up from logs/traces during the outage). The returned
-// cleanup flushes pending events and closes the pool.
-func startAuditor(ctx context.Context, cfg config.Config) (*storage.Auditor, func()) {
+// startPGConsumers connects to PG and starts the consumers that depend on it:
+// the audit flush loop and the tenant resolver used for gateway routing. PG
+// being down degrades both to off with a warning; the message pipeline does
+// not depend on them (audit catches up from logs/traces during the outage,
+// and a nil resolver disables tenant routing). The returned cleanup stops the
+// auditor and closes the shared pool.
+func startPGConsumers(ctx context.Context, cfg config.Config) (*storage.Auditor, *tenant.Resolver, func()) {
 	noop := func() {}
 	pool, err := storage.NewPG(ctx, cfg.PGDSN)
 	if err != nil {
-		plog.Warnf("audit unavailable, PG unreachable: %v", err)
-		return nil, noop
+		plog.Warnf("PG unreachable, audit and tenant routing disabled: %v", err)
+		return nil, nil, noop
 	}
 	a := storage.NewAuditor(pool)
 	a.Start()
-	plog.Infof("audit enabled")
-	return a, func() {
+	plog.Infof("audit and tenant routing enabled")
+	return a, tenant.NewResolver(tenant.NewPGStore(pool)), func() {
 		a.Close()
 		pool.Close()
 	}

@@ -61,6 +61,7 @@ func (p *RunnerProcessor) Process(ctx context.Context, msg channels.InboundMessa
 		SessionKey: msg.SessionKey,
 		UserID:     msg.UserID,
 		ChatID:     msg.ChatID,
+		TenantID:   msg.TenantID,
 		TraceID:    msg.TraceID,
 	}
 

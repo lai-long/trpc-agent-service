@@ -17,6 +17,8 @@ import (
 
 // InboundMessage is a normalized inbound message: the Channel builds it from
 // the platform-specific callback payload and hands it to the Handler.
+// TenantID/AppID start empty; the Gateway stamps them after resolving
+// WebhookPath through channel_binding (tenant routing).
 type InboundMessage struct {
 	Channel     string    // channel type: mock / wecom / wechat_kf ...
 	MsgID       string    // IM platform message ID, for idempotent dedup (dedup:{channel}:{msg_id})
@@ -24,6 +26,9 @@ type InboundMessage struct {
 	UserID      string    // user ID on the IM side (wecom external_userid / wechat openid)
 	ChatID      string    // group chat ID; empty for direct chats
 	Text        string    // text content
+	WebhookPath string    // callback path the message arrived on; routes to tenant/app
+	TenantID    string    // owning tenant UUID, stamped by the Gateway
+	AppID       string    // owning agent app UUID, stamped by the Gateway
 	TraceID     string    // trace ID, spanning callback → Worker → reply
 	TraceParent string    // W3C traceparent, carries the trace across the Stream boundary
 	ReceivedAt  time.Time // when the callback arrived
@@ -38,6 +43,7 @@ type OutboundMessage struct {
 	UserID      string // recipient (required for direct chats)
 	ChatID      string // recipient group (required for group chats)
 	Text        string
+	TenantID    string // owning tenant UUID, carried through for sender metrics
 	TraceID     string
 	TraceParent string // W3C traceparent, carried through to the outbound span
 }

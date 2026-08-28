@@ -59,14 +59,15 @@ func (c *Channel) RegisterRoutes(mux *http.ServeMux, h channels.Handler) {
 
 		// 2. Normalize the external payload into the platform-wide InboundMessage.
 		msg := channels.InboundMessage{
-			Channel:    c.Name(),
-			MsgID:      req.MsgID,
-			SessionKey: channels.SessionKey(c.Name(), req.UserID, req.ChatID),
-			UserID:     req.UserID,
-			ChatID:     req.ChatID,
-			Text:       req.Text,
-			TraceID:    req.MsgID, // the gateway stamps the real trace ID over it
-			ReceivedAt: time.Now(),
+			Channel:     c.Name(),
+			MsgID:       req.MsgID,
+			SessionKey:  channels.SessionKey(c.Name(), req.UserID, req.ChatID),
+			UserID:      req.UserID,
+			ChatID:      req.ChatID,
+			Text:        req.Text,
+			WebhookPath: r.URL.Path, // the gateway routes tenant/app through it
+			TraceID:     req.MsgID,  // the gateway stamps the real trace ID over it
+			ReceivedAt:  time.Now(),
 		}
 
 		// 3. Hand over to the upper layer (the gateway dedups, enqueues to
