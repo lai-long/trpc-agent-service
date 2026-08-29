@@ -26,9 +26,11 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tool"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/web"
+	"trpc.group/trpc-go/trpc-agent-go/session"
 	sessionredis "trpc.group/trpc-go/trpc-agent-go/session/redis"
 	ttool "trpc.group/trpc-go/trpc-agent-go/tool"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -92,11 +94,12 @@ func serve() error {
 		return err
 	}
 
-	// PG serves two consumers: the Auditor (async batch lane for routine
-	// events, sync lane for critical decisions) and the tenant Resolver
-	// (gateway routing). PG down at startup degrades both to off with a
-	// warning — the message pipeline must not depend on them.
-	auditor, resolver, pgCleanup := startPGConsumers(ctx, cfg)
+	// PG serves three consumers: the Auditor (async batch lane for routine
+	// events, sync lane for critical decisions), the tenant Resolver (gateway
+	// routing), and the session store when SessionBackend=postgres. PG down at
+	// startup degrades audit and routing to off with a warning — the message
+	// pipeline must not depend on them.
+	auditor, resolver, pgPool, pgCleanup := startPGConsumers(ctx, cfg)
 	defer pgCleanup()
 
 	ch := mock.New()
@@ -133,7 +136,7 @@ func serve() error {
 		IdleTimeout:       60 * time.Second,
 	}
 
-	processor, cleanup := buildProcessor(ctx, cfg, rdb, auditor)
+	processor, cleanup := buildProcessor(ctx, cfg, rdb, auditor, pgPool)
 	defer cleanup()
 
 	consumer := fmt.Sprintf("%s-%d", "allinone", os.Getpid())
@@ -176,17 +179,17 @@ func serve() error {
 // not depend on them (audit catches up from logs/traces during the outage,
 // and a nil resolver disables tenant routing). The returned cleanup stops the
 // auditor and closes the shared pool.
-func startPGConsumers(ctx context.Context, cfg config.Config) (*storage.Auditor, *tenant.Resolver, func()) {
+func startPGConsumers(ctx context.Context, cfg config.Config) (*storage.Auditor, *tenant.Resolver, *pgxpool.Pool, func()) {
 	noop := func() {}
 	pool, err := storage.NewPG(ctx, cfg.PGDSN)
 	if err != nil {
 		plog.Warnf("PG unreachable, audit and tenant routing disabled: %v", err)
-		return nil, nil, noop
+		return nil, nil, nil, noop
 	}
 	a := storage.NewAuditor(pool)
 	a.Start()
 	plog.Infof("audit and tenant routing enabled")
-	return a, tenant.NewResolver(tenant.NewPGStore(pool)), func() {
+	return a, tenant.NewResolver(tenant.NewPGStore(pool)), pool, func() {
 		a.Close()
 		pool.Close()
 	}
@@ -226,7 +229,7 @@ func startWecom(cfg config.Config) *wecom.Channel {
 // checks and message-level auditing. It falls back to EchoProcessor when the
 // model key is missing, so the pipeline stays demoable without LLM access.
 // The returned cleanup closes resources.
-func buildProcessor(ctx context.Context, cfg config.Config, rdb *redis.Client, auditor *storage.Auditor) (agent.Processor, func()) {
+func buildProcessor(ctx context.Context, cfg config.Config, rdb *redis.Client, auditor *storage.Auditor, pgPool *pgxpool.Pool) (agent.Processor, func()) {
 	noop := func() {}
 
 	registry := tool.DemoTools()
@@ -248,21 +251,38 @@ func buildProcessor(ctx context.Context, cfg config.Config, rdb *redis.Client, a
 		return wrap(agent.EchoProcessor{}), noop
 	}
 
-	// WithEnableTracing is required beyond observability: with tracing disabled,
-	// the session service's startSpan falls back to the caller's active span and
-	// its defer span.End() would end OUR worker span prematurely (framework quirk).
-	sess, err := sessionredis.NewService(
-		sessionredis.WithRedisClientURL("redis://"+cfg.RedisAddr),
-		sessionredis.WithEnableTracing(true),
-	)
-	if err != nil {
-		plog.Warnf("session service unavailable (%v), falling back to echo processor", err)
-		return wrap(agent.EchoProcessor{}), noop
+	// Session backend: redis (hot data, default) or postgres (event journal +
+	// snapshot, design decision 2). WithEnableTracing is required beyond
+	// observability: with tracing disabled, the session service's startSpan
+	// falls back to the caller's active span and its defer span.End() would
+	// end OUR worker span prematurely (framework quirk).
+	var sess session.Service
+	var sessCleanup func()
+	switch cfg.SessionBackend {
+	case "postgres":
+		if pgPool == nil {
+			plog.Warnf("TRPC_SESSION_BACKEND=postgres but PG is unreachable, falling back to redis")
+			break
+		}
+		sess = storage.NewPGSessionService(pgPool)
+		sessCleanup = func() {}
+		plog.Infof("session backend: postgres")
+	}
+	if sess == nil {
+		rs, err := sessionredis.NewService(
+			sessionredis.WithRedisClientURL("redis://"+cfg.RedisAddr),
+			sessionredis.WithEnableTracing(true),
+		)
+		if err != nil {
+			plog.Warnf("session service unavailable (%v), falling back to echo processor", err)
+			return wrap(agent.EchoProcessor{}), noop
+		}
+		sess, sessCleanup = rs, func() { _ = rs.Close() }
 	}
 
 	callbacks := ttool.NewCallbacks().RegisterBeforeTool(approver.BeforeTool)
 	p := agent.NewRunnerProcessor(agent.RunnerConfig{
-		AppName:        "trpc-service",
+		AppName:        cfg.AppName,
 		BaseURL:        cfg.ModelBaseURL,
 		APIKey:         apiKey,
 		ModelName:      cfg.ModelName,
@@ -271,5 +291,5 @@ func buildProcessor(ctx context.Context, cfg config.Config, rdb *redis.Client, a
 		ToolCallbacks:  callbacks,
 	})
 	plog.Infof("runner processor ready (model=%s)", cfg.ModelName)
-	return wrap(p), func() { _ = p.Close(); _ = sess.Close() }
+	return wrap(p), func() { _ = p.Close(); sessCleanup() }
 }
