@@ -5,10 +5,10 @@ go 1.27
 toolchain go1.27.0
 
 require (
-	github.com/gorilla/websocket v1.5.3
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/prometheus/client_golang v1.20.5
 	github.com/redis/go-redis/v9 v9.22.0
+	github.com/sbzhu/weworkapi_golang/wxbizmsgcrypt v0.0.0-00010101000000-000000000000
 	go.opentelemetry.io/otel v1.46.0
 	go.opentelemetry.io/otel/exporters/prometheus v0.56.0
 	go.opentelemetry.io/otel/metric v1.46.0
@@ -65,3 +65,5 @@ require (
 	trpc.group/trpc-go/trpc-a2a-go v0.2.6-0.20260721084546-18c8244d0acb // indirect
 	trpc.group/trpc-go/trpc-agent-go/storage/redis v0.0.3 // indirect
 )
+
+replace github.com/sbzhu/weworkapi_golang/wxbizmsgcrypt => ./wxbizmsgcrypt

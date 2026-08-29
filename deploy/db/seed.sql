@@ -21,4 +21,7 @@ INSERT INTO channel_binding (id, tenant_id, channel, app_id, webhook_path, statu
     ('00000000-0000-0000-0000-000000000201', '00000000-0000-0000-0000-000000000001',
      'mock', '00000000-0000-0000-0000-000000000101', '/mock/callback', 'active'),
     ('00000000-0000-0000-0000-000000000202', '00000000-0000-0000-0000-000000000001',
-     'testweb', '00000000-0000-0000-0000-000000000101', '/testweb/callback', 'active');
+     'testweb', '00000000-0000-0000-0000-000000000101', '/testweb/callback', 'active'),
+    -- token_ref/aeskey_ref resolve via the SecretResolver (data/secrets/ locally)
+    ('00000000-0000-0000-0000-000000000203', '00000000-0000-0000-0000-000000000001',
+     'wecom', '00000000-0000-0000-0000-000000000101', '/wecom/callback', 'active');

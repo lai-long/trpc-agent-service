@@ -26,6 +26,15 @@ type Config struct {
 	ModelBaseURL   string // TRPC_MODEL_BASE_URL: OpenAI-compatible endpoint (DeepSeek default)
 	ModelName      string // TRPC_MODEL_NAME: model name, e.g. deepseek-v4-flash (cheapest)
 	ModelAPIKeyRef string // TRPC_MODEL_APIKEY_REF: secret ref (NOT the key itself) resolved via SecretResolver
+
+	// WeCom channel: enabled when TRPC_WECOM_CORP_ID is set. All secret
+	// material is referenced, resolved via SecretResolver.
+	WecomCorpID    string // TRPC_WECOM_CORP_ID
+	WecomAgentID   string // TRPC_WECOM_AGENT_ID (integer)
+	WecomTokenRef  string // TRPC_WECOM_TOKEN_REF: callback token secret ref
+	WecomAESKeyRef string // TRPC_WECOM_AESKEY_REF: EncodingAESKey secret ref
+	WecomSecretRef string // TRPC_WECOM_SECRET_REF: corpsecret secret ref
+	WecomAPIBase   string // TRPC_WECOM_API_BASE: default https://qyapi.weixin.qq.com
 }
 
 // Load reads configuration from environment variables, filling defaults for
@@ -43,6 +52,13 @@ func Load() Config {
 		ModelBaseURL:   getenv("TRPC_MODEL_BASE_URL", "https://api.deepseek.com"),
 		ModelName:      getenv("TRPC_MODEL_NAME", "deepseek-v4-flash"),
 		ModelAPIKeyRef: getenv("TRPC_MODEL_APIKEY_REF", "deepseek-apikey"),
+
+		WecomCorpID:    getenv("TRPC_WECOM_CORP_ID", ""),
+		WecomAgentID:   getenv("TRPC_WECOM_AGENT_ID", ""),
+		WecomTokenRef:  getenv("TRPC_WECOM_TOKEN_REF", "wecom-token"),
+		WecomAESKeyRef: getenv("TRPC_WECOM_AESKEY_REF", "wecom-aeskey"),
+		WecomSecretRef: getenv("TRPC_WECOM_SECRET_REF", "wecom-secret"),
+		WecomAPIBase:   getenv("TRPC_WECOM_API_BASE", "https://qyapi.weixin.qq.com"),
 	}
 }
 

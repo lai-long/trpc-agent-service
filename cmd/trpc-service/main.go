@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -17,6 +18,7 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/agent"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels/mock"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/channels/wecom"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/config"
 	plog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/metrics"
@@ -98,12 +100,21 @@ func serve() error {
 	defer pgCleanup()
 
 	ch := mock.New()
-	mux := http.NewServeMux()
-	ch.RegisterRoutes(mux, web.EnqueueHandler{
+	enqueue := web.EnqueueHandler{
 		Stream: stream,
 		Dedup:  storage.NewDeduper(rdb),
 		Routes: resolver,
-	})
+	}
+	mux := http.NewServeMux()
+	ch.RegisterRoutes(mux, enqueue)
+
+	// Channel registry for the outbound sender: mock always, wecom when
+	// configured. Channel misconfiguration disables only that channel.
+	channelSet := map[string]channels.Channel{ch.Name(): ch}
+	if wc := startWecom(cfg); wc != nil {
+		wc.RegisterRoutes(mux, enqueue)
+		channelSet[wc.Name()] = wc
+	}
 
 	metricsHandler, err := metrics.InitMetrics()
 	if err != nil {
@@ -142,7 +153,7 @@ func serve() error {
 	sender := &channels.Sender{
 		Stream:   stream,
 		Sent:     storage.NewSentMarker(rdb),
-		Channels: map[string]channels.Channel{ch.Name(): ch},
+		Channels: channelSet,
 		Name:     consumer + "-s",
 	}
 	g.Go(func() error { return sender.Run(gctx) })
@@ -179,6 +190,34 @@ func startPGConsumers(ctx context.Context, cfg config.Config) (*storage.Auditor,
 		a.Close()
 		pool.Close()
 	}
+}
+
+// startWecom builds the WeCom channel from env config; it returns nil (with a
+// warning) when the channel is not configured or its secrets are missing, so
+// the rest of the platform keeps serving the other channels.
+func startWecom(cfg config.Config) *wecom.Channel {
+	if cfg.WecomCorpID == "" {
+		return nil
+	}
+	agentID, err := strconv.Atoi(cfg.WecomAgentID)
+	if err != nil || agentID == 0 {
+		plog.Warnf("wecom channel disabled: invalid TRPC_WECOM_AGENT_ID %q", cfg.WecomAgentID)
+		return nil
+	}
+	wc, err := wecom.New(wecom.Config{
+		CorpID:    cfg.WecomCorpID,
+		AgentID:   agentID,
+		TokenRef:  cfg.WecomTokenRef,
+		AESKeyRef: cfg.WecomAESKeyRef,
+		SecretRef: cfg.WecomSecretRef,
+		APIBase:   cfg.WecomAPIBase,
+	}, config.NewFileResolver(cfg.SecretsDir))
+	if err != nil {
+		plog.Warnf("wecom channel disabled: %v", err)
+		return nil
+	}
+	plog.Infof("wecom channel enabled (callback: POST /wecom/callback)")
+	return wc
 }
 
 // buildProcessor assembles the processing chain: the platform tool registry,
