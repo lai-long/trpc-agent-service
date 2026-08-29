@@ -125,6 +125,17 @@ func serve() error {
 	}
 	mux.Handle("GET /metrics", metricsHandler)
 
+	// Admin API needs PG; it also starts the resolver's invalidation watch so
+	// publish/rollback reaches workers in seconds (design 5.2.3).
+	if pgPool != nil {
+		web.NewAdminAPI(pgPool, auditor, rdb, cfg.AdminToken).RegisterRoutes(mux)
+		resolver.WatchInvalidations(ctx, rdb)
+		if cfg.AdminToken == "" {
+			plog.Warnf("admin API unprotected (TRPC_ADMIN_TOKEN unset) — dev mode only")
+		}
+		plog.Infof("admin API enabled (/admin/...)")
+	}
+
 	srv := &http.Server{
 		Addr:    cfg.HTTPAddr,
 		Handler: mux,

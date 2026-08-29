@@ -7,8 +7,25 @@ import (
 	"sync"
 	"time"
 
+	"github.com/redis/go-redis/v9"
+
 	plog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
 )
+
+// InvalidationChannel is the Redis pub/sub channel carrying config
+// invalidation notifications (design 5.2.3): the Admin API publishes after
+// tenant/app/binding writes and publish/rollback; Resolvers drop their cache
+// on receipt so changes take effect in seconds. The cache TTL remains the
+// fallback when a notification is lost.
+const InvalidationChannel = "tenant:invalidate"
+
+// PublishInvalidation notifies all Resolver instances to drop their cache.
+func PublishInvalidation(ctx context.Context, rdb *redis.Client) error {
+	if err := rdb.Publish(ctx, InvalidationChannel, "1").Err(); err != nil {
+		return fmt.Errorf("publish invalidation: %w", err)
+	}
+	return nil
+}
 
 // DefaultCacheTTL bounds how long a snapshot is served before reloading.
 // The publish/rollback pub/sub invalidation arrives with the Admin API
@@ -89,6 +106,35 @@ func (r *Resolver) Resolve(ctx context.Context, webhookPath string) (Route, erro
 		return Route{}, fmt.Errorf("%w: app %s disabled", ErrInactive, app.ID)
 	}
 	return Route{Tenant: t, App: app, Binding: b}, nil
+}
+
+// Invalidate drops the cached snapshot; the next Resolve reloads.
+func (r *Resolver) Invalidate() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.loaded = false
+}
+
+// WatchInvalidations subscribes to the invalidation channel until ctx is
+// canceled; each notification drops the cache so a publish/rollback takes
+// effect within seconds instead of at TTL expiry.
+func (r *Resolver) WatchInvalidations(ctx context.Context, rdb *redis.Client) {
+	go func() {
+		sub := rdb.Subscribe(ctx, InvalidationChannel)
+		defer func() { _ = sub.Close() }()
+		ch := sub.Channel()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case _, ok := <-ch:
+				if !ok {
+					return
+				}
+				r.Invalidate()
+			}
+		}
+	}()
 }
 
 // refresh reloads the snapshot when the cache is stale. Concurrent refreshes

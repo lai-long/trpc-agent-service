@@ -44,6 +44,10 @@ type Config struct {
 	WecomAESKeyRef string // TRPC_WECOM_AESKEY_REF: EncodingAESKey secret ref
 	WecomSecretRef string // TRPC_WECOM_SECRET_REF: corpsecret secret ref
 	WecomAPIBase   string // TRPC_WECOM_API_BASE: default https://qyapi.weixin.qq.com
+
+	// AdminToken guards the Admin API (Authorization: Bearer); empty means
+	// dev mode with no auth — set it in any shared environment.
+	AdminToken string // TRPC_ADMIN_TOKEN
 }
 
 // Load reads configuration from environment variables, filling defaults for
@@ -71,6 +75,8 @@ func Load() Config {
 		WecomAESKeyRef: getenv("TRPC_WECOM_AESKEY_REF", "wecom-aeskey"),
 		WecomSecretRef: getenv("TRPC_WECOM_SECRET_REF", "wecom-secret"),
 		WecomAPIBase:   getenv("TRPC_WECOM_API_BASE", "https://qyapi.weixin.qq.com"),
+
+		AdminToken: getenv("TRPC_ADMIN_TOKEN", ""),
 	}
 }
 

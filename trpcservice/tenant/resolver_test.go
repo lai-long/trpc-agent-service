@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/liuzengh/trpc-agent-service/trpcservice/storage"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 )
 
@@ -129,4 +130,58 @@ func TestFirstLoadFailure(t *testing.T) {
 	if _, err := r.Resolve(context.Background(), "/mock/callback"); err == nil {
 		t.Fatal("want error when the first load fails")
 	}
+}
+
+// A pub/sub invalidation drops the cache before TTL expiry. Needs the Redis
+// from compose (localhost:6380); skips when unreachable.
+func TestWatchInvalidations(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	rdb, err := storage.NewRedis(ctx, "localhost:6380")
+	if err != nil {
+		t.Skipf("redis unavailable (%v), skipping integration test", err)
+	}
+	defer func() { _ = rdb.Close() }()
+
+	store := &fakeStore{data: testData()}
+	r := tenant.NewResolverWithTTL(store, time.Hour) // TTL far away: only invalidation can refresh
+	r.WatchInvalidations(ctx, rdb)
+
+	if _, err := r.Resolve(ctx, "/mock/callback"); err != nil {
+		t.Fatal(err)
+	}
+	if n := store.loadCount(); n != 1 {
+		t.Fatalf("want 1 load, got %d", n)
+	}
+
+	// Pub/sub is fire-and-forget: publish until the subscriber is attached
+	// (Publish reports the receiver count), then the notification must land.
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		n, err := rdb.Publish(ctx, tenant.InvalidationChannel, "1").Result()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n >= 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("watcher never subscribed within 3s")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	// The notification triggers an asynchronous reload; poll for it.
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := r.Resolve(ctx, "/mock/callback"); err != nil {
+			t.Fatal(err)
+		}
+		if store.loadCount() >= 2 {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatal("invalidation did not trigger a reload within 3s")
 }
