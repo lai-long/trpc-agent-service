@@ -178,14 +178,16 @@ func (s *PGSessionService) DeleteSession(ctx context.Context, key session.Key, _
 
 	var sessID string
 	err = tx.QueryRow(ctx,
-		`DELETE FROM session WHERE app_id = $1 AND session_key = $2 RETURNING id`,
+		`SELECT id FROM session WHERE app_id = $1 AND session_key = $2 FOR UPDATE`,
 		key.AppName, key.SessionID).Scan(&sessID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil // already gone
 	}
 	if err != nil {
-		return fmt.Errorf("delete session: %w", err)
+		return fmt.Errorf("find session: %w", err)
 	}
+	// Children first: neither FK declares ON DELETE CASCADE, so deleting the
+	// session row while events still reference it would violate the FK.
 	for _, q := range []string{
 		`DELETE FROM session_event WHERE session_id = $1`,
 		`DELETE FROM summary WHERE session_id = $1`,
@@ -193,6 +195,9 @@ func (s *PGSessionService) DeleteSession(ctx context.Context, key session.Key, _
 		if _, err := tx.Exec(ctx, q, sessID); err != nil {
 			return fmt.Errorf("delete children: %w", err)
 		}
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM session WHERE id = $1`, sessID); err != nil {
+		return fmt.Errorf("delete session: %w", err)
 	}
 	return tx.Commit(ctx)
 }

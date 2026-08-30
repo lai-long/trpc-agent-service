@@ -2,6 +2,7 @@ package storage_test
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -184,6 +185,40 @@ func TestPGSessionUpdateStateAndDelete(t *testing.T) {
 	}
 	if events != 0 {
 		t.Fatalf("events must be deleted with the session, got %d", events)
+	}
+}
+
+// Regression: session_event has a FK to session without ON DELETE CASCADE, so
+// deleting a session that already has events only works when the children go
+// first. An empty session hides the bug, hence this case.
+func TestPGSessionDeleteWithEvents(t *testing.T) {
+	svc, pool := pgSessionService(t)
+	ctx := context.Background()
+	key := testKey(t.Name())
+	cleanupSession(t, pool, key)
+	t.Cleanup(func() { cleanupSession(t, pool, key) })
+
+	sess, err := svc.CreateSession(ctx, key, session.StateMap{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, id := range []string{"e1", "e2", "e3"} {
+		if err := svc.AppendEvent(ctx, sess, textEvent(id, "user", fmt.Sprintf("msg %d", i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := svc.DeleteSession(ctx, key); err != nil {
+		t.Fatalf("delete session with events: %v", err)
+	}
+	var left int
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM session WHERE app_id=$1 AND session_key=$2`,
+		key.AppName, key.SessionID).Scan(&left); err != nil {
+		t.Fatal(err)
+	}
+	if left != 0 {
+		t.Fatalf("session row must be gone, got %d", left)
 	}
 }
 
