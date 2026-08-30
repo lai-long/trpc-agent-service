@@ -27,10 +27,30 @@ func NewDeduper(rdb *redis.Client) *Deduper {
 // Check reports whether the message arrives for the first time. SETNX is
 // atomic, so concurrent duplicates of the same msg_id race safely.
 func (d *Deduper) Check(ctx context.Context, channel, msgID string) (bool, error) {
-	key := fmt.Sprintf("dedup:%s:%s", channel, msgID)
+	key := dedupKey(channel, msgID)
 	ok, err := d.rdb.SetNX(ctx, key, 1, DedupTTL).Result()
 	if err != nil {
 		return false, fmt.Errorf("dedup %s: %w", key, err)
 	}
 	return ok, nil
+}
+
+// Forget clears the key set by a successful Check, reopening the message for
+// redelivery.
+//
+// It is the undo path for failures after Check (e.g. a failed enqueue): the
+// dedup key only exists to absorb the IM's own redeliveries, and those
+// redeliveries are exactly our retry mechanism (design 5.2.2). Leaving the
+// key behind would drop every retry for the whole 24h TTL — the message is
+// silently lost instead of delayed.
+func (d *Deduper) Forget(ctx context.Context, channel, msgID string) error {
+	key := dedupKey(channel, msgID)
+	if err := d.rdb.Del(ctx, key).Err(); err != nil {
+		return fmt.Errorf("dedup forget %s: %w", key, err)
+	}
+	return nil
+}
+
+func dedupKey(channel, msgID string) string {
+	return fmt.Sprintf("dedup:%s:%s", channel, msgID)
 }

@@ -54,3 +54,35 @@ func TestDeduper(t *testing.T) {
 	}
 	rdb.Del(ctx, fmt.Sprintf("dedup:wecom:%s", msgID))
 }
+
+// Forget reopens a message for redelivery. This is what keeps a failed
+// delivery retryable: without it, a failure after Check (a failed enqueue)
+// leaves the key behind and the IM's redelivery is dropped as a duplicate for
+// the whole TTL.
+func TestDeduperForget(t *testing.T) {
+	rdb := redisOrSkip(t)
+	ctx := context.Background()
+	msgID := fmt.Sprintf("dedup-forget-%d", time.Now().UnixNano())
+	key := fmt.Sprintf("dedup:mock:%s", msgID)
+	t.Cleanup(func() { rdb.Del(ctx, key) })
+
+	d := NewDeduper(rdb)
+	if first, err := d.Check(ctx, "mock", msgID); err != nil || !first {
+		t.Fatalf("first arrival should pass, got first=%v err=%v", first, err)
+	}
+	if err := d.Forget(ctx, "mock", msgID); err != nil {
+		t.Fatal(err)
+	}
+
+	first, err := d.Check(ctx, "mock", msgID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !first {
+		t.Fatal("message must pass again after Forget")
+	}
+	// Forgetting only touches its own key namespace.
+	if n, err := rdb.Exists(ctx, "dedup:wecom:"+msgID).Result(); err != nil || n != 0 {
+		t.Fatalf("other channel key must be untouched, n=%d err=%v", n, err)
+	}
+}
