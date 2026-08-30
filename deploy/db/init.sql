@@ -119,6 +119,7 @@ CREATE TABLE memory_item (
     app_id       uuid,                  -- NULL means tenant-shared memory
     user_id      varchar(128) NOT NULL,
     content      text         NOT NULL,
+    topics       jsonb,                 -- framework memory topics (array of strings)
     embedding_id varchar(256),          -- vector ID in the vector store (externalized for easier migration)
     created_at   timestamptz  NOT NULL DEFAULT now(),
     updated_at   timestamptz  NOT NULL DEFAULT now(),

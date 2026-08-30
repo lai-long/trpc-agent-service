@@ -26,6 +26,9 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tool"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/web"
+	"trpc.group/trpc-go/trpc-agent-go/knowledge"
+	openaiembed "trpc.group/trpc-go/trpc-agent-go/knowledge/embedder/openai"
+	"trpc.group/trpc-go/trpc-agent-go/memory"
 	"trpc.group/trpc-go/trpc-agent-go/session"
 	sessionredis "trpc.group/trpc-go/trpc-agent-go/session/redis"
 	ttool "trpc.group/trpc-go/trpc-agent-go/tool"
@@ -125,10 +128,16 @@ func serve() error {
 	}
 	mux.Handle("GET /metrics", metricsHandler)
 
+	// Knowledge base: enabled only with an embeddings-capable endpoint
+	// (TRPC_EMBEDDER_*); the default DeepSeek chat endpoint has none.
+	kb := buildKnowledge(ctx, cfg)
+
 	// Admin API needs PG; it also starts the resolver's invalidation watch so
 	// publish/rollback reaches workers in seconds (design 5.2.3).
 	if pgPool != nil {
-		web.NewAdminAPI(pgPool, auditor, rdb, cfg.AdminToken).RegisterRoutes(mux)
+		adminAPI := web.NewAdminAPI(pgPool, auditor, rdb, cfg.AdminToken)
+		adminAPI.Knowledge = kb
+		adminAPI.RegisterRoutes(mux)
 		resolver.WatchInvalidations(ctx, rdb)
 		if cfg.AdminToken == "" {
 			plog.Warnf("admin API unprotected (TRPC_ADMIN_TOKEN unset) — dev mode only")
@@ -147,7 +156,7 @@ func serve() error {
 		IdleTimeout:       60 * time.Second,
 	}
 
-	processor, cleanup := buildProcessor(ctx, cfg, rdb, auditor, pgPool)
+	processor, cleanup := buildProcessor(ctx, cfg, rdb, auditor, pgPool, kb)
 	defer cleanup()
 
 	consumer := fmt.Sprintf("%s-%d", "allinone", os.Getpid())
@@ -236,11 +245,12 @@ func startWecom(cfg config.Config) *wecom.Channel {
 
 // buildProcessor assembles the processing chain: the platform tool registry,
 // the dangerous-tool Approver, the Runner-backed inner processor (llmagent +
-// session/redis), and the Guarded guardrail wrapper that owns input/output
-// checks and message-level auditing. It falls back to EchoProcessor when the
-// model key is missing, so the pipeline stays demoable without LLM access.
+// session backend + memory service + optional knowledge base), and the
+// Guarded guardrail wrapper that owns input/output checks and message-level
+// auditing. It falls back to EchoProcessor when the model key is missing, so
+// the pipeline stays demoable without LLM access.
 // The returned cleanup closes resources.
-func buildProcessor(ctx context.Context, cfg config.Config, rdb *redis.Client, auditor *storage.Auditor, pgPool *pgxpool.Pool) (agent.Processor, func()) {
+func buildProcessor(ctx context.Context, cfg config.Config, rdb *redis.Client, auditor *storage.Auditor, pgPool *pgxpool.Pool, kb *knowledge.BuiltinKnowledge) (agent.Processor, func()) {
 	noop := func() {}
 
 	registry := tool.DemoTools()
@@ -291,16 +301,74 @@ func buildProcessor(ctx context.Context, cfg config.Config, rdb *redis.Client, a
 		sess, sessCleanup = rs, func() { _ = rs.Close() }
 	}
 
+	// Memory service over the PG memory_item table (two-level scope, soft
+	// delete); knowledge gets the tenant/app metadata filter for isolation.
+	var memService memory.Service
+	var knowledgeFilter map[string]any
+	if pgPool != nil {
+		memService = storage.NewPGMemoryService(pgPool)
+		var tenantID string
+		if err := pgPool.QueryRow(ctx,
+			`SELECT tenant_id FROM agent_app WHERE id = $1`, cfg.AppName).Scan(&tenantID); err != nil {
+			plog.Warnf("resolve tenant for app %s: %v (memory/knowledge disabled)", cfg.AppName, err)
+			memService = nil
+		} else {
+			knowledgeFilter = map[string]any{"tenant_id": tenantID, "app_id": cfg.AppName}
+		}
+	}
+
 	callbacks := ttool.NewCallbacks().RegisterBeforeTool(approver.BeforeTool)
+	// Guard the typed-nil interface: a nil *BuiltinKnowledge must stay a nil
+	// Knowledge, or the agent would wire a knowledge tool onto nothing.
+	var kbIface knowledge.Knowledge
+	if kb != nil {
+		kbIface = kb
+	}
 	p := agent.NewRunnerProcessor(agent.RunnerConfig{
-		AppName:        cfg.AppName,
-		BaseURL:        cfg.ModelBaseURL,
-		APIKey:         apiKey,
-		ModelName:      cfg.ModelName,
-		SessionService: sess,
-		Tools:          registry.All(),
-		ToolCallbacks:  callbacks,
+		AppName:         cfg.AppName,
+		BaseURL:         cfg.ModelBaseURL,
+		APIKey:          apiKey,
+		ModelName:       cfg.ModelName,
+		SessionService:  sess,
+		Tools:           registry.All(),
+		ToolCallbacks:   callbacks,
+		MemoryService:   memService,
+		Knowledge:       kbIface,
+		KnowledgeFilter: knowledgeFilter,
 	})
 	plog.Infof("runner processor ready (model=%s)", cfg.ModelName)
 	return wrap(p), func() { _ = p.Close(); sessCleanup() }
+}
+
+// buildKnowledge builds the pgvector-backed knowledge base when an
+// embeddings-capable endpoint is configured; otherwise it returns nil and the
+// agent runs without knowledge retrieval.
+func buildKnowledge(ctx context.Context, cfg config.Config) *knowledge.BuiltinKnowledge {
+	if cfg.EmbedderModel == "" {
+		return nil
+	}
+	resolver := config.NewFileResolver(cfg.SecretsDir)
+	key, err := resolver.Resolve(ctx, cfg.EmbedderKeyRef)
+	if err != nil {
+		plog.Warnf("embedder key %q unavailable (%v), knowledge disabled", cfg.EmbedderKeyRef, err)
+		return nil
+	}
+	dim, err := strconv.Atoi(cfg.EmbedderDim)
+	if err != nil || dim <= 0 {
+		plog.Warnf("invalid TRPC_EMBEDDER_DIMENSION %q, knowledge disabled", cfg.EmbedderDim)
+		return nil
+	}
+	emb := openaiembed.New(
+		openaiembed.WithModel(cfg.EmbedderModel),
+		openaiembed.WithAPIKey(key),
+		openaiembed.WithBaseURL(cfg.EmbedderBaseURL),
+		openaiembed.WithDimensions(dim),
+	)
+	kb, err := agent.NewKnowledgeBase(cfg.PGDSN, cfg.KnowledgeTable, dim, emb)
+	if err != nil {
+		plog.Warnf("knowledge base unavailable (%v), knowledge disabled", err)
+		return nil
+	}
+	plog.Infof("knowledge base enabled (model=%s, dim=%d)", cfg.EmbedderModel, dim)
+	return kb
 }

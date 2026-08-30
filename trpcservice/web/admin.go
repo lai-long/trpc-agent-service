@@ -13,7 +13,9 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
+	"trpc.group/trpc-go/trpc-agent-go/knowledge"
 
+	"github.com/liuzengh/trpc-agent-service/trpcservice/agent"
 	plog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/storage"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
@@ -31,6 +33,10 @@ type AdminAPI struct {
 	auditor *storage.Auditor // nil disables write-op auditing
 	rdb     *redis.Client    // nil disables invalidation broadcasts
 	token   string
+
+	// Knowledge ingests documents into the shared knowledge store (nil when
+	// no embedder is configured; the ingestion endpoint then answers 503).
+	Knowledge *knowledge.BuiltinKnowledge
 }
 
 // NewAdminAPI creates the API. The bearer token empty means dev mode.
@@ -55,6 +61,7 @@ func (a *AdminAPI) RegisterRoutes(mux *http.ServeMux) {
 	handle("POST /admin/apps/{id}/bindings", a.createBinding)
 	handle("GET /admin/apps/{id}/bindings", a.listBindings)
 	handle("DELETE /admin/apps/{id}/bindings/{binding}", a.deleteBinding)
+	handle("POST /admin/apps/{id}/knowledge/documents", a.addKnowledgeDocument)
 	handle("GET /admin/audit", a.queryAudit)
 }
 
@@ -490,6 +497,57 @@ func (a *AdminAPI) deleteBinding(w http.ResponseWriter, r *http.Request) {
 	}
 	a.afterWrite(r, "delete_binding", "")
 	writeJSON(w, http.StatusOK, map[string]any{"deleted": true})
+}
+
+// ---------------------------------------------------------------------------
+// Knowledge ingestion
+// ---------------------------------------------------------------------------
+
+// addKnowledgeDocument ingests one inline document into the shared knowledge
+// store. tenant_id / app_id are forced into the document metadata so agent
+// searches filtered by them stay tenant-isolated.
+func (a *AdminAPI) addKnowledgeDocument(w http.ResponseWriter, r *http.Request) {
+	if a.Knowledge == nil {
+		writeError(w, http.StatusServiceUnavailable, "knowledge is disabled (no embedder configured)")
+		return
+	}
+	var in struct {
+		Name    string `json:"name"`
+		Content string `json:"content"`
+	}
+	if !decodeBody(w, r, &in) {
+		return
+	}
+	if in.Name == "" || in.Content == "" {
+		writeError(w, http.StatusBadRequest, "name and content are required")
+		return
+	}
+	var tenantID string
+	err := a.pool.QueryRow(r.Context(),
+		`SELECT tenant_id FROM agent_app WHERE id = $1`, r.PathValue("id")).Scan(&tenantID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		writeError(w, http.StatusNotFound, "app not found")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	src := &agent.DocSource{
+		DocName: in.Name,
+		Content: in.Content,
+		Metadata: map[string]any{
+			"tenant_id": tenantID,
+			"app_id":    r.PathValue("id"),
+		},
+	}
+	if err := a.Knowledge.AddSource(r.Context(), src); err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("ingest document: %v", err))
+		return
+	}
+	a.afterWrite(r, "add_knowledge_document", tenantID)
+	writeJSON(w, http.StatusCreated, map[string]any{"ingested": in.Name})
 }
 
 // ---------------------------------------------------------------------------

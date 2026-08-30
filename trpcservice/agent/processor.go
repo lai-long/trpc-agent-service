@@ -9,6 +9,8 @@ import (
 	otelmetric "go.opentelemetry.io/otel/metric"
 	"go.uber.org/zap"
 	"trpc.group/trpc-go/trpc-agent-go/agent/llmagent"
+	"trpc.group/trpc-go/trpc-agent-go/knowledge"
+	"trpc.group/trpc-go/trpc-agent-go/memory"
 	"trpc.group/trpc-go/trpc-agent-go/model"
 	"trpc.group/trpc-go/trpc-agent-go/model/openai"
 	"trpc.group/trpc-go/trpc-agent-go/runner"
@@ -39,6 +41,13 @@ type RunnerConfig struct {
 	// guardrail's dangerous-tool interception into the agent.
 	Tools         []tool.Tool
 	ToolCallbacks *tool.Callbacks
+	// MemoryService, when set, is injected into invocations (the memory tools
+	// resolve it from context) and its tool set joins the agent's tools.
+	MemoryService memory.Service
+	// Knowledge, when set, gives the agent a knowledge search tool scoped by
+	// KnowledgeFilter (tenant/app metadata isolation).
+	Knowledge       knowledge.Knowledge
+	KnowledgeFilter map[string]any
 }
 
 // NewRunnerProcessor assembles llmagent + runner with non-streaming
@@ -48,18 +57,32 @@ func NewRunnerProcessor(cfg RunnerConfig) *RunnerProcessor {
 		openai.WithBaseURL(cfg.BaseURL),
 		openai.WithAPIKey(cfg.APIKey),
 	)
+	tools := cfg.Tools
+	if cfg.MemoryService != nil {
+		tools = append(append([]tool.Tool{}, tools...), cfg.MemoryService.Tools()...)
+	}
 	opts := []llmagent.Option{
 		llmagent.WithModel(m),
 		llmagent.WithGenerationConfig(model.GenerationConfig{Stream: false}),
 	}
-	if len(cfg.Tools) > 0 {
-		opts = append(opts, llmagent.WithTools(cfg.Tools))
+	if len(tools) > 0 {
+		opts = append(opts, llmagent.WithTools(tools))
 	}
 	if cfg.ToolCallbacks != nil {
 		opts = append(opts, llmagent.WithToolCallbacks(cfg.ToolCallbacks))
 	}
+	if cfg.Knowledge != nil {
+		opts = append(opts, llmagent.WithKnowledge(cfg.Knowledge))
+		if len(cfg.KnowledgeFilter) > 0 {
+			opts = append(opts, llmagent.WithKnowledgeFilter(cfg.KnowledgeFilter))
+		}
+	}
 	llm := llmagent.New("assistant", opts...)
-	r := runner.NewRunner(cfg.AppName, llm, runner.WithSessionService(cfg.SessionService))
+	runnerOpts := []runner.Option{runner.WithSessionService(cfg.SessionService)}
+	if cfg.MemoryService != nil {
+		runnerOpts = append(runnerOpts, runner.WithMemoryService(cfg.MemoryService))
+	}
+	r := runner.NewRunner(cfg.AppName, llm, runnerOpts...)
 	return &RunnerProcessor{runner: r}
 }
 

@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -32,15 +31,13 @@ import (
 // session{app_id, user_id, session_key}. AppName must be the agent_app UUID
 // until per-app Runner assembly lands.
 type PGSessionService struct {
-	pool *pgxpool.Pool
-
-	mu       sync.Mutex
-	tenantOf map[string]string // app_id → tenant_id cache
+	pool    *pgxpool.Pool
+	tenants *appTenantResolver
 }
 
 // NewPGSessionService creates the service on an established pool.
 func NewPGSessionService(pool *pgxpool.Pool) *PGSessionService {
-	return &PGSessionService{pool: pool, tenantOf: make(map[string]string)}
+	return &PGSessionService{pool: pool, tenants: newAppTenantResolver(pool)}
 }
 
 // ErrStateScopeUnsupported is returned by the app/user-scoped state methods:
@@ -443,24 +440,10 @@ func (s *PGSessionService) loadEvents(ctx context.Context, sessID string, opts .
 	return events, nil
 }
 
-// tenantForApp resolves a session row's tenant_id from its agent_app, cached
-// per process (app → tenant mapping changes only via deployment config).
+// tenantForApp resolves a session row's tenant_id from its agent_app via the
+// shared cached resolver.
 func (s *PGSessionService) tenantForApp(ctx context.Context, appID string) (string, error) {
-	s.mu.Lock()
-	cached, ok := s.tenantOf[appID]
-	s.mu.Unlock()
-	if ok {
-		return cached, nil
-	}
-	var tenantID string
-	if err := s.pool.QueryRow(ctx,
-		`SELECT tenant_id FROM agent_app WHERE id = $1`, appID).Scan(&tenantID); err != nil {
-		return "", fmt.Errorf("resolve tenant for app %s: %w", appID, err)
-	}
-	s.mu.Lock()
-	s.tenantOf[appID] = tenantID
-	s.mu.Unlock()
-	return tenantID, nil
+	return s.tenants.resolve(ctx, appID)
 }
 
 // channelOf extracts the channel segment from a session key

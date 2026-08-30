@@ -48,6 +48,16 @@ type Config struct {
 	// AdminToken guards the Admin API (Authorization: Bearer); empty means
 	// dev mode with no auth — set it in any shared environment.
 	AdminToken string // TRPC_ADMIN_TOKEN
+
+	// Embedder config for Knowledge (pgvector). Disabled when
+	// TRPC_EMBEDDER_MODEL is unset: the default chat endpoint (DeepSeek) has
+	// no embeddings API, so point these at an embeddings-capable
+	// OpenAI-compatible endpoint.
+	EmbedderBaseURL string // TRPC_EMBEDDER_BASE_URL
+	EmbedderModel   string // TRPC_EMBEDDER_MODEL
+	EmbedderKeyRef  string // TRPC_EMBEDDER_APIKEY_REF: secret ref
+	EmbedderDim     string // TRPC_EMBEDDER_DIMENSION: vector size, default 1536
+	KnowledgeTable  string // TRPC_KNOWLEDGE_TABLE: pgvector table, default knowledge_embeddings
 }
 
 // Load reads configuration from environment variables, filling defaults for
@@ -77,6 +87,12 @@ func Load() Config {
 		WecomAPIBase:   getenv("TRPC_WECOM_API_BASE", "https://qyapi.weixin.qq.com"),
 
 		AdminToken: getenv("TRPC_ADMIN_TOKEN", ""),
+
+		EmbedderBaseURL: getenv("TRPC_EMBEDDER_BASE_URL", ""),
+		EmbedderModel:   getenv("TRPC_EMBEDDER_MODEL", ""),
+		EmbedderKeyRef:  getenv("TRPC_EMBEDDER_APIKEY_REF", "embedder-apikey"),
+		EmbedderDim:     getenv("TRPC_EMBEDDER_DIMENSION", "1536"),
+		KnowledgeTable:  getenv("TRPC_KNOWLEDGE_TABLE", "knowledge_embeddings"),
 	}
 }
 

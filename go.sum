@@ -57,6 +57,8 @@ github.com/openai/openai-go v1.12.0 h1:NBQCnXzqOTv5wsgNC36PrFEiskGfO5wccfCWDo9S1
 github.com/openai/openai-go v1.12.0/go.mod h1:g461MYGXEXBVdV5SaR/5tNzNbSfwTBBefwc+LlDCK0Y=
 github.com/panjf2000/ants/v2 v2.10.0 h1:zhRg1pQUtkyRiOFo2Sbqwjp0GfBNo9cUY2/Grpx1p+8=
 github.com/panjf2000/ants/v2 v2.10.0/go.mod h1:7ZxyxsqE4vvW0M7LSD8aI3cKwgFhBHbxnlN8mDqHa1I=
+github.com/pgvector/pgvector-go v0.2.3 h1:/vv4mmSAtkT/XHCwkPexNiI1SNmrwccUqxPYr9WzIek=
+github.com/pgvector/pgvector-go v0.2.3/go.mod h1:u5sg3z9bnqVEdpe1pkTij8/rFhTaMCMNyQagPDLK8gQ=
 github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
 github.com/prometheus/client_golang v1.20.5 h1:cxppBPuYhUnsO6yo/aoRol4L7q7UFfdm+bR9r+8l63Y=
 github.com/prometheus/client_golang v1.20.5/go.mod h1:PIEt8X02hGcP8JWbeHyeZ53Y/jReSnHgO035n//V5WE=
@@ -163,7 +165,11 @@ trpc.group/trpc-go/trpc-a2a-go v0.2.6-0.20260721084546-18c8244d0acb h1:hW6SMv4qf
 trpc.group/trpc-go/trpc-a2a-go v0.2.6-0.20260721084546-18c8244d0acb/go.mod h1:7nbGA66/9AZ2j8+juvl7IsH0FC9jEdrxgsmBLrdKnLw=
 trpc.group/trpc-go/trpc-agent-go v1.11.2 h1:qBgrX48JXvgf+k6cq1BSWR4oPfFXxp8/boYydAs4PNM=
 trpc.group/trpc-go/trpc-agent-go v1.11.2/go.mod h1:bIZcN4N9sGpA42sWfE98XCPl9ZgMi6fMDLGYOaXNe9A=
+trpc.group/trpc-go/trpc-agent-go/knowledge/vectorstore/pgvector v1.11.0 h1:juswI87erGKdahH2/e7wm8FYGxNLyL7gEqOf3GCyV1Y=
+trpc.group/trpc-go/trpc-agent-go/knowledge/vectorstore/pgvector v1.11.0/go.mod h1:8wTUmca/8gcjpnL8USAPYzOF4s8j2Jp4mGdssWoJQFo=
 trpc.group/trpc-go/trpc-agent-go/session/redis v1.11.0 h1:k9JQxmsMDCKq5F8hKGkC141ai9P+KPTDjYQEeP4J7lM=
 trpc.group/trpc-go/trpc-agent-go/session/redis v1.11.0/go.mod h1:80ouH5vO6qAKXqq+/8MrtJxI9K2mNlzRtH2L+XRr3S0=
+trpc.group/trpc-go/trpc-agent-go/storage/postgres v0.0.0-20251030021201-13c22db836ca h1:aZ8gZyKNt0rIo58pGFiXMo37EZknQgrOy8TMNZkrj2E=
+trpc.group/trpc-go/trpc-agent-go/storage/postgres v0.0.0-20251030021201-13c22db836ca/go.mod h1:q1/qPdLQ8hgyGhvq2t0lmfhRcekm0chBc5+ZI32pBv0=
 trpc.group/trpc-go/trpc-agent-go/storage/redis v0.0.3 h1:Vd2bewRzVD19TxGC0mCB4/oqo8Eti1tRAEaV3XGfS+M=
 trpc.group/trpc-go/trpc-agent-go/storage/redis v0.0.3/go.mod h1:dmIEHlm3TG74PKiGeOKiuRI73+F3cOMO+KtYNgnc70I=

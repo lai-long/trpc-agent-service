@@ -5,12 +5,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/liuzengh/trpc-agent-service/trpcservice/agent"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/storage"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/web"
 )
@@ -199,6 +201,85 @@ func TestAdminLifecycle(t *testing.T) {
 		t.Fatalf("delete binding: %d", code)
 	}
 }
+
+func TestAdminKnowledgeIngestion(t *testing.T) {
+	ctx := context.Background()
+	pool, err := storage.NewPG(ctx, "postgres://trpc:trpc-dev-only@localhost:5432/trpc?sslmode=disable")
+	if err != nil {
+		t.Skipf("postgres unavailable (%v), skipping integration test", err)
+	}
+	t.Cleanup(func() { pool.Close() })
+
+	// Fixture app to ingest into.
+	appID := "00000000-0000-0000-0000-0000000001aa"
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO tenant (id, name, status) VALUES ('00000000-0000-0000-0000-0000000000aa', 'kb-test', 'active') ON CONFLICT (id) DO NOTHING`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO agent_app (id, tenant_id, name, agent_type, config, version, status)
+		 VALUES ($1, '00000000-0000-0000-0000-0000000000aa', 'kb-test', 'llm', '{}', 1, 'published') ON CONFLICT DO NOTHING`, appID); err != nil {
+		t.Fatal(err)
+	}
+
+	// Disabled knowledge → 503.
+	mux := http.NewServeMux()
+	web.NewAdminAPI(pool, nil, nil, "").RegisterRoutes(mux)
+	code, _ := doJSON(t, mux, http.MethodPost, "/admin/apps/"+appID+"/knowledge/documents",
+		`{"name":"x","content":"y"}`)
+	if code != http.StatusServiceUnavailable {
+		t.Fatalf("knowledge disabled must be 503, got %d", code)
+	}
+
+	// Enabled with the fake embedder: the document lands with tenant/app
+	// metadata in the pgvector table.
+	const table = "knowledge_test_admin_ingest"
+	t.Cleanup(func() { _, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS `+table) })
+	kb, err := agent.NewKnowledgeBase(
+		"postgres://trpc:trpc-dev-only@localhost:5432/trpc?sslmode=disable", table, 64, fakeEmbedder{dim: 64})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux2 := http.NewServeMux()
+	api := web.NewAdminAPI(pool, nil, nil, "")
+	api.Knowledge = kb
+	api.RegisterRoutes(mux2)
+
+	code, out := doJSON(t, mux2, http.MethodPost, "/admin/apps/"+appID+"/knowledge/documents",
+		`{"name":"退款政策","content":"签收后七天内支持无理由退款。"}`)
+	if code != http.StatusCreated {
+		t.Fatalf("ingest: %d %v", code, out)
+	}
+	var hits int
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM `+table+` WHERE metadata->>'tenant_id' = '00000000-0000-0000-0000-0000000000aa'
+		 AND metadata->>'app_id' = $1`, appID).Scan(&hits); err != nil {
+		t.Fatal(err)
+	}
+	if hits == 0 {
+		t.Fatal("document not stored with tenant/app metadata")
+	}
+}
+
+// fakeEmbedder produces deterministic bag-of-runes vectors for tests.
+type fakeEmbedder struct{ dim int }
+
+func (f fakeEmbedder) GetEmbedding(_ context.Context, text string) ([]float64, error) {
+	v := make([]float64, f.dim)
+	for _, r := range text {
+		h := fnv.New32a()
+		_, _ = h.Write([]byte(string(r)))
+		v[int(h.Sum32())%f.dim]++
+	}
+	return v, nil
+}
+
+func (f fakeEmbedder) GetEmbeddingWithUsage(ctx context.Context, text string) ([]float64, map[string]any, error) {
+	v, err := f.GetEmbedding(ctx, text)
+	return v, nil, err
+}
+
+func (f fakeEmbedder) GetDimensions() int { return f.dim }
 
 func TestAdminAuthAndAuditQuery(t *testing.T) {
 	ctx := context.Background()
