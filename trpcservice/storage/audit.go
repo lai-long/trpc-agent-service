@@ -3,8 +3,10 @@ package storage
 import (
 	"context"
 	"fmt"
+	"sync/atomic"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	plog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
@@ -31,8 +33,16 @@ type AuditEvent struct {
 const (
 	auditBatchSize     = 100             // flush the buffer at this many events
 	auditFlushInterval = time.Second     // or this often, whichever comes first
-	auditQueueSize     = 10000           // events beyond this are dropped with a warning
 	auditSyncTimeout   = 3 * time.Second // deny/review writes get this much slack
+	auditFlushTimeout  = 5 * time.Second // per flush attempt
+	auditFlushTries    = 3               // a dropped batch is a lost audit trail
+	auditFlushBackoff  = 200 * time.Millisecond
+
+	// auditQueueSize is the buffer depth and auditEnqueueWait how long a
+	// producer waits for room before its event is dropped: a brief burst is
+	// absorbed, while a sustained overload cannot stall the request path.
+	auditQueueSize   = 10000
+	auditEnqueueWait = 100 * time.Millisecond
 )
 
 // Auditor writes audit events to PG in two lanes: routine allow events are
@@ -40,11 +50,16 @@ const (
 // critical decisions (deny / review) are written synchronously — they must
 // not be lost, even at the cost of milliseconds of latency.
 type Auditor struct {
-	pool   *pgxpool.Pool
-	ch     chan AuditEvent
-	cancel context.CancelFunc
-	done   chan struct{}
+	pool    *pgxpool.Pool
+	ch      chan AuditEvent
+	cancel  context.CancelFunc
+	done    chan struct{}
+	dropped atomic.Uint64 // events lost to a sustained queue overload
 }
+
+// Dropped returns how many events were lost to a sustained queue overload
+// (compliance: a non-zero value means the audit trail has holes).
+func (a *Auditor) Dropped() uint64 { return a.dropped.Load() }
 
 // NewAuditor creates an Auditor on an established pool.
 func NewAuditor(pool *pgxpool.Pool) *Auditor {
@@ -78,31 +93,55 @@ func (a *Auditor) Start() {
 					buf = buf[:0]
 				}
 			case <-ctx.Done():
-				if len(buf) > 0 {
-					a.flush(buf)
+				// Graceful shutdown: drain whatever is still queued before
+				// exiting. Stopping on the buffer alone would lose the burst
+				// that arrived right before Close.
+				for {
+					select {
+					case ev := <-a.ch:
+						buf = append(buf, ev)
+						if len(buf) >= auditBatchSize {
+							a.flush(buf)
+							buf = buf[:0]
+						}
+					default:
+						a.flush(buf)
+						return
+					}
 				}
-				return
 			}
 		}
 	}()
 }
 
-// Close stops the flush loop and waits for the remaining buffer to flush.
+// Close stops the flush loop and waits for it to drain what is still queued.
+// It is safe to call before Start (or twice): an Auditor that never started
+// has no loop to stop.
 func (a *Auditor) Close() {
+	if a.cancel == nil {
+		return
+	}
 	a.cancel()
 	<-a.done
 }
 
-// LogAsync buffers a routine event; the queue full case drops the event with
-// a warning rather than blocking the request path.
+// LogAsync buffers a routine event.
+//
+// A producer waits up to auditEnqueueWait for room, so a short burst is
+// absorbed instead of dropped; only a sustained overload drops the event, and
+// that drop is counted and logged at error level — a silent loss would leave
+// holes in the audit trail without anyone noticing.
 func (a *Auditor) LogAsync(ev AuditEvent) {
 	if ev.CreatedAt.IsZero() {
 		ev.CreatedAt = time.Now()
 	}
+	timer := time.NewTimer(auditEnqueueWait)
+	defer timer.Stop()
 	select {
 	case a.ch <- ev:
-	default:
-		plog.Warnf("audit queue full, dropping %s event (trace=%s)", ev.Decision, ev.TraceID)
+	case <-timer.C:
+		plog.Errorf("audit queue full, dropped %s event (trace=%s, dropped_total=%d)",
+			ev.Decision, ev.TraceID, a.dropped.Add(1))
 	}
 }
 
@@ -116,30 +155,57 @@ func (a *Auditor) LogSync(ctx context.Context, ev AuditEvent) error {
 	return a.insert(ctx, []AuditEvent{ev})
 }
 
+// flush writes one batch, retrying with a short backoff: the buffer is the
+// only copy of these events, so giving up on the first error would drop a
+// chunk of the audit trail. After auditFlushTries the batch is lost, but
+// loudly.
 func (a *Auditor) flush(buf []AuditEvent) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if err := a.insert(ctx, buf); err != nil {
-		plog.Errorf("audit batch flush (%d events): %v", len(buf), err)
+	for attempt := 1; ; attempt++ {
+		ctx, cancel := context.WithTimeout(context.Background(), auditFlushTimeout)
+		err := a.insert(ctx, buf)
+		cancel()
+		if err == nil {
+			return
+		}
+		if attempt >= auditFlushTries {
+			plog.Errorf("audit batch flush (%d events) failed after %d attempts, dropping: %v",
+				len(buf), attempt, err)
+			a.dropped.Add(uint64(len(buf)))
+			return
+		}
+		plog.Warnf("audit batch flush (%d events) attempt %d/%d: %v",
+			len(buf), attempt, auditFlushTries, err)
+		time.Sleep(time.Duration(attempt) * auditFlushBackoff)
 	}
 }
 
+// insert writes the whole slice as one pgx batch: one round trip for the
+// batch instead of one Exec per row.
 func (a *Auditor) insert(ctx context.Context, events []AuditEvent) error {
+	if len(events) == 0 {
+		return nil
+	}
 	const q = `INSERT INTO audit_log
 		(tenant_id, channel, user_id, session_id, agent_name, tool_name,
 		 decision, latency_ms, error_type, cost, prompt_tokens, completion_tokens,
 		 trace_id, created_at)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`
+	batch := &pgx.Batch{}
 	for _, ev := range events {
 		var sessionID *string
 		if ev.SessionID != "" {
 			sessionID = &ev.SessionID
 		}
-		if _, err := a.pool.Exec(ctx, q,
+		batch.Queue(q,
 			ev.TenantID, ev.Channel, ev.UserID, sessionID, ev.AgentName, ev.ToolName,
 			ev.Decision, ev.LatencyMs, ev.ErrorType, ev.Cost, ev.PromptTokens,
 			ev.CompletionTokens, ev.TraceID, ev.CreatedAt,
-		); err != nil {
+		)
+	}
+	results := a.pool.SendBatch(ctx, batch)
+	defer results.Close()
+	for range events {
+		if _, err := results.Exec(); err != nil {
 			return fmt.Errorf("insert audit_log: %w", err)
 		}
 	}

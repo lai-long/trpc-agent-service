@@ -72,3 +72,50 @@ func TestAuditorAsyncBatchAndSync(t *testing.T) {
 		t.Fatalf("expected 5 audit rows after close-flush, got %d", n)
 	}
 }
+
+// Close must be safe on an Auditor that never started (and safe twice): the
+// flush loop owns the cancel func, so an early Close used to nil-panic.
+func TestAuditorCloseWithoutStart(t *testing.T) {
+	a := NewAuditor(nil)
+	a.Close()
+	a.Close()
+}
+
+// A burst queued right before shutdown must still be written: the flush loop
+// drains the channel instead of stopping at the buffer it happens to hold.
+// Before the drain this was a coin flip — select picked randomly between the
+// queued event and the shutdown signal.
+func TestAuditorCloseDrainsQueuedEvents(t *testing.T) {
+	pool, err := NewPG(context.Background(), testPGDSN)
+	if err != nil {
+		t.Skipf("postgres unavailable (%v), skipping integration test", err)
+	}
+	ctx := context.Background()
+	tag := fmt.Sprintf("audit-drain-%d", time.Now().UnixNano())
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), "DELETE FROM audit_log WHERE trace_id LIKE $1", tag+"%")
+		pool.Close()
+	})
+
+	a := NewAuditor(pool)
+	a.Start()
+	for i := 0; i < 5; i++ {
+		a.LogAsync(AuditEvent{
+			TenantID: zeroTenant, Channel: "mock", UserID: "u1",
+			Decision: "allow", TraceID: fmt.Sprintf("%s-%d", tag, i),
+		})
+	}
+	a.Close() // no flush tick in between: only the drain can save these
+
+	var n int
+	if err := pool.QueryRow(ctx,
+		"SELECT count(*) FROM audit_log WHERE trace_id LIKE $1", tag+"%").Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 5 {
+		t.Fatalf("want 5 drained rows after close, got %d", n)
+	}
+	if a.Dropped() != 0 {
+		t.Fatalf("no event should be dropped, got %d", a.Dropped())
+	}
+}
