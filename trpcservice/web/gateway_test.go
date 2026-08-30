@@ -91,3 +91,48 @@ func TestEnqueueStampsTenant(t *testing.T) {
 	// Trace fields are intentionally not asserted: they are only stamped when
 	// the OTel provider is installed, which main.go does at process startup.
 }
+
+// A failed enqueue must not leave the dedup key behind: the IM redelivery is
+// the retry path (design 5.2.2), and a stale key would drop every retry for
+// the full 24h TTL — the message would be lost instead of delayed.
+func TestEnqueueRollsBackDedupOnFailure(t *testing.T) {
+	ctx := context.Background()
+	rdb, err := storage.NewRedis(ctx, "localhost:6380")
+	if err != nil {
+		t.Skipf("redis unavailable (%v), skipping integration test", err)
+	}
+	defer func() { _ = rdb.Close() }()
+
+	// Occupy the queue key with a plain string so XADD fails with WRONGTYPE:
+	// a deterministic enqueue failure without stubbing the stream.
+	inbound := "test:inbound-broken:" + t.Name()
+	t.Cleanup(func() { rdb.Del(context.Background(), inbound) })
+	if err := rdb.Set(ctx, inbound, "not-a-stream", 0).Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	msgID := fmt.Sprintf("test-gw-rollback-%d", time.Now().UnixNano())
+	dedupKey := "dedup:mock:" + msgID
+	t.Cleanup(func() { rdb.Del(context.Background(), dedupKey) })
+
+	h := web.EnqueueHandler{
+		Stream:   storage.NewStream(rdb),
+		Dedup:    storage.NewDeduper(rdb),
+		Routes:   tenant.NewResolver(fakeStore{data: testData()}),
+		InStream: inbound,
+	}
+	if _, err := h.Handle(ctx, channels.InboundMessage{
+		Channel: "mock", MsgID: msgID, SessionKey: "dm:mock:u1", UserID: "u1",
+		Text: "hi", WebhookPath: "/mock/callback",
+	}); err == nil {
+		t.Fatal("enqueue to a non-stream key must fail")
+	}
+
+	n, err := rdb.Exists(ctx, dedupKey).Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatal("dedup key must be rolled back so the IM can redeliver")
+	}
+}

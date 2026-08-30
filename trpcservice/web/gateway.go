@@ -12,6 +12,7 @@ import (
 	"go.opentelemetry.io/otel/propagation"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
+	plog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/metrics"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/storage"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
@@ -79,6 +80,18 @@ func (h EnqueueHandler) Handle(ctx context.Context, msg channels.InboundMessage)
 		}
 	}
 
+	// Rollback for anything that fails from here on: the dedup key must not
+	// outlive a failed delivery attempt, or the IM redelivery that is supposed
+	// to retry the message (design 5.2.2) would be dropped as a duplicate.
+	rollbackDedup := func() {
+		if h.Dedup == nil {
+			return
+		}
+		if err := h.Dedup.Forget(ctx, msg.Channel, msg.MsgID); err != nil {
+			plog.Warnf("dedup rollback %s/%s: %v", msg.Channel, msg.MsgID, err)
+		}
+	}
+
 	ctx, span := tracer.Start(ctx, "gateway.enqueue")
 	defer span.End()
 	span.SetAttributes(
@@ -95,11 +108,14 @@ func (h EnqueueHandler) Handle(ctx context.Context, msg channels.InboundMessage)
 
 	payload, err := json.Marshal(msg)
 	if err != nil {
+		rollbackDedup()
 		return channels.OutboundMessage{}, fmt.Errorf("marshal inbound message: %w", err)
 	}
 	if _, err := h.Stream.Add(ctx, h.inStream(), payload); err != nil {
 		// Return the error so the channel layer replies 5xx and the IM
-		// retries later.
+		// retries later — the dedup key is rolled back first, otherwise that
+		// retry would be swallowed.
+		rollbackDedup()
 		return channels.OutboundMessage{}, fmt.Errorf("enqueue inbound: %w", err)
 	}
 	metrics.InboundTotal.Add(ctx, 1, chAttr(msg))
