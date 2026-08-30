@@ -16,6 +16,7 @@ import (
 	"context"
 	"encoding/json"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -166,8 +167,15 @@ func (c *Channel) receive(w http.ResponseWriter, r *http.Request, h channels.Han
 		ReceivedAt:  time.Now(),
 	}
 	if _, err := h.Handle(r.Context(), msg); err != nil {
-		// 5xx makes the platform redeliver; the gateway's dedup key absorbs
-		// the retry (design 5.1.4).
+		if errors.Is(err, channels.ErrDuplicate) {
+			// ErrDuplicate is a success outcome, not a failure: answer 200 so
+			// the platform stops redelivering (see the Handler contract).
+			plog.Warnf("wecom duplicate message %s dropped", cm.MsgID)
+			writeSuccess(w)
+			return
+		}
+		// 5xx makes the platform redeliver; the gateway rolls the dedup key
+		// back first so that retry is not swallowed (design 5.1.4).
 		plog.Errorf("wecom handle msg %s: %v", cm.MsgID, err)
 		http.Error(w, "handle error", http.StatusInternalServerError)
 		return

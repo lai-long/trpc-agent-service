@@ -156,6 +156,37 @@ func TestCallbackSkipsEventsAndBadSignatures(t *testing.T) {
 	}
 }
 
+// ErrDuplicate is a success outcome: the callback must answer 200 so the
+// platform stops redelivering. A real failure stays 5xx — that is what makes
+// the platform retry (and the gateway rolls the dedup key back).
+func TestCallbackDuplicateVersusFailure(t *testing.T) {
+	const inner = `<xml><ToUserName><![CDATA[ww1234567890]]></ToUserName><FromUserName><![CDATA[zhangsan]]></FromUserName><CreateTime>1700000000</CreateTime><MsgType><![CDATA[text]]></MsgType><Content><![CDATA[你好]]></Content><MsgId>9876543212</MsgId><AgentID>1000002</AgentID></xml>`
+	body, query := forgeCallback(t, inner)
+
+	post := func(t *testing.T, h channels.HandlerFunc) int {
+		t.Helper()
+		c := testChannel(t, "")
+		mux := http.NewServeMux()
+		c.RegisterRoutes(mux, h)
+		req := httptest.NewRequest(http.MethodPost, "/wecom/callback?"+query, strings.NewReader(string(body)))
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		return rec.Code
+	}
+
+	if code := post(t, func(context.Context, channels.InboundMessage) (channels.OutboundMessage, error) {
+		return channels.OutboundMessage{}, channels.ErrDuplicate
+	}); code != http.StatusOK {
+		t.Fatalf("duplicate must be answered 200, got %d", code)
+	}
+
+	if code := post(t, func(context.Context, channels.InboundMessage) (channels.OutboundMessage, error) {
+		return channels.OutboundMessage{}, fmt.Errorf("enqueue inbound: boom")
+	}); code != http.StatusInternalServerError {
+		t.Fatalf("real failure must be answered 5xx so the IM retries, got %d", code)
+	}
+}
+
 func TestVerifyURL(t *testing.T) {
 	c := testChannel(t, "")
 	mux := http.NewServeMux()
