@@ -49,6 +49,13 @@ var (
 	OutboundTotal otelmetric.Int64Counter
 	// TokensTotal counts LLM token usage by kind (prompt / completion).
 	TokensTotal otelmetric.Int64Counter
+	// GatewayRejectedTotal counts callbacks rejected before enqueue, by reason
+	// (rate_limited / backpressure): the noisy-neighbor and overload defenses
+	// of design 5.1.4 firing.
+	GatewayRejectedTotal otelmetric.Int64Counter
+	// SendRateLimitedTotal counts outbound messages re-queued because the
+	// per-{channel, tenant} send bucket was exhausted within the wait window.
+	SendRateLimitedTotal otelmetric.Int64Counter
 )
 
 func init() {
@@ -71,6 +78,12 @@ func init() {
 		panic(err)
 	}
 	if TokensTotal, err = meter.Int64Counter("llm_tokens_total"); err != nil {
+		panic(err)
+	}
+	if GatewayRejectedTotal, err = meter.Int64Counter("gateway_rejected_total"); err != nil {
+		panic(err)
+	}
+	if SendRateLimitedTotal, err = meter.Int64Counter("send_rate_limited_total"); err != nil {
 		panic(err)
 	}
 }

@@ -3,7 +3,9 @@ package storage_test
 import (
 	"context"
 	"fmt"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"trpc.group/trpc-go/trpc-agent-go/event"
@@ -59,6 +61,8 @@ func cleanupSession(t *testing.T, pool *pgxpool.Pool, key session.Key) {
 	t.Helper()
 	ctx := context.Background()
 	_, _ = pool.Exec(ctx, `DELETE FROM session_event WHERE session_id IN
+		(SELECT id FROM session WHERE app_id=$1 AND session_key=$2)`, key.AppName, key.SessionID)
+	_, _ = pool.Exec(ctx, `DELETE FROM summary WHERE session_id IN
 		(SELECT id FROM session WHERE app_id=$1 AND session_key=$2)`, key.AppName, key.SessionID)
 	_, _ = pool.Exec(ctx, `DELETE FROM session WHERE app_id=$1 AND session_key=$2`, key.AppName, key.SessionID)
 }
@@ -231,4 +235,119 @@ func TestPGSessionUnsupportedScopes(t *testing.T) {
 	if _, err := svc.ListUserStates(ctx, session.UserKey{AppName: testAppID, UserID: "u"}); err == nil {
 		t.Fatal("user state scope must be unsupported")
 	}
+}
+
+// fakeSummarizer implements the framework summary.SessionSummarizer without
+// an LLM: every call returns a distinct text so tests can tell summaries apart.
+type fakeSummarizer struct {
+	mu    sync.Mutex
+	calls int
+}
+
+func (f *fakeSummarizer) ShouldSummarize(*session.Session) bool { return true }
+func (f *fakeSummarizer) Summarize(context.Context, *session.Session) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls++
+	return fmt.Sprintf("摘要v%d", f.calls), nil
+}
+func (f *fakeSummarizer) SetPrompt(string)     {}
+func (f *fakeSummarizer) SetModel(model.Model) {}
+func (f *fakeSummarizer) Metadata() map[string]any {
+	return nil
+}
+
+// The summary pipeline: summarization persists text + covered_event_id, and
+// GetSession then replays only the uncovered tail with the summary exposed
+// under Session.Summaries (design 5.1.3 重放与摘要机制).
+func TestPGSessionSummaryAndIncrementalReplay(t *testing.T) {
+	_, pool := pgSessionService(t)
+	ctx := context.Background()
+	key := testKey(t.Name())
+	cleanupSession(t, pool, key)
+	t.Cleanup(func() { cleanupSession(t, pool, key) })
+
+	fake := &fakeSummarizer{}
+	svcWithSummary := storage.NewPGSessionService(pool, storage.WithSummarizer(fake))
+	t.Cleanup(func() { _ = svcWithSummary.Close() })
+
+	sess, err := svcWithSummary.CreateSession(ctx, key, session.StateMap{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"s1", "s2", "s3"} {
+		if err := svcWithSummary.AppendEvent(ctx, sess, textEvent(id, "user", "消息"+id)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Sync summarization (the async path is EnqueueSummaryJob, tested below).
+	if err := svcWithSummary.CreateSessionSummary(ctx, sess, "assistant", true); err != nil {
+		t.Fatal(err)
+	}
+
+	// The summary row points at the last covered event.
+	var sumText, filterKey, coveredID string
+	var coveredSeq int64
+	if err := pool.QueryRow(ctx,
+		`SELECT s.summary_text, s.filter_key, s.covered_event_id, e.event_seq
+		 FROM summary s JOIN session_event e ON e.id = s.covered_event_id
+		 WHERE s.session_id = (SELECT id FROM session WHERE app_id=$1 AND session_key=$2)`,
+		key.AppName, key.SessionID).Scan(&sumText, &filterKey, &coveredID, &coveredSeq); err != nil {
+		t.Fatal(err)
+	}
+	if sumText != "摘要v1" || filterKey != "assistant" || coveredSeq != 3 {
+		t.Fatalf("unexpected summary row: %q %q seq=%d", sumText, filterKey, coveredSeq)
+	}
+
+	// Incremental replay: covered events are gone from the event list, and the
+	// summary surfaces under Session.Summaries with the prompt-side boundary.
+	got, err := svcWithSummary.GetSession(ctx, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Events) != 0 {
+		t.Fatalf("all 3 events covered, want 0 replayed, got %d", len(got.Events))
+	}
+	sum := got.Summaries["assistant"]
+	if sum == nil || sum.Summary != "摘要v1" {
+		t.Fatalf("summary missing from session: %+v", got.Summaries)
+	}
+	if sum.Boundary == nil || sum.Boundary.LastEventID != "s3" {
+		t.Fatalf("boundary must anchor at the covered event s3: %+v", sum.Boundary)
+	}
+
+	// New events land after the cursor: replay yields only them.
+	if err := svcWithSummary.AppendEvent(ctx, sess, textEvent("s4", "user", "消息s4")); err != nil {
+		t.Fatal(err)
+	}
+	got, err = svcWithSummary.GetSession(ctx, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Events) != 1 || got.Events[0].ID != "s4" {
+		t.Fatalf("want only the uncovered tail, got %+v", got.Events)
+	}
+
+	// The async path: EnqueueSummaryJob hands off to the background worker.
+	if err := svcWithSummary.AppendEvent(ctx, sess, textEvent("s5", "user", "消息s5")); err != nil {
+		t.Fatal(err)
+	}
+	if err := svcWithSummary.EnqueueSummaryJob(ctx, sess, "assistant", true); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if err := pool.QueryRow(ctx,
+			`SELECT summary_text FROM summary
+			 WHERE session_id = (SELECT id FROM session WHERE app_id=$1 AND session_key=$2)`,
+			key.AppName, key.SessionID).Scan(&sumText); err != nil {
+			t.Fatal(err)
+		}
+		if sumText == "摘要v2" {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("async summary job did not advance the summary, last text %q", sumText)
 }

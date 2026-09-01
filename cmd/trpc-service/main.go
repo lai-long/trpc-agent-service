@@ -29,8 +29,10 @@ import (
 	"trpc.group/trpc-go/trpc-agent-go/knowledge"
 	openaiembed "trpc.group/trpc-go/trpc-agent-go/knowledge/embedder/openai"
 	"trpc.group/trpc-go/trpc-agent-go/memory"
+	"trpc.group/trpc-go/trpc-agent-go/model/openai"
 	"trpc.group/trpc-go/trpc-agent-go/session"
 	sessionredis "trpc.group/trpc-go/trpc-agent-go/session/redis"
+	sessionsummary "trpc.group/trpc-go/trpc-agent-go/session/summary"
 	ttool "trpc.group/trpc-go/trpc-agent-go/tool"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -107,9 +109,12 @@ func serve() error {
 
 	ch := mock.New()
 	enqueue := web.EnqueueHandler{
-		Stream: stream,
-		Dedup:  storage.NewDeduper(rdb),
-		Routes: resolver,
+		Stream:       stream,
+		Dedup:        storage.NewDeduper(rdb),
+		Routes:       resolver,
+		Limiter:      storage.NewLimiter(rdb),
+		DefaultQPS:   parseFloat(cfg.GatewayRateQPS, 50),
+		DefaultBurst: parseInt(cfg.GatewayRateBurst, 100),
 	}
 	mux := http.NewServeMux()
 	ch.RegisterRoutes(mux, enqueue)
@@ -174,12 +179,24 @@ func serve() error {
 	g.Go(func() error { return worker.Run(gctx) })
 
 	sender := &channels.Sender{
-		Stream:   stream,
-		Sent:     storage.NewSentMarker(rdb),
-		Channels: channelSet,
-		Name:     consumer + "-s",
+		Stream:    stream,
+		Sent:      storage.NewSentMarker(rdb),
+		Channels:  channelSet,
+		Name:      consumer + "-s",
+		Limiter:   storage.NewLimiter(rdb),
+		SendQPS:   parseFloat(cfg.SendRateQPS, 20),
+		SendBurst: parseInt(cfg.SendRateBurst, 40),
 	}
 	g.Go(func() error { return sender.Run(gctx) })
+
+	// Monthly-ish archival (design 5.1.3): move old session_event / audit_log
+	// rows to the archive tables so the hot tables stay small.
+	if pgPool != nil {
+		archiver := storage.NewArchiver(pgPool,
+			parseDuration(cfg.ArchiveRetention, 30*24*time.Hour),
+			parseDuration(cfg.ArchiveInterval, 24*time.Hour))
+		g.Go(func() error { archiver.Run(gctx); return nil })
+	}
 
 	// Graceful shutdown: stop pulling new messages first, let in-flight
 	// processing finish, then close the HTTP server.
@@ -278,8 +295,11 @@ func buildProcessor(ctx context.Context, cfg config.Config, rdb *redis.Client, a
 			plog.Warnf("TRPC_SESSION_BACKEND=postgres but PG is unreachable, falling back to redis")
 			break
 		}
-		sess = storage.NewPGSessionService(pgPool)
-		sessCleanup = func() {}
+		var sessOpts []storage.PGSessionOption
+		if sm := buildSummarizer(ctx, cfg); sm != nil {
+			sessOpts = append(sessOpts, storage.WithSummarizer(sm))
+		}
+		sess = storage.NewPGSessionService(pgPool, sessOpts...)
 		plog.Infof("session backend: postgres")
 	}
 	if sess == nil {
@@ -291,8 +311,9 @@ func buildProcessor(ctx context.Context, cfg config.Config, rdb *redis.Client, a
 			plog.Warnf("session service unavailable (%v), falling back to echo processor", err)
 			return wrap(agent.EchoProcessor{}), noop
 		}
-		sess, sessCleanup = rs, func() { _ = rs.Close() }
+		sess = rs
 	}
+	sessCleanup = func() { _ = sess.Close() }
 
 	timeout, err := time.ParseDuration(cfg.ModelTimeout)
 	if err != nil || timeout <= 0 {
@@ -339,6 +360,55 @@ func buildProcessor(ctx context.Context, cfg config.Config, rdb *redis.Client, a
 	})
 	plog.Infof("per-app runner assembler ready (model default=%s, timeout=%s)", cfg.ModelName, timeout)
 	return wrap(assembler), func() { _ = assembler.Close(); sessCleanup() }
+}
+
+// buildSummarizer builds the framework session summarizer on the platform
+// default model. Summarization is a background maintenance job, so it uses
+// the env default model rather than per-tenant model config. Without a model
+// key, summaries are disabled and sessions always replay in full.
+func buildSummarizer(ctx context.Context, cfg config.Config) sessionsummary.SessionSummarizer {
+	resolver := config.NewFileResolver(cfg.SecretsDir)
+	key, err := resolver.Resolve(ctx, cfg.ModelAPIKeyRef)
+	if err != nil {
+		plog.Warnf("model key %q unavailable (%v), session summaries disabled", cfg.ModelAPIKeyRef, err)
+		return nil
+	}
+	threshold := parseInt(cfg.SummaryEventThreshold, 20)
+	m := openai.New(cfg.ModelName,
+		openai.WithBaseURL(cfg.ModelBaseURL),
+		openai.WithAPIKey(key),
+	)
+	plog.Infof("session summarizer enabled (event threshold=%d)", threshold)
+	return sessionsummary.NewSummarizer(m, sessionsummary.WithEventThreshold(threshold))
+}
+
+// parseInt / parseFloat / parseDuration parse env string values, falling back
+// to def with a warning on invalid input.
+func parseInt(s string, def int) int {
+	v, err := strconv.Atoi(s)
+	if err != nil || v <= 0 {
+		plog.Warnf("invalid integer %q, using default %d", s, def)
+		return def
+	}
+	return v
+}
+
+func parseFloat(s string, def float64) float64 {
+	v, err := strconv.ParseFloat(s, 64)
+	if err != nil || v <= 0 {
+		plog.Warnf("invalid number %q, using default %v", s, def)
+		return def
+	}
+	return v
+}
+
+func parseDuration(s string, def time.Duration) time.Duration {
+	v, err := time.ParseDuration(s)
+	if err != nil || v <= 0 {
+		plog.Warnf("invalid duration %q, using default %s", s, def)
+		return def
+	}
+	return v
 }
 
 // buildKnowledge builds the pgvector-backed knowledge base when an

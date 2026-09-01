@@ -86,6 +86,7 @@ func (a *AdminAPI) createTenant(w http.ResponseWriter, r *http.Request) {
 		ModelConfig   json.RawMessage `json:"model_config"`
 		ToolPolicy    json.RawMessage `json:"tool_policy"`
 		AuditPolicy   json.RawMessage `json:"audit_policy"`
+		RatePolicy    json.RawMessage `json:"rate_policy"`
 		StorageConfig json.RawMessage `json:"storage_config"`
 	}
 	if !decodeBody(w, r, &in) {
@@ -97,10 +98,10 @@ func (a *AdminAPI) createTenant(w http.ResponseWriter, r *http.Request) {
 	}
 	var id string
 	err := a.pool.QueryRow(r.Context(),
-		`INSERT INTO tenant (name, model_config, tool_policy, audit_policy, storage_config)
-		 VALUES ($1, $2, $3, $4, $5) RETURNING id`,
+		`INSERT INTO tenant (name, model_config, tool_policy, audit_policy, rate_policy, storage_config)
+		 VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
 		in.Name, rawOrNil(in.ModelConfig), rawOrNil(in.ToolPolicy),
-		rawOrNil(in.AuditPolicy), rawOrNil(in.StorageConfig)).Scan(&id)
+		rawOrNil(in.AuditPolicy), rawOrNil(in.RatePolicy), rawOrNil(in.StorageConfig)).Scan(&id)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -135,14 +136,14 @@ func (a *AdminAPI) listTenants(w http.ResponseWriter, r *http.Request) {
 
 func (a *AdminAPI) getTenant(w http.ResponseWriter, r *http.Request) {
 	var (
-		name, status                            string
-		modelCfg, toolPol, auditPol, storageCfg []byte
-		createdAt, updatedAt                    time.Time
+		name, status                                     string
+		modelCfg, toolPol, auditPol, ratePol, storageCfg []byte
+		createdAt, updatedAt                             time.Time
 	)
 	err := a.pool.QueryRow(r.Context(),
-		`SELECT name, status, model_config, tool_policy, audit_policy, storage_config, created_at, updated_at
+		`SELECT name, status, model_config, tool_policy, audit_policy, rate_policy, storage_config, created_at, updated_at
 		 FROM tenant WHERE id = $1`, r.PathValue("id"),
-	).Scan(&name, &status, &modelCfg, &toolPol, &auditPol, &storageCfg, &createdAt, &updatedAt)
+	).Scan(&name, &status, &modelCfg, &toolPol, &auditPol, &ratePol, &storageCfg, &createdAt, &updatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		writeError(w, http.StatusNotFound, "tenant not found")
 		return
@@ -154,8 +155,9 @@ func (a *AdminAPI) getTenant(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"id": r.PathValue("id"), "name": name, "status": status,
 		"model_config": jsonOrNull(modelCfg), "tool_policy": jsonOrNull(toolPol),
-		"audit_policy": jsonOrNull(auditPol), "storage_config": jsonOrNull(storageCfg),
-		"created_at": createdAt, "updated_at": updatedAt,
+		"audit_policy": jsonOrNull(auditPol), "rate_policy": jsonOrNull(ratePol),
+		"storage_config": jsonOrNull(storageCfg),
+		"created_at":     createdAt, "updated_at": updatedAt,
 	})
 }
 
@@ -166,6 +168,7 @@ func (a *AdminAPI) updateTenant(w http.ResponseWriter, r *http.Request) {
 		ModelConfig   json.RawMessage `json:"model_config"`
 		ToolPolicy    json.RawMessage `json:"tool_policy"`
 		AuditPolicy   json.RawMessage `json:"audit_policy"`
+		RatePolicy    json.RawMessage `json:"rate_policy"`
 		StorageConfig json.RawMessage `json:"storage_config"`
 	}
 	if !decodeBody(w, r, &in) {
@@ -190,6 +193,9 @@ func (a *AdminAPI) updateTenant(w http.ResponseWriter, r *http.Request) {
 	}
 	if in.AuditPolicy != nil {
 		add("audit_policy = $%d", []byte(in.AuditPolicy))
+	}
+	if in.RatePolicy != nil {
+		add("rate_policy = $%d", []byte(in.RatePolicy))
 	}
 	if in.StorageConfig != nil {
 		// storage_config changes must go through the migration flow (design

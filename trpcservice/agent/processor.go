@@ -88,6 +88,9 @@ func NewRunnerProcessor(cfg RunnerConfig) *RunnerProcessor {
 	opts := []llmagent.Option{
 		llmagent.WithModel(m),
 		llmagent.WithGenerationConfig(genConfig),
+		// Prepend the session summary when one exists (PG backend compresses
+		// old events into the summary table); a no-op for sessions without.
+		llmagent.WithAddSessionSummary(true),
 	}
 	if cfg.Instruction != "" {
 		opts = append(opts, llmagent.WithInstruction(cfg.Instruction))

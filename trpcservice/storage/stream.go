@@ -19,9 +19,14 @@ const (
 	// StreamDeadletter receives messages that exhausted redelivery attempts.
 	StreamDeadletter = "stream:deadletter"
 
-	// streamMaxLen caps the queue length (XADD MAXLEN ~) so a backlog cannot
+	// StreamMaxLen caps the queue length (XADD MAXLEN ~) so a backlog cannot
 	// exhaust Redis memory; crossing the threshold should trigger an alert.
-	streamMaxLen = 100000
+	StreamMaxLen = 100000
+
+	// BackpressureThreshold is the queue length at which the gateway stops
+	// accepting new messages (80% of the cap, design 5.1.4): the IM is told to
+	// retry later, which is the boundary of the no-loss guarantee.
+	BackpressureThreshold = StreamMaxLen * 80 / 100
 
 	// payloadField is the field name of the payload inside a Stream entry.
 	payloadField = "payload"
@@ -49,7 +54,7 @@ func NewStream(rdb *redis.Client) *Stream {
 func (s *Stream) Add(ctx context.Context, stream string, payload []byte) (string, error) {
 	id, err := s.rdb.XAdd(ctx, &redis.XAddArgs{
 		Stream: stream,
-		MaxLen: streamMaxLen,
+		MaxLen: StreamMaxLen,
 		Approx: true, // approximate trimming by node avoids per-entry exact trimming cost
 		Values: map[string]any{payloadField: payload},
 	}).Result()
@@ -57,6 +62,15 @@ func (s *Stream) Add(ctx context.Context, stream string, payload []byte) (string
 		return "", fmt.Errorf("xadd %s: %w", stream, err)
 	}
 	return id, nil
+}
+
+// Len returns the stream length (XLEN), for the gateway's backpressure check.
+func (s *Stream) Len(ctx context.Context, stream string) (int64, error) {
+	n, err := s.rdb.XLen(ctx, stream).Result()
+	if err != nil {
+		return 0, fmt.Errorf("xlen %s: %w", stream, err)
+	}
+	return n, nil
 }
 
 // EnsureGroup creates the consumer group if missing; an existing group is

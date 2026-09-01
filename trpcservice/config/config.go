@@ -53,6 +53,26 @@ type Config struct {
 	// dev mode with no auth — set it in any shared environment.
 	AdminToken string // TRPC_ADMIN_TOKEN
 
+	// GatewayRateQPS / GatewayRateBurst are the platform default for the
+	// per-tenant admission token bucket (design 5.1.4); tenant.rate_policy
+	// overrides per tenant.
+	GatewayRateQPS   string // TRPC_GATEWAY_RATE_QPS
+	GatewayRateBurst string // TRPC_GATEWAY_RATE_BURST
+
+	// SendRateQPS / SendRateBurst pace outbound IM sends per
+	// {channel, tenant} (design 5.3.2, IM proactive-send rate limits).
+	SendRateQPS   string // TRPC_SEND_RATE_QPS
+	SendRateBurst string // TRPC_SEND_RATE_BURST
+
+	// SummaryEventThreshold is the number of uncovered events that triggers
+	// session summarization (PG session backend only). ArchiveRetention is
+	// how long session_event/audit_log rows stay in the hot tables before the
+	// archive sweep moves them (design 5.1.3); ArchiveInterval is the sweep
+	// cadence. Go duration syntax for the two intervals.
+	SummaryEventThreshold string // TRPC_SUMMARY_EVENT_THRESHOLD
+	ArchiveRetention      string // TRPC_ARCHIVE_RETENTION
+	ArchiveInterval       string // TRPC_ARCHIVE_INTERVAL
+
 	// Embedder config for Knowledge (pgvector). Disabled when
 	// TRPC_EMBEDDER_MODEL is unset: the default chat endpoint (DeepSeek) has
 	// no embeddings API, so point these at an embeddings-capable
@@ -92,6 +112,15 @@ func Load() Config {
 		WecomAPIBase:   getenv("TRPC_WECOM_API_BASE", "https://qyapi.weixin.qq.com"),
 
 		AdminToken: getenv("TRPC_ADMIN_TOKEN", ""),
+
+		GatewayRateQPS:   getenv("TRPC_GATEWAY_RATE_QPS", "50"),
+		GatewayRateBurst: getenv("TRPC_GATEWAY_RATE_BURST", "100"),
+		SendRateQPS:      getenv("TRPC_SEND_RATE_QPS", "20"),
+		SendRateBurst:    getenv("TRPC_SEND_RATE_BURST", "40"),
+
+		SummaryEventThreshold: getenv("TRPC_SUMMARY_EVENT_THRESHOLD", "20"),
+		ArchiveRetention:      getenv("TRPC_ARCHIVE_RETENTION", "720h"), // 30 days online (design 6.2)
+		ArchiveInterval:       getenv("TRPC_ARCHIVE_INTERVAL", "24h"),
 
 		EmbedderBaseURL: getenv("TRPC_EMBEDDER_BASE_URL", ""),
 		EmbedderModel:   getenv("TRPC_EMBEDDER_MODEL", ""),

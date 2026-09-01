@@ -27,6 +27,14 @@ func sendAttr(msg OutboundMessage, result string) otelmetric.MeasurementOption {
 	)
 }
 
+// rateLimitedAttr tags re-queue events caused by send pacing.
+func rateLimitedAttr(msg OutboundMessage) otelmetric.AddOption {
+	return otelmetric.WithAttributes(
+		attribute.String("channel", msg.Channel),
+		attribute.String("tenant_id", msg.TenantID),
+	)
+}
+
 // Sender consumes the outbound stream as part of consumer group "senders" and
 // dispatches each message to the Send of its Channel.
 //
@@ -34,11 +42,23 @@ func sendAttr(msg OutboundMessage, result string) otelmetric.MeasurementOption {
 // skip already-delivered replies; send; mark sent; only then Ack. A crash
 // before Ack redelivers the message, but the sent: key blocks a duplicate
 // push to the user. Failures stay pending for retry.
+//
+// Sends are paced per {channel, tenant} token bucket (design 5.3.2, IM
+// proactive-send rate limits): when the bucket is exhausted the message is
+// re-queued instead of dropped, so rate limiting delays but never loses.
 type Sender struct {
 	Stream   *storage.Stream
 	Sent     *storage.SentMarker // nil disables outbound idempotency
 	Channels map[string]Channel  // channel name → channel implementation
 	Name     string              // consumer name
+
+	// Limiter paces sends per {channel}:{tenant_id}; nil disables pacing.
+	// SendQPS/SendBurst are the platform-level bucket shape; SendWait bounds
+	// how long a message spins for a token before being re-queued.
+	Limiter   *storage.Limiter
+	SendQPS   float64
+	SendBurst int
+	SendWait  time.Duration
 
 	InStream string // stream to consume; empty means storage.StreamOutbound
 }
@@ -48,6 +68,27 @@ func (s *Sender) inStream() string {
 		return s.InStream
 	}
 	return storage.StreamOutbound
+}
+
+func (s *Sender) sendQPS() float64 {
+	if s.SendQPS > 0 {
+		return s.SendQPS
+	}
+	return 20
+}
+
+func (s *Sender) sendBurst() int {
+	if s.SendBurst > 0 {
+		return s.SendBurst
+	}
+	return 40
+}
+
+func (s *Sender) sendWait() time.Duration {
+	if s.SendWait > 0 {
+		return s.SendWait
+	}
+	return 30 * time.Second
 }
 
 // Run consumes until ctx is canceled; a nil return means a clean shutdown.
@@ -116,6 +157,28 @@ func (s *Sender) handle(ctx context.Context, m storage.Message) {
 		plog.Errorf("sender %s: no channel named %q, drop %s", s.Name, msg.Channel, m.ID)
 		_ = s.Stream.Ack(ctx, s.inStream(), "senders", m.ID)
 		return
+	}
+
+	// Pace the send on the {channel, tenant} bucket (design 5.3.2). On
+	// exhaustion the message is re-queued (new entry, original acked) rather
+	// than dropped: the copy retries when the bucket has refilled.
+	if s.Limiter != nil {
+		scope := "send:" + msg.Channel + ":" + msg.TenantID
+		ok, err := s.Limiter.WaitAllow(ctx, scope, s.sendQPS(), s.sendBurst(), s.sendWait())
+		if err != nil {
+			plog.Warnf("sender %s rate limit check %s: %v", s.Name, m.ID, err)
+			return // Redis hiccup: leave pending, retry later
+		}
+		if !ok {
+			if _, err := s.Stream.Add(ctx, s.inStream(), m.Payload); err != nil {
+				plog.Errorf("sender %s re-queue %s: %v", s.Name, m.ID, err)
+				return // stays pending
+			}
+			metrics.SendRateLimitedTotal.Add(ctx, 1, rateLimitedAttr(msg))
+			plog.Warnf("sender %s re-queued %s: send bucket %s exhausted", s.Name, m.ID, scope)
+			_ = s.Stream.Ack(ctx, s.inStream(), "senders", m.ID)
+			return
+		}
 	}
 
 	if err := ch.Send(ctx, msg); err != nil {

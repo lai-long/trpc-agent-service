@@ -20,6 +20,10 @@ CREATE TABLE tenant (
     model_config   jsonb,
     tool_policy    jsonb,
     audit_policy   jsonb,
+    -- Traffic admission policy for the gateway's per-tenant token bucket
+    -- (design 5.1.4), e.g. {"qps": 50, "burst": 100}; empty means the
+    -- platform default.
+    rate_policy    jsonb,
     -- Data-backend overrides (a controlled menu), e.g.
     -- {"session":{"type":"redis","dsn_ref":"t42-redis"}}. Empty means the
     -- platform-recommended stack. Changes must go through the migration
@@ -138,6 +142,9 @@ CREATE TABLE summary (
     -- Logical reference without a foreign key: session_event rows get
     -- archived away, and a hard FK would block archival.
     covered_event_id uuid        NOT NULL,
+    -- The framework event filter key the summary was built for (single-agent
+    -- apps: the agent name). One row per session for now.
+    filter_key       varchar(128) NOT NULL DEFAULT '',
     updated_at       timestamptz NOT NULL DEFAULT now()
 );
 
@@ -166,3 +173,38 @@ CREATE TABLE audit_log (
 CREATE INDEX idx_audit_tenant_time ON audit_log (tenant_id, created_at);
 CREATE INDEX idx_audit_session ON audit_log (session_id);
 CREATE INDEX idx_audit_trace ON audit_log (trace_id);
+
+-- ---------------------------------------------------------------------------
+-- Archive tables: same shape as their source tables (INSERT ... SELECT *),
+-- but WITHOUT foreign keys — archived rows must not block or be blocked by
+-- session deletion. The monthly archive task (storage.Archiver) copies old
+-- rows here in limited batches, then deletes them from the source table.
+-- ---------------------------------------------------------------------------
+CREATE TABLE session_event_archive (
+    id         uuid PRIMARY KEY,
+    session_id uuid        NOT NULL,
+    event_seq  bigint      NOT NULL,
+    event      jsonb       NOT NULL,
+    created_at timestamptz NOT NULL,
+    CONSTRAINT uk_session_event_archive_seq UNIQUE (session_id, event_seq)
+);
+CREATE INDEX idx_session_event_archive_created ON session_event_archive (created_at);
+
+CREATE TABLE audit_log_archive (
+    id                uuid PRIMARY KEY,
+    tenant_id         uuid         NOT NULL,
+    channel           varchar(64),
+    user_id           varchar(128),
+    session_id        uuid,
+    agent_name        varchar(128),
+    tool_name         varchar(128),
+    decision          varchar(32)  NOT NULL,
+    latency_ms        int,
+    error_type        varchar(64),
+    cost              numeric(12, 6),
+    prompt_tokens     int,
+    completion_tokens int,
+    trace_id          varchar(128),
+    created_at        timestamptz  NOT NULL
+);
+CREATE INDEX idx_audit_archive_tenant_time ON audit_log_archive (tenant_id, created_at);

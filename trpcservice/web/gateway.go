@@ -4,6 +4,7 @@ package web
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	"go.opentelemetry.io/otel"
@@ -30,14 +31,28 @@ var tracer = otel.Tracer("trpc-agent-service/gateway")
 //
 // Before enqueueing, the handler resolves tenant routing (webhook_path →
 // channel_binding → tenant + app) and stamps tenant_id / app_id onto the
-// message; unknown or inactive routes are rejected. Per-tenant token-bucket
-// rate limiting plugs in next, between routing and dedup.
+// message; unknown or inactive routes are rejected. Two admission defenses
+// follow (design 5.1.4): a per-tenant token bucket rejects a tenant flooding
+// the shared queue (noisy neighbor), and an XLEN backpressure check rejects
+// everyone once the queue is nearly full. Both rejections return an error so
+// the channel answers 5xx and the IM redelivers later — that redelivery is
+// the retry path, and it works because the rate check runs before the dedup
+// key is set while the backpressure rejection rolls it back.
 type EnqueueHandler struct {
 	Stream *storage.Stream
 	Dedup  *storage.Deduper
 	// Routes resolves webhook_path to tenant/app; nil disables tenant routing
 	// (single-tenant dev fallback, messages carry an empty tenant_id).
 	Routes *tenant.Resolver
+	// Limiter is the per-tenant token bucket; nil disables rate limiting.
+	// DefaultQPS/DefaultBurst apply when the tenant's rate_policy is empty.
+	Limiter      *storage.Limiter
+	DefaultQPS   float64
+	DefaultBurst int
+	// BackpressureLimit is the queue length that triggers rejection
+	// (XLEN >= limit). Zero means storage.BackpressureThreshold; a negative
+	// value disables the check.
+	BackpressureLimit int64
 
 	InStream string // empty means storage.StreamInbound
 }
@@ -49,6 +64,18 @@ func (h EnqueueHandler) inStream() string {
 	return storage.StreamInbound
 }
 
+func (h EnqueueHandler) backpressureLimit() int64 {
+	if h.BackpressureLimit == 0 {
+		return storage.BackpressureThreshold
+	}
+	return h.BackpressureLimit
+}
+
+// ErrOverloaded rejects a callback because admission control fired (tenant
+// rate limit or queue backpressure). The channel layer answers 5xx so the
+// IM redelivers later (design 5.2.2).
+var ErrOverloaded = errors.New("gateway overloaded")
+
 // Handle implements channels.Handler.
 //
 // Starts the root span of the message trace and stamps the message with the
@@ -57,13 +84,33 @@ func (h EnqueueHandler) inStream() string {
 func (h EnqueueHandler) Handle(ctx context.Context, msg channels.InboundMessage) (channels.OutboundMessage, error) {
 	// Tenant routing first: a message with no active route is rejected before
 	// consuming dedup keys or queue space.
+	var route tenant.Route
 	if h.Routes != nil {
-		route, err := h.Routes.Resolve(ctx, msg.WebhookPath)
+		var err error
+		route, err = h.Routes.Resolve(ctx, msg.WebhookPath)
 		if err != nil {
 			return channels.OutboundMessage{}, fmt.Errorf("tenant route: %w", err)
 		}
 		msg.TenantID = route.Tenant.ID
 		msg.AppID = route.App.ID
+	}
+
+	// Per-tenant admission (before dedup: a rejected message must not consume
+	// the dedup key, or the IM's redelivery would be dropped as a duplicate).
+	if h.Limiter != nil {
+		qps, burst := h.DefaultQPS, h.DefaultBurst
+		if rl := tenant.ParseRateLimit(route.Tenant.RatePolicy); rl.QPS > 0 && rl.Burst > 0 {
+			qps, burst = rl.QPS, rl.Burst
+		}
+		ok, err := h.Limiter.Allow(ctx, "tenant:"+msg.TenantID, qps, burst)
+		if err != nil {
+			// Redis hiccup: fail open — the backpressure check below still
+			// bounds the queue.
+			plog.Warnf("rate limit check failed, allowing: %v", err)
+		} else if !ok {
+			metrics.GatewayRejectedTotal.Add(ctx, 1, rejectAttr(msg, "rate_limited"))
+			return channels.OutboundMessage{}, fmt.Errorf("%w: tenant %s rate limited", ErrOverloaded, msg.TenantID)
+		}
 	}
 
 	// Inbound idempotency gate: first arrival passes, duplicates get
@@ -106,6 +153,23 @@ func (h EnqueueHandler) Handle(ctx context.Context, msg channels.InboundMessage)
 	metrics.InjectTraceparent(ctx, carrier)
 	msg.TraceParent = carrier.Get("traceparent")
 
+	// Backpressure: with the queue nearly full, reject instead of enqueueing —
+	// the boundary of the no-loss guarantee is that messages are refused
+	// (and retried by the IM) rather than silently truncated by MAXLEN.
+	if limit := h.backpressureLimit(); limit > 0 {
+		n, err := h.Stream.Len(ctx, h.inStream())
+		if err != nil {
+			rollbackDedup()
+			return channels.OutboundMessage{}, fmt.Errorf("queue length check: %w", err)
+		}
+		if n >= limit {
+			rollbackDedup()
+			metrics.GatewayRejectedTotal.Add(ctx, 1, rejectAttr(msg, "backpressure"))
+			return channels.OutboundMessage{}, fmt.Errorf("%w: queue %s at %d/%d",
+				ErrOverloaded, h.inStream(), n, limit)
+		}
+	}
+
 	payload, err := json.Marshal(msg)
 	if err != nil {
 		rollbackDedup()
@@ -126,5 +190,14 @@ func chAttr(msg channels.InboundMessage) otelmetric.AddOption {
 	return otelmetric.WithAttributes(
 		attribute.String("channel", msg.Channel),
 		attribute.String("tenant_id", msg.TenantID),
+	)
+}
+
+// rejectAttr tags gateway rejections with their admission-control reason.
+func rejectAttr(msg channels.InboundMessage, reason string) otelmetric.AddOption {
+	return otelmetric.WithAttributes(
+		attribute.String("channel", msg.Channel),
+		attribute.String("tenant_id", msg.TenantID),
+		attribute.String("reason", reason),
 	)
 }

@@ -136,3 +136,81 @@ func TestEnqueueRollsBackDedupOnFailure(t *testing.T) {
 		t.Fatal("dedup key must be rolled back so the IM can redeliver")
 	}
 }
+
+// A tenant over its rate limit is rejected before dedup (ErrOverloaded → the
+// channel answers 5xx so the IM redelivers), and the rejection consumes no
+// dedup key — the redelivery must still be admissible.
+func TestEnqueueRateLimited(t *testing.T) {
+	ctx := context.Background()
+	rdb, err := storage.NewRedis(ctx, "localhost:6380")
+	if err != nil {
+		t.Skipf("redis unavailable (%v), skipping integration test", err)
+	}
+	defer func() { _ = rdb.Close() }()
+	t.Cleanup(func() { rdb.Del(context.Background(), "ratelimit:tenant:t1") })
+
+	h := web.EnqueueHandler{
+		Stream: storage.NewStream(rdb), Dedup: storage.NewDeduper(rdb),
+		Routes: tenant.NewResolver(fakeStore{data: testData()}),
+		// burst=1 with a near-zero refill: the first message passes, the
+		// second is denied.
+		Limiter: storage.NewLimiter(rdb), DefaultQPS: 0.001, DefaultBurst: 1,
+		InStream: "test:inbound-rl:" + t.Name(),
+	}
+	t.Cleanup(func() { rdb.Del(context.Background(), "test:inbound-rl:"+t.Name()) })
+
+	mk := func(id string) channels.InboundMessage {
+		return channels.InboundMessage{
+			Channel: "mock", MsgID: id, SessionKey: "dm:mock:u1", UserID: "u1",
+			Text: "hi", WebhookPath: "/mock/callback",
+		}
+	}
+	if _, err := h.Handle(ctx, mk("rl-1")); err != nil {
+		t.Fatalf("first message must pass: %v", err)
+	}
+	_, err = h.Handle(ctx, mk("rl-2"))
+	if !errors.Is(err, web.ErrOverloaded) {
+		t.Fatalf("want ErrOverloaded, got %v", err)
+	}
+	// The rejection happened before dedup: no key was consumed for rl-2.
+	if n, _ := rdb.Exists(ctx, "dedup:mock:rl-2").Result(); n != 0 {
+		t.Fatal("rate-limited message must not consume its dedup key")
+	}
+	t.Cleanup(func() { rdb.Del(context.Background(), "dedup:mock:rl-1") })
+}
+
+// With the queue at the backpressure limit the gateway rejects and rolls back
+// the dedup key: refusing beats silent MAXLEN truncation (design 5.1.4).
+func TestEnqueueBackpressure(t *testing.T) {
+	ctx := context.Background()
+	rdb, err := storage.NewRedis(ctx, "localhost:6380")
+	if err != nil {
+		t.Skipf("redis unavailable (%v), skipping integration test", err)
+	}
+	defer func() { _ = rdb.Close() }()
+
+	inbound := "test:inbound-bp:" + t.Name()
+	t.Cleanup(func() { rdb.Del(context.Background(), inbound) })
+	t.Cleanup(func() { rdb.Del(context.Background(), "dedup:mock:bp-1", "dedup:mock:bp-2") })
+
+	h := web.EnqueueHandler{
+		Stream: storage.NewStream(rdb), Dedup: storage.NewDeduper(rdb),
+		Routes:   tenant.NewResolver(fakeStore{data: testData()}),
+		InStream: inbound, BackpressureLimit: 1, // reject as soon as 1 entry sits in the queue
+	}
+	mk := func(id string) channels.InboundMessage {
+		return channels.InboundMessage{
+			Channel: "mock", MsgID: id, SessionKey: "dm:mock:u1", UserID: "u1",
+			Text: "hi", WebhookPath: "/mock/callback",
+		}
+	}
+	if _, err := h.Handle(ctx, mk("bp-1")); err != nil {
+		t.Fatalf("empty queue must accept: %v", err)
+	}
+	if _, err := h.Handle(ctx, mk("bp-2")); !errors.Is(err, web.ErrOverloaded) {
+		t.Fatalf("full queue must reject with ErrOverloaded, got %v", err)
+	}
+	if n, _ := rdb.Exists(ctx, "dedup:mock:bp-2").Result(); n != 0 {
+		t.Fatal("backpressure rejection must roll back the dedup key")
+	}
+}

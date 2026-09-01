@@ -6,12 +6,16 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"trpc.group/trpc-go/trpc-agent-go/event"
 	"trpc.group/trpc-go/trpc-agent-go/session"
+	"trpc.group/trpc-go/trpc-agent-go/session/summary"
+
+	plog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
 )
 
 // PGSessionService implements the framework session.Service over the
@@ -24,20 +28,64 @@ import (
 //     (ON CONFLICT DO NOTHING: a late duplicate is dropped, never an error).
 //   - session.state is a materialized snapshot for fast reads; the event
 //     stream is the source of truth a crashed session can be replayed from.
+//   - summary compresses old events: GetSession replays only the events
+//     after covered_event_id and exposes the summary under
+//     Session.Summaries, so long sessions no longer do a full replay
+//     (design 5.1.3 重放与摘要机制).
 //   - App/user-scoped state (app:/user: prefixes) is not supported by this
 //     backend: the platform's agent definitions don't use those scopes.
 //
 // Key mapping: framework Key{AppName, UserID, SessionID} →
-// session{app_id, user_id, session_key}. AppName must be the agent_app UUID
-// until per-app Runner assembly lands.
+// session{app_id, user_id, session_key}; AppName is the agent_app UUID the
+// per-app assembler stamps onto the runner.
 type PGSessionService struct {
 	pool    *pgxpool.Pool
 	tenants *appTenantResolver
+
+	// summarizer, when set, enables the summary pipeline: the runner calls
+	// EnqueueSummaryJob after every event append, and the background worker
+	// summarizes sessions whose uncovered events pass the threshold.
+	summarizer summary.SessionSummarizer
+	jobs       chan summaryJob
+	stop       chan struct{}
+	wg         sync.WaitGroup
+}
+
+// summaryJob is one queued summarization request.
+type summaryJob struct {
+	key       session.Key
+	filterKey string
+	force     bool
+}
+
+// summaryQueueSize bounds pending jobs; a full queue drops the job (the next
+// appended event re-enqueues), so a summarizer outage cannot block the worker.
+const summaryQueueSize = 256
+
+// PGSessionOption customizes the PG session service.
+type PGSessionOption func(*PGSessionService)
+
+// WithSummarizer enables asynchronous summary generation (framework
+// summarizer, event-count threshold) persisted into the summary table.
+func WithSummarizer(s summary.SessionSummarizer) PGSessionOption {
+	return func(svc *PGSessionService) {
+		svc.summarizer = s
+	}
 }
 
 // NewPGSessionService creates the service on an established pool.
-func NewPGSessionService(pool *pgxpool.Pool) *PGSessionService {
-	return &PGSessionService{pool: pool, tenants: newAppTenantResolver(pool)}
+func NewPGSessionService(pool *pgxpool.Pool, opts ...PGSessionOption) *PGSessionService {
+	s := &PGSessionService{pool: pool, tenants: newAppTenantResolver(pool)}
+	for _, opt := range opts {
+		opt(s)
+	}
+	if s.summarizer != nil {
+		s.jobs = make(chan summaryJob, summaryQueueSize)
+		s.stop = make(chan struct{})
+		s.wg.Add(1)
+		go s.summaryLoop()
+	}
+	return s
 }
 
 // ErrStateScopeUnsupported is returned by the app/user-scoped state methods:
@@ -88,7 +136,10 @@ func (s *PGSessionService) CreateSession(ctx context.Context, key session.Key, s
 }
 
 // GetSession implements session.Service: loads the snapshot and replays
-// events from the journal. A missing session returns (nil, nil).
+// events from the journal. When a summary exists, replay is incremental —
+// only events after covered_event_id are loaded, and the summary is exposed
+// under Session.Summaries (with its boundary) so the framework prepends it
+// instead of the compressed history. A missing session returns (nil, nil).
 func (s *PGSessionService) GetSession(ctx context.Context, key session.Key, opts ...session.Option) (*session.Session, error) {
 	if err := key.CheckSessionKey(); err != nil {
 		return nil, err
@@ -118,7 +169,22 @@ func (s *PGSessionService) GetSession(ctx context.Context, key session.Key, opts
 		ID: key.SessionID, AppName: key.AppName, UserID: key.UserID,
 		State: state, CreatedAt: createdAt, UpdatedAt: updAt,
 	}
-	events, err := s.loadEvents(ctx, sessID, opts...)
+	var afterSeq int64
+	sum, has, err := s.loadSummary(ctx, sessID)
+	if err != nil {
+		return nil, err
+	}
+	if has {
+		afterSeq = sum.seq
+		sess.Summaries = map[string]*session.Summary{
+			sum.filterKey: {
+				Summary:   sum.text,
+				UpdatedAt: sum.coveredAt,
+				Boundary:  session.NewSummaryBoundaryWithEventID(sum.filterKey, sum.coveredAt, sum.eventID),
+			},
+		}
+	}
+	events, err := s.loadEvents(ctx, sessID, afterSeq, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -153,7 +219,7 @@ func (s *PGSessionService) ListSessions(ctx context.Context, userKey session.Use
 			CreatedAt: createdAt, UpdatedAt: updatedAt,
 		}
 		if !onlyMeta {
-			events, err := s.loadEvents(ctx, sessID)
+			events, err := s.loadEvents(ctx, sessID, 0)
 			if err != nil {
 				return nil, err
 			}
@@ -309,15 +375,128 @@ func (s *PGSessionService) UpdateSessionState(ctx context.Context, key session.K
 	return tx.Commit(ctx)
 }
 
-// CreateSessionSummary implements session.Service as a no-op: summarization
-// only runs when a summarizer is configured (arrives with the Memory/Knowledge
-// stage); the summary table and its covered_event_id cursor are already here.
-func (s *PGSessionService) CreateSessionSummary(_ context.Context, _ *session.Session, _ string, _ bool) error {
+// CreateSessionSummary implements session.Service: summarize now, in the
+// caller's context. The runner triggers it through EnqueueSummaryJob; this
+// synchronous entry exists for the framework contract and for tests.
+func (s *PGSessionService) CreateSessionSummary(ctx context.Context, sess *session.Session, filterKey string, force bool) error {
+	if s.summarizer == nil || sess == nil {
+		return nil
+	}
+	key := session.Key{AppName: sess.AppName, UserID: sess.UserID, SessionID: sess.ID}
+	if err := key.CheckSessionKey(); err != nil {
+		return err
+	}
+	return s.summarize(ctx, key, filterKey, force)
+}
+
+// EnqueueSummaryJob implements session.Service: summarization is asynchronous
+// (design 5.1.3: 摘要由框架 Summarizer 在事件数超阈值时异步生成). The job
+// carries only the session key; the worker reloads the session from PG, so a
+// job survives the enqueueing worker's request context.
+func (s *PGSessionService) EnqueueSummaryJob(_ context.Context, sess *session.Session, filterKey string, force bool) error {
+	if s.summarizer == nil || sess == nil {
+		return nil
+	}
+	job := summaryJob{
+		key:       session.Key{AppName: sess.AppName, UserID: sess.UserID, SessionID: sess.ID},
+		filterKey: filterKey,
+		force:     force,
+	}
+	select {
+	case s.jobs <- job:
+	default:
+		// Queue full: drop. The next appended event enqueues again, so the
+		// summary merely lags; blocking the message worker would be worse.
+		plog.Warnf("summary queue full, dropping job for session %s", sess.ID)
+	}
 	return nil
 }
 
-// EnqueueSummaryJob implements session.Service as a no-op (see CreateSessionSummary).
-func (s *PGSessionService) EnqueueSummaryJob(_ context.Context, _ *session.Session, _ string, _ bool) error {
+// summaryLoop drains the summary queue until Close.
+func (s *PGSessionService) summaryLoop() {
+	defer s.wg.Done()
+	for {
+		select {
+		case <-s.stop:
+			return
+		case job := <-s.jobs:
+			// Detached context with a generous deadline: summarization is an
+			// LLM call of its own and must not die with the request ctx.
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			if err := s.summarize(ctx, job.key, job.filterKey, job.force); err != nil {
+				plog.Warnf("summarize session %s: %v", job.key.SessionID, err)
+			}
+			cancel()
+		}
+	}
+}
+
+// summarize reloads the session from PG, asks the framework summarizer for a
+// rolling summary, and persists it with the covered_event_id cursor. The
+// previous summary is exposed on sess.Summaries so the summarizer rolls
+// forward instead of starting over.
+func (s *PGSessionService) summarize(ctx context.Context, key session.Key, filterKey string, force bool) error {
+	sessID, err := s.sessionID(ctx, key)
+	if err != nil {
+		return err
+	}
+	if sessID == "" {
+		return nil // session not persisted yet; the next append retries
+	}
+
+	sess := &session.Session{
+		ID: key.SessionID, AppName: key.AppName, UserID: key.UserID,
+		State:     session.StateMap{},
+		Summaries: make(map[string]*session.Summary),
+	}
+	prev, has, err := s.loadSummary(ctx, sessID)
+	if err != nil {
+		return err
+	}
+	if has {
+		sess.Summaries[prev.filterKey] = &session.Summary{
+			Summary:   prev.text,
+			UpdatedAt: prev.coveredAt,
+			Boundary:  session.NewSummaryBoundaryWithEventID(prev.filterKey, prev.coveredAt, prev.eventID),
+		}
+	}
+	rows, err := s.loadEventRows(ctx, sessID, 0)
+	if err != nil {
+		return err
+	}
+	for _, r := range rows {
+		sess.Events = append(sess.Events, r.evt)
+	}
+	if len(rows) == 0 {
+		return nil
+	}
+
+	if !force && !s.summarizer.ShouldSummarize(sess) {
+		return nil
+	}
+	text, err := s.summarizer.Summarize(ctx, sess)
+	if err != nil {
+		return fmt.Errorf("summarize: %w", err)
+	}
+	if strings.TrimSpace(text) == "" {
+		return nil
+	}
+
+	// The summary covers everything the summarizer saw: all events loaded
+	// above. Persist with a cursor guard so a stale concurrent job cannot
+	// move the cursor backwards.
+	covered := rows[len(rows)-1]
+	_, err = s.pool.Exec(ctx,
+		`INSERT INTO summary (session_id, summary_text, covered_event_id, filter_key, updated_at)
+		 VALUES ($1, $2, $3, $4, now())
+		 ON CONFLICT (session_id) DO UPDATE
+		 SET summary_text = $2, covered_event_id = $3, filter_key = $4, updated_at = now()
+		 WHERE COALESCE((SELECT event_seq FROM session_event WHERE id = summary.covered_event_id), -1) <= $5`,
+		sessID, text, covered.id, filterKey, covered.seq)
+	if err != nil {
+		return fmt.Errorf("upsert summary: %w", err)
+	}
+	plog.Debugf("summary updated for session %s (covered seq %d)", key.SessionID, covered.seq)
 	return nil
 }
 
@@ -368,8 +547,15 @@ func (s *PGSessionService) ListUserStates(context.Context, session.UserKey) (ses
 	return nil, ErrStateScopeUnsupported
 }
 
-// Close implements session.Service; the pool is owned by the caller.
-func (s *PGSessionService) Close() error { return nil }
+// Close implements session.Service: stops the summary worker and waits for
+// the in-flight job. The pool is owned by the caller.
+func (s *PGSessionService) Close() error {
+	if s.stop != nil {
+		close(s.stop)
+		s.wg.Wait()
+	}
+	return nil
+}
 
 // ensureSession returns the internal session UUID, inserting the row when
 // missing, and locks it FOR UPDATE (must run inside a transaction).
@@ -403,30 +589,17 @@ func (s *PGSessionService) ensureSession(ctx context.Context, tx pgx.Tx, key ses
 	return sessID, nil
 }
 
-// loadEvents replays the journal in event_seq order, applying the EventTime /
-// EventNum options in memory (per-session volumes are modest).
-func (s *PGSessionService) loadEvents(ctx context.Context, sessID string, opts ...session.Option) ([]event.Event, error) {
-	rows, err := s.pool.Query(ctx,
-		`SELECT event FROM session_event WHERE session_id = $1 ORDER BY event_seq`, sessID)
+// loadEvents replays the journal in event_seq order, incrementally from
+// afterSeq (0 = full replay), applying the EventTime / EventNum options in
+// memory (per-session volumes are modest).
+func (s *PGSessionService) loadEvents(ctx context.Context, sessID string, afterSeq int64, opts ...session.Option) ([]event.Event, error) {
+	rows, err := s.loadEventRows(ctx, sessID, afterSeq)
 	if err != nil {
-		return nil, fmt.Errorf("query events: %w", err)
-	}
-	defer rows.Close()
-
-	var events []event.Event
-	for rows.Next() {
-		var raw []byte
-		if err := rows.Scan(&raw); err != nil {
-			return nil, fmt.Errorf("scan event: %w", err)
-		}
-		var e event.Event
-		if err := json.Unmarshal(raw, &e); err != nil {
-			return nil, fmt.Errorf("decode event: %w", err)
-		}
-		events = append(events, e)
-	}
-	if err := rows.Err(); err != nil {
 		return nil, err
+	}
+	events := make([]event.Event, 0, len(rows))
+	for _, r := range rows {
+		events = append(events, r.evt)
 	}
 
 	o := applySessionOpts(opts)
@@ -443,6 +616,111 @@ func (s *PGSessionService) loadEvents(ctx context.Context, sessID string, opts .
 		events = events[len(events)-o.EventNum:]
 	}
 	return events, nil
+}
+
+// eventRow is one journaled event with its storage coordinates.
+type eventRow struct {
+	id        string // session_event row UUID (the covered_event_id target)
+	seq       int64
+	createdAt time.Time
+	evt       event.Event
+}
+
+// loadEventRows loads events with their row IDs and seqs, in seq order,
+// incrementally from afterSeq (0 = from the beginning).
+func (s *PGSessionService) loadEventRows(ctx context.Context, sessID string, afterSeq int64) ([]eventRow, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT id, event_seq, created_at, event FROM session_event
+		 WHERE session_id = $1 AND event_seq > $2 ORDER BY event_seq`, sessID, afterSeq)
+	if err != nil {
+		return nil, fmt.Errorf("query events: %w", err)
+	}
+	defer rows.Close()
+
+	var out []eventRow
+	for rows.Next() {
+		var r eventRow
+		var raw []byte
+		if err := rows.Scan(&r.id, &r.seq, &r.createdAt, &raw); err != nil {
+			return nil, fmt.Errorf("scan event: %w", err)
+		}
+		if err := json.Unmarshal(raw, &r.evt); err != nil {
+			return nil, fmt.Errorf("decode event: %w", err)
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// summaryRow is the summary table row with the covered event's position
+// resolved (the covered row lives in session_event, or in the archive after
+// the monthly task has moved it).
+type summaryRow struct {
+	text      string
+	filterKey string
+	seq       int64     // covered event_seq: replay resumes after it
+	eventID   string    // covered framework event ID (the prompt-side boundary)
+	coveredAt time.Time // covered event creation time
+}
+
+// loadSummary reads the summary row and resolves its covered event; a covered
+// event that no longer exists anywhere invalidates the row (treated as
+// absent, so the session falls back to a full replay).
+func (s *PGSessionService) loadSummary(ctx context.Context, sessID string) (summaryRow, bool, error) {
+	var (
+		sum       summaryRow
+		coveredID string
+		seq       *int64
+		createdAt *time.Time
+		eventRaw  []byte
+	)
+	err := s.pool.QueryRow(ctx,
+		`SELECT s.summary_text, s.filter_key, s.covered_event_id,
+		        COALESCE(e.event_seq, a.event_seq),
+		        COALESCE(e.created_at, a.created_at),
+		        COALESCE(e.event, a.event)
+		 FROM summary s
+		 LEFT JOIN session_event e ON e.id = s.covered_event_id
+		 LEFT JOIN session_event_archive a ON a.id = s.covered_event_id
+		 WHERE s.session_id = $1`, sessID,
+	).Scan(&sum.text, &sum.filterKey, &coveredID, &seq, &createdAt, &eventRaw)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return summaryRow{}, false, nil
+	}
+	if err != nil {
+		return summaryRow{}, false, fmt.Errorf("query summary: %w", err)
+	}
+	if seq == nil || createdAt == nil {
+		// Covered event vanished without archival (e.g. manual cleanup):
+		// without its position the replay boundary is unknowable, so the
+		// session falls back to a full replay with the summary unused.
+		plog.Warnf("summary for session %s references missing event %s, ignoring", sessID, coveredID)
+		return summaryRow{}, false, nil
+	}
+	sum.seq = *seq
+	sum.coveredAt = *createdAt
+	var evt event.Event
+	if err := json.Unmarshal(eventRaw, &evt); err != nil {
+		return summaryRow{}, false, fmt.Errorf("decode covered event: %w", err)
+	}
+	sum.eventID = evt.ID
+	return sum, true, nil
+}
+
+// sessionID returns the internal session UUID, "" when the session does not
+// exist yet.
+func (s *PGSessionService) sessionID(ctx context.Context, key session.Key) (string, error) {
+	var sessID string
+	err := s.pool.QueryRow(ctx,
+		`SELECT id FROM session WHERE app_id = $1 AND session_key = $2`,
+		key.AppName, key.SessionID).Scan(&sessID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("query session id: %w", err)
+	}
+	return sessID, nil
 }
 
 // tenantForApp resolves a session row's tenant_id from its agent_app via the

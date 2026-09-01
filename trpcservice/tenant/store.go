@@ -49,7 +49,7 @@ func (s *PGStore) LoadAll(ctx context.Context) (Data, error) {
 
 func (s *PGStore) loadTenants(ctx context.Context, d *Data) error {
 	rows, err := s.pool.Query(ctx,
-		`SELECT id, name, model_config, tool_policy, audit_policy, storage_config, status FROM tenant`)
+		`SELECT id, name, model_config, tool_policy, audit_policy, rate_policy, storage_config, status FROM tenant`)
 	if err != nil {
 		return fmt.Errorf("query tenant: %w", err)
 	}
@@ -57,7 +57,7 @@ func (s *PGStore) loadTenants(ctx context.Context, d *Data) error {
 	for rows.Next() {
 		var t Tenant
 		if err := rows.Scan(&t.ID, &t.Name, &t.ModelConfig, &t.ToolPolicy,
-			&t.AuditPolicy, &t.StorageConfig, &t.Status); err != nil {
+			&t.AuditPolicy, &t.RatePolicy, &t.StorageConfig, &t.Status); err != nil {
 			return fmt.Errorf("scan tenant: %w", err)
 		}
 		d.Tenants = append(d.Tenants, t)

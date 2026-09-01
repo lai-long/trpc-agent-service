@@ -287,6 +287,7 @@ sequenceDiagram
 | `model_config` | `jsonb` | 否 | 模型配置，包括模型、温度、上下文长度等 |
 | `tool_policy` | `jsonb` | 否 | 工具调用策略 |
 | `audit_policy` | `jsonb` | 否 | 审计与数据保留策略 |
+| `rate_policy` | `jsonb` | 否 | 入口限流策略（5.1.4 令牌桶），如 `{"qps":50,"burst":100}`，空走平台默认 |
 | `storage_config` | `jsonb` | 否 | 数据后端覆盖配置（受控菜单），如 `{"session":{"type":"redis","dsn_ref":"t42-redis"}}`，空表示走平台推荐栈 |
 | `status` | `varchar(32)` | 是 | 状态：`active`、`disabled` 等 |
 | `created_at` | `timestamptz` | 是 | 创建时间 |
@@ -464,6 +465,7 @@ PG 要求分区键包含在所有唯一约束中，与 `(session_id, event_seq)`
 | `session_id` | `uuid` | 是 | 会话 ID，主键 |
 | `summary_text` | `text` | 是 | 会话摘要 |
 | `covered_event_id` | `uuid` | 是 | 摘要覆盖到的最大事件 ID |
+| `filter_key` | `varchar(128)` | 是 | 摘要对应的框架事件过滤键（单 Agent 应用即 Agent 名） |
 | `updated_at` | `timestamptz` | 是 | 摘要更新时间 |
 
 索引与约束：
