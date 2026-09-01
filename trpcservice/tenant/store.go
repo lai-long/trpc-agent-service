@@ -3,8 +3,10 @@ package tenant
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -15,11 +17,12 @@ type Store interface {
 	LoadAll(ctx context.Context) (Data, error)
 }
 
-// Data is one load of the three routing tables.
+// Data is one load of the routing tables plus active storage migrations.
 type Data struct {
-	Tenants  []Tenant
-	Apps     []AgentApp
-	Bindings []ChannelBinding
+	Tenants    []Tenant
+	Apps       []AgentApp
+	Bindings   []ChannelBinding
+	Migrations []Migration
 }
 
 // PGStore implements Store on a PostgreSQL pool.
@@ -44,7 +47,39 @@ func (s *PGStore) LoadAll(ctx context.Context) (Data, error) {
 	if err := s.loadBindings(ctx, &d); err != nil {
 		return Data{}, err
 	}
+	if err := s.loadMigrations(ctx, &d); err != nil {
+		return Data{}, err
+	}
 	return d, nil
+}
+
+// loadMigrations loads migrations in non-terminal phases; a missing
+// storage_migration table (schema predates it) yields an empty set.
+func (s *PGStore) loadMigrations(ctx context.Context, d *Data) error {
+	rows, err := s.pool.Query(ctx,
+		`SELECT id, tenant_id, resource, from_backend, to_backend, phase FROM storage_migration
+		 WHERE phase NOT IN ('done', 'failed', 'aborted')`)
+	if err != nil {
+		if isUndefinedTable(err) {
+			return nil
+		}
+		return fmt.Errorf("query storage_migration: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var m Migration
+		if err := rows.Scan(&m.ID, &m.TenantID, &m.Resource, &m.FromBackend, &m.ToBackend, &m.Phase); err != nil {
+			return fmt.Errorf("scan migration: %w", err)
+		}
+		d.Migrations = append(d.Migrations, m)
+	}
+	return rows.Err()
+}
+
+// isUndefinedTable reports the PG 42P01 (undefined_table) error.
+func isUndefinedTable(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "42P01"
 }
 
 func (s *PGStore) loadTenants(ctx context.Context, d *Data) error {

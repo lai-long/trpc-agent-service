@@ -273,6 +273,8 @@ sequenceDiagram
 | `memory_item` | 用户长期记忆 | `id` 主键 |
 | `summary` | 会话摘要及压缩进度 | `session_id` 主键 |
 | `audit_log` | 审计日志 | `id` 主键 |
+| `storage_migration` | 租户后端迁移状态机（5.2.6） | `(tenant_id, resource)` 活跃唯一（部分索引） |
+| `memory_embedding` | 记忆语义召回向量（pgvector，异步写入） | `memory_id` 唯一 |
 
 #### 5.1.3 表结构
 
@@ -497,6 +499,7 @@ PG 要求分区键包含在所有唯一约束中，与 `(session_id, event_seq)`
 | `prompt_tokens` | `int` | 否 | 输入 token 数 |
 | `completion_tokens` | `int` | 否 | 输出 token 数 |
 | `trace_id` | `varchar(128)` | 否 | 链路追踪 ID |
+| `detail` | `jsonb` | 否 | 管理端写操作的变更前后内容（`{"before":..., "after":...}`，5.4 变更审计） |
 | `created_at` | `timestamptz` | 是 | 创建时间 |
 
 索引与约束：

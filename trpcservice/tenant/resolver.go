@@ -60,6 +60,7 @@ type Resolver struct {
 	tenants  map[string]Tenant
 	apps     map[string]AgentApp
 	bindings map[string]ChannelBinding // by webhook_path
+	migs     map[string]Migration      // by tenant_id + ":" + resource
 	loadedAt time.Time
 	loaded   bool
 }
@@ -206,8 +207,26 @@ func (r *Resolver) refresh(ctx context.Context) error {
 	for _, b := range d.Bindings {
 		bindings[b.WebhookPath] = b
 	}
-	r.tenants, r.apps, r.bindings = tenants, apps, bindings
+	migs := make(map[string]Migration, len(d.Migrations))
+	for _, m := range d.Migrations {
+		migs[m.TenantID+":"+m.Resource] = m
+	}
+	r.tenants, r.apps, r.bindings, r.migs = tenants, apps, bindings, migs
 	r.loadedAt = time.Now()
 	r.loaded = true
 	return nil
+}
+
+// ActiveMigration returns the in-flight migration for (tenant, resource), or
+// nil. The worker's session-service routing fans writes out to both backends
+// while one is active (design 5.2.6).
+func (r *Resolver) ActiveMigration(tenantID, resource string) *Migration {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	m, ok := r.migs[tenantID+":"+resource]
+	if !ok {
+		return nil
+	}
+	cp := m
+	return &cp
 }

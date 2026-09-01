@@ -11,6 +11,7 @@ import (
 	otelmetric "go.opentelemetry.io/otel/metric"
 	"go.uber.org/zap"
 	"trpc.group/trpc-go/trpc-agent-go/agent/llmagent"
+	"trpc.group/trpc-go/trpc-agent-go/artifact"
 	"trpc.group/trpc-go/trpc-agent-go/knowledge"
 	"trpc.group/trpc-go/trpc-agent-go/memory"
 	"trpc.group/trpc-go/trpc-agent-go/model"
@@ -72,6 +73,9 @@ type RunnerConfig struct {
 	// KnowledgeFilter (tenant/app metadata isolation).
 	Knowledge       knowledge.Knowledge
 	KnowledgeFilter map[string]any
+	// ArtifactService, when set, is wired onto the runner for artifact
+	// storage (design: Artifact = S3).
+	ArtifactService artifact.Service
 }
 
 // NewRunnerProcessor assembles llmagent + runner with non-streaming
@@ -112,6 +116,9 @@ func NewRunnerProcessor(cfg RunnerConfig) *RunnerProcessor {
 	runnerOpts := []runner.Option{runner.WithSessionService(cfg.SessionService)}
 	if cfg.MemoryService != nil {
 		runnerOpts = append(runnerOpts, runner.WithMemoryService(cfg.MemoryService))
+	}
+	if cfg.ArtifactService != nil {
+		runnerOpts = append(runnerOpts, runner.WithArtifactService(cfg.ArtifactService))
 	}
 	r := runner.NewRunner(cfg.AppName, llm, runnerOpts...)
 	return newRunnerProcessor(r, cfg.ModelName, cfg.Timeout, cfg.Retries)

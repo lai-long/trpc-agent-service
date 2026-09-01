@@ -22,12 +22,10 @@ import (
 )
 
 // AdminAPI serves the management endpoints of design 5.4: tenant/app CRUD,
-// publish/rollback with atomic switching, channel binding management and
-// audit queries. It is intended for internal networks only; authentication is
-// a bearer token (TRPC_ADMIN_TOKEN) — empty means dev mode (no auth).
-//
-// Storage-migration endpoints (5.2.6) are intentionally absent until the
-// migration executor lands.
+// publish/rollback with atomic switching, channel binding management,
+// storage-migration control (5.2.6) and audit queries. It is intended for
+// internal networks only; authentication is a bearer token
+// (TRPC_ADMIN_TOKEN) — empty means dev mode (no auth).
 type AdminAPI struct {
 	pool    *pgxpool.Pool
 	auditor *storage.Auditor // nil disables write-op auditing
@@ -37,6 +35,9 @@ type AdminAPI struct {
 	// Knowledge ingests documents into the shared knowledge store (nil when
 	// no embedder is configured; the ingestion endpoint then answers 503).
 	Knowledge *knowledge.BuiltinKnowledge
+	// DefaultSessionBackend is the platform default session backend; a
+	// migration's from_backend is the tenant's override or this default.
+	DefaultSessionBackend string
 }
 
 // NewAdminAPI creates the API. The bearer token empty means dev mode.
@@ -62,6 +63,8 @@ func (a *AdminAPI) RegisterRoutes(mux *http.ServeMux) {
 	handle("GET /admin/apps/{id}/bindings", a.listBindings)
 	handle("DELETE /admin/apps/{id}/bindings/{binding}", a.deleteBinding)
 	handle("POST /admin/apps/{id}/knowledge/documents", a.addKnowledgeDocument)
+	handle("POST /admin/tenants/{id}/storage-migrations", a.createMigration)
+	handle("GET /admin/storage-migrations/{id}", a.getMigration)
 	handle("GET /admin/audit", a.queryAudit)
 }
 
@@ -568,6 +571,114 @@ func (a *AdminAPI) addKnowledgeDocument(w http.ResponseWriter, r *http.Request) 
 	// The document content can be large; the audit records the metadata only.
 	a.afterWrite(r, "add_knowledge_document", tenantID, nil, map[string]any{"name": in.Name})
 	writeJSON(w, http.StatusCreated, map[string]any{"ingested": in.Name})
+}
+
+// ---------------------------------------------------------------------------
+// Storage migrations (design 5.2.6)
+// ---------------------------------------------------------------------------
+
+// createMigration starts a backend migration for one tenant. The row appears
+// in the resolver snapshot within seconds (invalidation broadcast), and from
+// then on the assembler dual-writes both backends; the Migrator advances the
+// phases.
+func (a *AdminAPI) createMigration(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Resource  string `json:"resource"`
+		ToBackend string `json:"to_backend"`
+	}
+	if !decodeBody(w, r, &in) {
+		return
+	}
+	if in.Resource != "session" {
+		writeError(w, http.StatusBadRequest, "resource must be \"session\" (knowledge/artifact arrive later)")
+		return
+	}
+	if in.ToBackend != "redis" && in.ToBackend != "postgres" {
+		writeError(w, http.StatusBadRequest, `to_backend must be "redis" or "postgres"`)
+		return
+	}
+
+	tenantID := r.PathValue("id")
+	var storageCfg []byte
+	err := a.pool.QueryRow(r.Context(),
+		`SELECT storage_config FROM tenant WHERE id = $1 AND status = 'active'`, tenantID).Scan(&storageCfg)
+	if errors.Is(err, pgx.ErrNoRows) {
+		writeError(w, http.StatusNotFound, "tenant not found or inactive")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	from := a.DefaultSessionBackend
+	if from == "" {
+		from = "redis"
+	}
+	if override := parseSessionBackendOverride(storageCfg); override != "" {
+		from = override
+	}
+	if from == in.ToBackend {
+		writeError(w, http.StatusConflict, "tenant already on "+in.ToBackend)
+		return
+	}
+
+	var id string
+	err = a.pool.QueryRow(r.Context(),
+		`INSERT INTO storage_migration (tenant_id, resource, from_backend, to_backend, phase)
+		 VALUES ($1, $2, $3, $4, 'dual_write') RETURNING id`,
+		tenantID, in.Resource, from, in.ToBackend).Scan(&id)
+	if err != nil {
+		if strings.Contains(err.Error(), "uk_storage_migration_active") {
+			writeError(w, http.StatusConflict, "an active migration already exists for this tenant/resource")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	a.afterWrite(r, "create_storage_migration", tenantID, nil, map[string]any{
+		"id": id, "resource": in.Resource, "from": from, "to": in.ToBackend,
+	})
+	writeJSON(w, http.StatusCreated, map[string]any{"id": id, "phase": "dual_write"})
+}
+
+func (a *AdminAPI) getMigration(w http.ResponseWriter, r *http.Request) {
+	var (
+		tenantID, resource, from, to, phase string
+		progress                            []byte
+		migErr                              *string
+		createdAt, updatedAt                time.Time
+	)
+	err := a.pool.QueryRow(r.Context(),
+		`SELECT tenant_id, resource, from_backend, to_backend, phase, progress, error, created_at, updated_at
+		 FROM storage_migration WHERE id = $1`, r.PathValue("id"),
+	).Scan(&tenantID, &resource, &from, &to, &phase, &progress, &migErr, &createdAt, &updatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		writeError(w, http.StatusNotFound, "migration not found")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"id": r.PathValue("id"), "tenant_id": tenantID, "resource": resource,
+		"from_backend": from, "to_backend": to, "phase": phase,
+		"progress": jsonOrNull(progress), "error": migErr,
+		"created_at": createdAt, "updated_at": updatedAt,
+	})
+}
+
+// parseSessionBackendOverride reads storage_config.session.type.
+func parseSessionBackendOverride(raw []byte) string {
+	var c struct {
+		Session struct {
+			Type string `json:"type"`
+		} `json:"session"`
+	}
+	if len(raw) > 0 {
+		_ = json.Unmarshal(raw, &c)
+	}
+	return c.Session.Type
 }
 
 // ---------------------------------------------------------------------------

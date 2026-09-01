@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net/http"
 	"os"
 	"os/signal"
+	"slices"
 	"strconv"
 	"syscall"
 	"time"
@@ -27,7 +29,9 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tool"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/web"
+	"trpc.group/trpc-go/trpc-agent-go/artifact"
 	"trpc.group/trpc-go/trpc-agent-go/knowledge"
+	"trpc.group/trpc-go/trpc-agent-go/knowledge/embedder"
 	openaiembed "trpc.group/trpc-go/trpc-agent-go/knowledge/embedder/openai"
 	"trpc.group/trpc-go/trpc-agent-go/memory"
 	"trpc.group/trpc-go/trpc-agent-go/model/openai"
@@ -108,6 +112,22 @@ func serve() error {
 	auditor, resolver, pgPool, pgCleanup := startPGConsumers(ctx, cfg)
 	defer pgCleanup()
 
+	// Session services: one per supported backend (design 5.1.1 受控菜单).
+	// The tenant's storage_config.session.type routes its apps;
+	// TRPC_SESSION_BACKEND picks the platform default.
+	sessByType, defaultSess, sessErr := buildSessionServices(ctx, cfg, pgPool)
+	if sessErr != nil {
+		plog.Warnf("session services unavailable (%v)", sessErr)
+	}
+	defer func() {
+		for _, s := range sessByType {
+			_ = s.Close()
+		}
+	}()
+
+	// Artifact storage (S3-compatible, MinIO locally); optional.
+	artifacts := buildArtifact(cfg)
+
 	ch := mock.New()
 	enqueue := web.EnqueueHandler{
 		Stream:       stream,
@@ -139,10 +159,12 @@ func serve() error {
 	kb := buildKnowledge(ctx, cfg)
 
 	// Admin API needs PG; it also starts the resolver's invalidation watch so
-	// publish/rollback reaches workers in seconds (design 5.2.3).
+	// publish/rollback reaches workers in seconds (design 5.2.3). The storage
+	// migration executor lives on the same dependency.
 	if pgPool != nil {
 		adminAPI := web.NewAdminAPI(pgPool, auditor, rdb, cfg.AdminToken)
 		adminAPI.Knowledge = kb
+		adminAPI.DefaultSessionBackend = defaultSess
 		adminAPI.RegisterRoutes(mux)
 		resolver.WatchInvalidations(ctx, rdb)
 		if cfg.AdminToken == "" {
@@ -162,7 +184,7 @@ func serve() error {
 		IdleTimeout:       60 * time.Second,
 	}
 
-	processor, cleanup := buildProcessor(ctx, cfg, rdb, auditor, pgPool, kb, resolver)
+	processor, cleanup := buildProcessor(ctx, cfg, rdb, auditor, pgPool, kb, resolver, sessByType, defaultSess, artifacts)
 	defer cleanup()
 
 	consumer := fmt.Sprintf("%s-%d", "allinone", os.Getpid())
@@ -201,6 +223,14 @@ func serve() error {
 
 	// Queue depth / pending gauges feeding the alerts of design 5.2.4.
 	metrics.StartStreamCollector(gctx, stream, 15*time.Second)
+
+	// Storage migration executor (design 5.2.6): advances active migrations
+	// through backfilling → read switch → observation → done.
+	if pgPool != nil {
+		migrator := storage.NewMigrator(pgPool, rdb, sessByType,
+			parseDuration(cfg.MigrationObserve, 24*time.Hour))
+		g.Go(func() error { migrator.Run(gctx); return nil })
+	}
 
 	// Graceful shutdown: stop pulling new messages first, let in-flight
 	// processing finish, then close the HTTP server.
@@ -264,6 +294,61 @@ func startWecom(cfg config.Config) *wecom.Channel {
 	return wc
 }
 
+// buildSessionServices builds one session service per supported backend
+// (design 5.1.1 受控菜单) plus the platform default selection. WithEnableTracing
+// is required beyond observability: with tracing disabled, the redis session
+// service's startSpan falls back to the caller's active span and its defer
+// span.End() would end OUR worker span prematurely (framework quirk).
+func buildSessionServices(ctx context.Context, cfg config.Config, pgPool *pgxpool.Pool) (map[string]session.Service, string, error) {
+	byType := map[string]session.Service{}
+	rs, err := sessionredis.NewService(
+		sessionredis.WithRedisClientURL("redis://"+cfg.RedisAddr),
+		sessionredis.WithEnableTracing(true),
+	)
+	if err != nil {
+		return nil, "", fmt.Errorf("redis session service: %w", err)
+	}
+	byType["redis"] = rs
+	if pgPool != nil {
+		var sessOpts []storage.PGSessionOption
+		if sm := buildSummarizer(ctx, cfg); sm != nil {
+			sessOpts = append(sessOpts, storage.WithSummarizer(sm))
+		}
+		byType["postgres"] = storage.NewPGSessionService(pgPool, sessOpts...)
+	} else if cfg.SessionBackend == "postgres" {
+		plog.Warnf("TRPC_SESSION_BACKEND=postgres but PG is unreachable, defaulting to redis")
+	}
+	def := cfg.SessionBackend
+	if _, ok := byType[def]; !ok {
+		plog.Warnf("session backend %q unavailable, defaulting to redis", def)
+		def = "redis"
+	}
+	return byType, def, nil
+}
+
+// buildArtifact builds the S3-compatible artifact store (design: Artifact =
+// S3, MinIO locally); unreachable endpoints degrade to nil with a warning.
+func buildArtifact(cfg config.Config) artifact.Service {
+	if cfg.S3Endpoint == "" {
+		return nil
+	}
+	svc, err := storage.NewS3ArtifactService(storage.S3ArtifactConfig{
+		Endpoint:     cfg.S3Endpoint,
+		AccessKeyRef: cfg.S3AccessKeyRef,
+		SecretKeyRef: cfg.S3SecretKeyRef,
+		Bucket:       cfg.S3Bucket,
+		Secure:       cfg.S3Secure == "true",
+		Prefix:       "artifact/",
+		Secrets:      config.NewFileResolver(cfg.SecretsDir),
+	})
+	if err != nil {
+		plog.Warnf("artifact store unavailable (%v), artifacts disabled", err)
+		return nil
+	}
+	plog.Infof("artifact store enabled (s3 %s, bucket %s)", cfg.S3Endpoint, cfg.S3Bucket)
+	return svc
+}
+
 // buildProcessor assembles the processing chain: the platform tool registry,
 // the dangerous-tool Approver, the per-app Assembler (one Runner per
 // agent_app, rebuilt when the resolver reports a config change), and the
@@ -271,7 +356,7 @@ func startWecom(cfg config.Config) *wecom.Channel {
 // auditing. Apps whose model key is missing are served by the echo fallback,
 // so the pipeline stays demoable without LLM access.
 // The returned cleanup closes resources.
-func buildProcessor(ctx context.Context, cfg config.Config, rdb *redis.Client, auditor *storage.Auditor, pgPool *pgxpool.Pool, kb *knowledge.BuiltinKnowledge, resolver *tenant.Resolver) (agent.Processor, func()) {
+func buildProcessor(ctx context.Context, cfg config.Config, rdb *redis.Client, auditor *storage.Auditor, pgPool *pgxpool.Pool, kb *knowledge.BuiltinKnowledge, resolver *tenant.Resolver, sessByType map[string]session.Service, defaultSess string, artifacts artifact.Service) (agent.Processor, func()) {
 	noop := func() {}
 
 	registry := tool.DemoTools()
@@ -297,38 +382,9 @@ func buildProcessor(ctx context.Context, cfg config.Config, rdb *redis.Client, a
 		}
 	}
 
-	// Session backend: redis (hot data, default) or postgres (event journal +
-	// snapshot, design decision 2). WithEnableTracing is required beyond
-	// observability: with tracing disabled, the session service's startSpan
-	// falls back to the caller's active span and its defer span.End() would
-	// end OUR worker span prematurely (framework quirk).
-	var sess session.Service
-	var sessCleanup func()
-	switch cfg.SessionBackend {
-	case "postgres":
-		if pgPool == nil {
-			plog.Warnf("TRPC_SESSION_BACKEND=postgres but PG is unreachable, falling back to redis")
-			break
-		}
-		var sessOpts []storage.PGSessionOption
-		if sm := buildSummarizer(ctx, cfg); sm != nil {
-			sessOpts = append(sessOpts, storage.WithSummarizer(sm))
-		}
-		sess = storage.NewPGSessionService(pgPool, sessOpts...)
-		plog.Infof("session backend: postgres")
+	if len(sessByType) == 0 {
+		return wrap(agent.EchoProcessor{}), noop
 	}
-	if sess == nil {
-		rs, err := sessionredis.NewService(
-			sessionredis.WithRedisClientURL("redis://"+cfg.RedisAddr),
-			sessionredis.WithEnableTracing(true),
-		)
-		if err != nil {
-			plog.Warnf("session service unavailable (%v), falling back to echo processor", err)
-			return wrap(agent.EchoProcessor{}), noop
-		}
-		sess = rs
-	}
-	sessCleanup = func() { _ = sess.Close() }
 
 	timeout, err := time.ParseDuration(cfg.ModelTimeout)
 	if err != nil || timeout <= 0 {
@@ -337,11 +393,15 @@ func buildProcessor(ctx context.Context, cfg config.Config, rdb *redis.Client, a
 	}
 
 	// Memory service over the PG memory_item table (two-level scope, soft
-	// delete), shared by all per-app runners; knowledge is likewise shared,
-	// with the assembler scoping each app's searches by metadata filter.
+	// delete), shared by all per-app runners; with an embeddings-capable
+	// endpoint the service gains semantic recall (async embedding worker).
 	var memService memory.Service
 	if pgPool != nil {
-		memService = storage.NewPGMemoryService(pgPool)
+		if emb, _, err := buildEmbedder(ctx, cfg); err == nil && emb != nil {
+			memService = storage.NewPGMemoryService(pgPool, storage.WithMemoryEmbedder(emb))
+		} else {
+			memService = storage.NewPGMemoryService(pgPool)
+		}
 	}
 
 	callbacks := ttool.NewCallbacks().RegisterBeforeTool(approver.BeforeTool)
@@ -360,10 +420,14 @@ func buildProcessor(ctx context.Context, cfg config.Config, rdb *redis.Client, a
 		Apps:      apps,
 		Secrets:   config.NewFileResolver(cfg.SecretsDir),
 		Registry:  registry,
-		Sessions:  sess,
 		Memory:    memService,
 		Knowledge: kbIface,
 		Callbacks: callbacks,
+		// Session backends: the tenant's storage_config routes its apps
+		// between them (migration flow only); the env default serves the rest.
+		SessionsByType: sessByType,
+		DefaultSession: defaultSess,
+		Artifact:       artifacts,
 		Defaults: agent.ModelSpec{
 			Name:      cfg.ModelName,
 			BaseURL:   cfg.ModelBaseURL,
@@ -373,8 +437,9 @@ func buildProcessor(ctx context.Context, cfg config.Config, rdb *redis.Client, a
 		Timeout:    timeout,
 		Retries:    1,
 	})
-	plog.Infof("per-app runner assembler ready (model default=%s, timeout=%s)", cfg.ModelName, timeout)
-	return wrap(assembler), func() { _ = assembler.Close(); sessCleanup() }
+	plog.Infof("per-app runner assembler ready (model default=%s, timeout=%s, session backends=%v)",
+		cfg.ModelName, timeout, slices.Sorted(maps.Keys(sessByType)))
+	return wrap(assembler), func() { _ = assembler.Close() }
 }
 
 // buildSummarizer builds the framework session summarizer on the platform
@@ -426,30 +491,42 @@ func parseDuration(s string, def time.Duration) time.Duration {
 	return v
 }
 
-// buildKnowledge builds the pgvector-backed knowledge base when an
-// embeddings-capable endpoint is configured; otherwise it returns nil and the
-// agent runs without knowledge retrieval.
-func buildKnowledge(ctx context.Context, cfg config.Config) *knowledge.BuiltinKnowledge {
+// buildEmbedder builds the OpenAI-compatible embeddings client shared by
+// Knowledge and memory semantic recall; (nil, 0, nil) when TRPC_EMBEDDER_MODEL
+// is unset — the default chat endpoint (DeepSeek) has no embeddings API.
+func buildEmbedder(ctx context.Context, cfg config.Config) (embedder.Embedder, int, error) {
 	if cfg.EmbedderModel == "" {
-		return nil
+		return nil, 0, nil
 	}
 	resolver := config.NewFileResolver(cfg.SecretsDir)
 	key, err := resolver.Resolve(ctx, cfg.EmbedderKeyRef)
 	if err != nil {
-		plog.Warnf("embedder key %q unavailable (%v), knowledge disabled", cfg.EmbedderKeyRef, err)
-		return nil
+		return nil, 0, fmt.Errorf("embedder key %q: %w", cfg.EmbedderKeyRef, err)
 	}
 	dim, err := strconv.Atoi(cfg.EmbedderDim)
 	if err != nil || dim <= 0 {
-		plog.Warnf("invalid TRPC_EMBEDDER_DIMENSION %q, knowledge disabled", cfg.EmbedderDim)
-		return nil
+		return nil, 0, fmt.Errorf("invalid TRPC_EMBEDDER_DIMENSION %q", cfg.EmbedderDim)
 	}
-	emb := openaiembed.New(
+	return openaiembed.New(
 		openaiembed.WithModel(cfg.EmbedderModel),
 		openaiembed.WithAPIKey(key),
 		openaiembed.WithBaseURL(cfg.EmbedderBaseURL),
 		openaiembed.WithDimensions(dim),
-	)
+	), dim, nil
+}
+
+// buildKnowledge builds the pgvector-backed knowledge base when an
+// embeddings-capable endpoint is configured; otherwise it returns nil and the
+// agent runs without knowledge retrieval.
+func buildKnowledge(ctx context.Context, cfg config.Config) *knowledge.BuiltinKnowledge {
+	emb, dim, err := buildEmbedder(ctx, cfg)
+	if err != nil {
+		plog.Warnf("embedder unavailable (%v), knowledge disabled", err)
+		return nil
+	}
+	if emb == nil {
+		return nil
+	}
 	kb, err := agent.NewKnowledgeBase(cfg.PGDSN, cfg.KnowledgeTable, dim, emb)
 	if err != nil {
 		plog.Warnf("knowledge base unavailable (%v), knowledge disabled", err)

@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"trpc.group/trpc-go/trpc-agent-go/artifact"
 	"trpc.group/trpc-go/trpc-agent-go/knowledge"
 	"trpc.group/trpc-go/trpc-agent-go/memory"
 	"trpc.group/trpc-go/trpc-agent-go/session"
@@ -17,6 +18,7 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/config"
 	plog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/storage"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tool"
 )
@@ -91,10 +93,34 @@ func parseToolPolicy(raw json.RawMessage) tool.ToolPolicy {
 	return p
 }
 
+// StorageConfig is the tenant's storage backend override (design 5.1.1 受控
+// 菜单): empty means the platform default stack. Only session has a choice
+// today (redis / postgres); unknown values fall back to the default with a
+// warning. Changes arrive only through the migration flow — a direct edit is
+// rejected by the Admin API.
+type StorageConfig struct {
+	Session struct {
+		Type string `json:"type"` // "redis" | "postgres"
+	} `json:"session"`
+}
+
+func parseStorageConfig(raw json.RawMessage) StorageConfig {
+	var c StorageConfig
+	if len(raw) > 0 {
+		if err := json.Unmarshal(raw, &c); err != nil {
+			plog.Warnf("invalid tenant storage_config ignored: %v", err)
+		}
+	}
+	return c
+}
+
 // AppProvider resolves the app a message was routed to, plus its owning
 // tenant (*tenant.Resolver satisfies it).
 type AppProvider interface {
 	AppByID(ctx context.Context, appID string) (tenant.AgentApp, tenant.Tenant, error)
+	// ActiveMigration reports a tenant's in-flight storage migration, nil when
+	// none; while one is active the assembler dual-writes both backends.
+	ActiveMigration(tenantID, resource string) *tenant.Migration
 }
 
 // keyError marks a model key resolution failure: the app is served by the
@@ -128,16 +154,26 @@ type cacheEntry struct {
 }
 
 // AssemblerConfig carries the shared dependencies every per-app assembly
-// reuses: session/memory/knowledge backends are process-level, while model,
+// reuses: memory/knowledge backends are process-level, while model,
 // prompt and tools come from the app config and tenant policies.
 type AssemblerConfig struct {
 	Apps      AppProvider // nil: env-only single-app mode (PG down at startup)
 	Secrets   config.SecretResolver
 	Registry  *tool.Registry
-	Sessions  session.Service
 	Memory    memory.Service
 	Knowledge knowledge.Knowledge
 	Callbacks *ttool.Callbacks
+
+	// SessionsByType holds one session service per supported backend
+	// ("redis" / "postgres"); DefaultSession is the key of the
+	// platform-recommended stack. The tenant's storage_config.session.type
+	// routes its apps to the chosen backend; empty/unknown means the default.
+	SessionsByType map[string]session.Service
+	DefaultSession string
+	// Artifact, when set, is wired onto every per-app runner (design:
+	// Artifact = S3, tenant differentiation is a later menu item).
+	Artifact artifact.Service
+
 	// Defaults is the env model config (lowest precedence); DefaultApp is the
 	// runner app name for unrouted messages (TRPC_APP_NAME, routing disabled).
 	Defaults   ModelSpec
@@ -169,7 +205,7 @@ func (a *Assembler) processorFor(ctx context.Context, appID string) (Processor, 
 	if err != nil {
 		return nil, err
 	}
-	fp := fingerprint(app.Config, t.ToolPolicy, t.ModelConfig)
+	fp := fingerprint(app.Config, t.ToolPolicy, t.ModelConfig, t.StorageConfig, migrationFingerprint(a.activeMigration(t.ID)))
 
 	a.mu.RLock()
 	entry, ok := a.cache[app.ID]
@@ -238,6 +274,12 @@ func (a *Assembler) assemble(ctx context.Context, app tenant.AgentApp, t tenant.
 	// whitelist first, then by the app's own policy (design 4.3).
 	tools := a.cfg.Registry.Allowed(parseToolPolicy(t.ToolPolicy), ac.Tools)
 
+	// Session backend routing (design 5.1.1): the tenant's storage_config
+	// picks from the controlled menu; empty/unknown means the platform
+	// default. Session history does not follow the runner across backends —
+	// switching happens through the migration flow (5.2.6).
+	sess := a.sessionServiceFor(t)
+
 	// Knowledge isolation: the shared pgvector base is filtered down to this
 	// tenant/app pair. Without a resolved tenant (env-only fallback) the
 	// filter stays empty — that path is single-tenant dev only.
@@ -252,7 +294,8 @@ func (a *Assembler) assemble(ctx context.Context, app tenant.AgentApp, t tenant.
 		ModelName:       spec.Name,
 		Instruction:     ac.Prompt,
 		Temperature:     spec.Temperature,
-		SessionService:  a.cfg.Sessions,
+		SessionService:  sess,
+		ArtifactService: a.cfg.Artifact,
 		Timeout:         a.cfg.Timeout,
 		Retries:         a.cfg.Retries,
 		Tools:           tools,
@@ -261,6 +304,58 @@ func (a *Assembler) assemble(ctx context.Context, app tenant.AgentApp, t tenant.
 		Knowledge:       a.cfg.Knowledge,
 		KnowledgeFilter: filter,
 	}), nil
+}
+
+// sessionServiceFor picks the tenant's session backend from the controlled
+// menu (design 5.1.1); empty or unknown types fall back to the platform
+// default with a warning. During a migration (design 5.2.6) the choice wraps
+// in a dual-write fanout: reads follow the phase (old backend until the read
+// switch, new one while observing), writes hit both.
+func (a *Assembler) sessionServiceFor(t tenant.Tenant) session.Service {
+	mig := a.activeMigration(t.ID)
+	if mig != nil {
+		primary, secondary := mig.FromBackend, mig.ToBackend
+		if mig.Phase == tenant.PhaseObserving {
+			primary, secondary = secondary, primary
+		}
+		p, pok := a.cfg.SessionsByType[primary]
+		s, sok := a.cfg.SessionsByType[secondary]
+		if pok && sok {
+			return &storage.FanoutSessionService{Primary: p, Secondary: s}
+		}
+		plog.Warnf("tenant %s migration backend pair %s/%s unavailable, using default %s",
+			t.ID, primary, secondary, a.cfg.DefaultSession)
+	}
+	def := a.cfg.SessionsByType[a.cfg.DefaultSession]
+	st := parseStorageConfig(t.StorageConfig).Session.Type
+	if st == "" {
+		return def
+	}
+	alt, ok := a.cfg.SessionsByType[st]
+	if !ok {
+		plog.Warnf("tenant %s storage_config session type %q unavailable, using default %s",
+			t.ID, st, a.cfg.DefaultSession)
+		return def
+	}
+	return alt
+}
+
+// activeMigration returns the tenant's in-flight session migration, nil when
+// routing is disabled or none is active.
+func (a *Assembler) activeMigration(tenantID string) *tenant.Migration {
+	if a.cfg.Apps == nil || tenantID == "" {
+		return nil
+	}
+	return a.cfg.Apps.ActiveMigration(tenantID, "session")
+}
+
+// migrationFingerprint distinguishes assemblies built under different
+// migration states so a phase change rebuilds the runner.
+func migrationFingerprint(m *tenant.Migration) []byte {
+	if m == nil {
+		return nil
+	}
+	return []byte(m.FromBackend + ">" + m.ToBackend + "@" + m.Phase)
 }
 
 // Close shuts down every runner the assembler created (process exit).

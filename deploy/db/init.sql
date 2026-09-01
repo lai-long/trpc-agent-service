@@ -133,6 +133,42 @@ CREATE INDEX idx_memory_item_user ON memory_item (tenant_id, user_id, app_id)
     WHERE deleted_at IS NULL;
 
 -- ---------------------------------------------------------------------------
+-- Memory embedding: vectors for memory semantic recall (design 5.1.3).
+-- Written asynchronously by the memory embedding worker; memory_item stays
+-- the source of truth and recall joins back by memory_id. The dimension must
+-- equal TRPC_EMBEDDER_DIMENSION.
+-- ---------------------------------------------------------------------------
+CREATE TABLE memory_embedding (
+    id         uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    memory_id  uuid         NOT NULL UNIQUE REFERENCES memory_item (id) ON DELETE CASCADE,
+    tenant_id  uuid         NOT NULL,
+    embedding  vector(1536) NOT NULL,
+    created_at timestamptz  NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_memory_embedding_hnsw ON memory_embedding
+    USING hnsw (embedding vector_cosine_ops);
+
+-- ---------------------------------------------------------------------------
+-- Storage migration: one row per in-flight backend migration (design 5.2.6).
+-- At most one active migration per (tenant, resource); terminal phases are
+-- done / failed / aborted.
+-- ---------------------------------------------------------------------------
+CREATE TABLE storage_migration (
+    id           uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id    uuid         NOT NULL REFERENCES tenant (id),
+    resource     varchar(32)  NOT NULL,  -- session (knowledge/artifact later)
+    from_backend varchar(32)  NOT NULL,  -- redis / postgres
+    to_backend   varchar(32)  NOT NULL,
+    phase        varchar(32)  NOT NULL,  -- dual_write / backfilling / observing / done / failed / aborted
+    progress     jsonb,                   -- sessions_total/done, cursor, mismatches, observe_until
+    error        text,
+    created_at   timestamptz  NOT NULL DEFAULT now(),
+    updated_at   timestamptz  NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX uk_storage_migration_active
+    ON storage_migration (tenant_id, resource) WHERE phase NOT IN ('done', 'failed', 'aborted');
+
+-- ---------------------------------------------------------------------------
 -- Summary: summary text + coverage cursor; crash recovery replays
 -- incrementally from covered_event_id onward.
 -- ---------------------------------------------------------------------------

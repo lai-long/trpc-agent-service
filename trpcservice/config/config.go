@@ -77,6 +77,18 @@ type Config struct {
 	ArchiveRetention      string // TRPC_ARCHIVE_RETENTION
 	ArchiveInterval       string // TRPC_ARCHIVE_INTERVAL
 
+	// MigrationObserve is the dual-write observation window after a migration
+	// read switch (design 5.2.6, default 24h). Go duration syntax.
+	MigrationObserve string // TRPC_MIGRATION_OBSERVE
+
+	// Artifact S3 backend (MinIO / cloud OSS). Secret refs only; disabled when
+	// the endpoint is unreachable at startup.
+	S3Endpoint     string // TRPC_S3_ENDPOINT
+	S3Bucket       string // TRPC_S3_BUCKET
+	S3AccessKeyRef string // TRPC_S3_ACCESSKEY_REF
+	S3SecretKeyRef string // TRPC_S3_SECRETKEY_REF
+	S3Secure       string // TRPC_S3_SECURE: "true" for TLS (cloud OSS)
+
 	// Embedder config for Knowledge (pgvector). Disabled when
 	// TRPC_EMBEDDER_MODEL is unset: the default chat endpoint (DeepSeek) has
 	// no embeddings API, so point these at an embeddings-capable
@@ -126,6 +138,13 @@ func Load() Config {
 		SummaryEventThreshold: getenv("TRPC_SUMMARY_EVENT_THRESHOLD", "20"),
 		ArchiveRetention:      getenv("TRPC_ARCHIVE_RETENTION", "720h"), // 30 days online (design 6.2)
 		ArchiveInterval:       getenv("TRPC_ARCHIVE_INTERVAL", "24h"),
+		MigrationObserve:      getenv("TRPC_MIGRATION_OBSERVE", "24h"),
+
+		S3Endpoint:     getenv("TRPC_S3_ENDPOINT", "localhost:9000"),
+		S3Bucket:       getenv("TRPC_S3_BUCKET", "artifacts"),
+		S3AccessKeyRef: getenv("TRPC_S3_ACCESSKEY_REF", "s3-accesskey"),
+		S3SecretKeyRef: getenv("TRPC_S3_SECRETKEY_REF", "s3-secretkey"),
+		S3Secure:       getenv("TRPC_S3_SECURE", "false"),
 
 		EmbedderBaseURL: getenv("TRPC_EMBEDDER_BASE_URL", ""),
 		EmbedderModel:   getenv("TRPC_EMBEDDER_MODEL", ""),

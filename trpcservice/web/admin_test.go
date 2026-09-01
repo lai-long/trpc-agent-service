@@ -400,3 +400,59 @@ func TestAdminAuditDetail(t *testing.T) {
 		t.Fatalf("want before/after names, got %s", detail)
 	}
 }
+
+// Storage-migration endpoints: create validates the backend pair and the
+// one-active-per-tenant constraint; get reports the phase (design 5.2.6).
+func TestAdminStorageMigration(t *testing.T) {
+	mux, pool := adminTestAPI(t)
+	ctx := context.Background()
+
+	code, out := doJSON(t, mux, http.MethodPost, "/admin/tenants", `{"name":"migration-test"}`)
+	if code != http.StatusCreated {
+		t.Fatalf("create tenant: %d", code)
+	}
+	tenantID, _ := out["id"].(string)
+	var migID string
+	t.Cleanup(func() {
+		if migID != "" {
+			_, _ = pool.Exec(ctx, `DELETE FROM storage_migration WHERE id = $1`, migID)
+		}
+		_, _ = pool.Exec(ctx, `DELETE FROM tenant WHERE id = $1`, tenantID)
+	})
+
+	// to_backend must be a menu member.
+	code, _ = doJSON(t, mux, http.MethodPost, "/admin/tenants/"+tenantID+"/storage-migrations",
+		`{"resource":"session","to_backend":"etcd"}`)
+	if code != http.StatusBadRequest {
+		t.Fatalf("unknown backend must be 400, got %d", code)
+	}
+	// Default backend is redis: migrating to redis is a no-op conflict.
+	code, _ = doJSON(t, mux, http.MethodPost, "/admin/tenants/"+tenantID+"/storage-migrations",
+		`{"resource":"session","to_backend":"redis"}`)
+	if code != http.StatusConflict {
+		t.Fatalf("same-backend migration must be 409, got %d", code)
+	}
+
+	code, out = doJSON(t, mux, http.MethodPost, "/admin/tenants/"+tenantID+"/storage-migrations",
+		`{"resource":"session","to_backend":"postgres"}`)
+	if code != http.StatusCreated {
+		t.Fatalf("create migration: %d %v", code, out)
+	}
+	migID, _ = out["id"].(string)
+	if out["phase"] != "dual_write" {
+		t.Fatalf("new migration starts in dual_write, got %v", out["phase"])
+	}
+
+	// One active migration per tenant/resource.
+	code, _ = doJSON(t, mux, http.MethodPost, "/admin/tenants/"+tenantID+"/storage-migrations",
+		`{"resource":"session","to_backend":"postgres"}`)
+	if code != http.StatusConflict {
+		t.Fatalf("concurrent migration must be 409, got %d", code)
+	}
+
+	// Status read-back.
+	code, out = doJSON(t, mux, http.MethodGet, "/admin/storage-migrations/"+migID, "")
+	if code != http.StatusOK || out["from_backend"] != "redis" || out["to_backend"] != "postgres" {
+		t.Fatalf("get migration: %d %v", code, out)
+	}
+}

@@ -8,16 +8,19 @@ import (
 	"testing"
 	"time"
 
+	"trpc.group/trpc-go/trpc-agent-go/session"
 	sessioninmemory "trpc.group/trpc-go/trpc-agent-go/session/inmemory"
 
+	"github.com/liuzengh/trpc-agent-service/trpcservice/storage"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tool"
 )
 
 // fakeApps implements AppProvider from in-memory maps.
 type fakeApps struct {
-	apps    map[string]tenant.AgentApp
-	tenants map[string]tenant.Tenant
+	apps       map[string]tenant.AgentApp
+	tenants    map[string]tenant.Tenant
+	migrations map[string]tenant.Migration // by tenantID+":"+resource
 }
 
 func (f *fakeApps) AppByID(_ context.Context, id string) (tenant.AgentApp, tenant.Tenant, error) {
@@ -26,6 +29,15 @@ func (f *fakeApps) AppByID(_ context.Context, id string) (tenant.AgentApp, tenan
 		return tenant.AgentApp{}, tenant.Tenant{}, fmt.Errorf("%w: %s", tenant.ErrUnknownApp, id)
 	}
 	return app, f.tenants[app.TenantID], nil
+}
+
+// ActiveMigration implements AppProvider.
+func (f *fakeApps) ActiveMigration(tenantID, resource string) *tenant.Migration {
+	m, ok := f.migrations[tenantID+":"+resource]
+	if !ok {
+		return nil
+	}
+	return &m
 }
 
 // fakeSecrets implements config.SecretResolver from a map.
@@ -40,11 +52,13 @@ func (f fakeSecrets) Resolve(_ context.Context, ref string) (string, error) {
 }
 
 func testAssembler(apps *fakeApps, secrets fakeSecrets) *Assembler {
+	sess := sessioninmemory.NewSessionService()
 	return NewAssembler(AssemblerConfig{
-		Apps:     apps,
-		Secrets:  secrets,
-		Registry: tool.DemoTools(),
-		Sessions: sessioninmemory.NewSessionService(),
+		Apps:           apps,
+		Secrets:        secrets,
+		Registry:       tool.DemoTools(),
+		SessionsByType: map[string]session.Service{"redis": sess},
+		DefaultSession: "redis",
 		Defaults: ModelSpec{
 			Name:      "env-model",
 			BaseURL:   "https://env.example.com",
@@ -251,5 +265,89 @@ func TestParseToolPolicy(t *testing.T) {
 	p = parseToolPolicy(json.RawMessage(`{`))
 	if len(p.Allow) != 0 || len(p.Deny) != 0 {
 		t.Fatalf("invalid policy must degrade to empty, got %+v", p)
+	}
+}
+
+func TestSessionServiceRouting(t *testing.T) {
+	redisSvc := sessioninmemory.NewSessionService()
+	pgSvc := sessioninmemory.NewSessionService()
+	a := NewAssembler(AssemblerConfig{
+		Registry:       tool.DemoTools(),
+		SessionsByType: map[string]session.Service{"redis": redisSvc, "postgres": pgSvc},
+		DefaultSession: "redis",
+		Secrets:        fakeSecrets{values: map[string]string{"env-key": "sk"}},
+		Defaults:       ModelSpec{Name: "m", APIKeyRef: "env-key"},
+	})
+
+	// No override → platform default.
+	if got := a.sessionServiceFor(tenant.Tenant{ID: "t1"}); got != redisSvc {
+		t.Fatal("empty storage_config must use the default backend")
+	}
+	// Controlled-menu override → postgres.
+	pg := tenant.Tenant{ID: "t2", StorageConfig: json.RawMessage(`{"session":{"type":"postgres"}}`)}
+	if got := a.sessionServiceFor(pg); got != pgSvc {
+		t.Fatal("session.type=postgres must route to the pg backend")
+	}
+	// Unknown type → default with a warning.
+	bogus := tenant.Tenant{ID: "t3", StorageConfig: json.RawMessage(`{"session":{"type":"etcd"}}`)}
+	if got := a.sessionServiceFor(bogus); got != redisSvc {
+		t.Fatal("unknown backend type must fall back to the default")
+	}
+}
+
+func TestParseStorageConfig(t *testing.T) {
+	if got := parseStorageConfig(nil); got.Session.Type != "" {
+		t.Fatalf("empty config must be zero: %+v", got)
+	}
+	c := parseStorageConfig(json.RawMessage(`{"session":{"type":"postgres","dsn_ref":"t2-pg"}}`))
+	if c.Session.Type != "postgres" {
+		t.Fatalf("unexpected parse: %+v", c)
+	}
+	// Invalid JSON degrades to zero (default stack) with a warning.
+	if got := parseStorageConfig(json.RawMessage(`{`)); got.Session.Type != "" {
+		t.Fatalf("invalid config must degrade to zero: %+v", got)
+	}
+}
+
+// During a session-backend migration the assembler must dual-write: reads
+// follow the phase (old backend until the read switch, new one while
+// observing), writes hit both (design 5.2.6).
+func TestSessionServiceFanoutDuringMigration(t *testing.T) {
+	redisSvc := sessioninmemory.NewSessionService()
+	pgSvc := sessioninmemory.NewSessionService()
+	apps := testAppData()
+	apps.migrations = map[string]tenant.Migration{
+		"t1:session": {ID: "m1", TenantID: "t1", Resource: "session",
+			FromBackend: "redis", ToBackend: "postgres", Phase: tenant.PhaseBackfilling},
+	}
+	a := NewAssembler(AssemblerConfig{
+		Apps:           apps,
+		Registry:       tool.DemoTools(),
+		SessionsByType: map[string]session.Service{"redis": redisSvc, "postgres": pgSvc},
+		DefaultSession: "redis",
+		Secrets:        fakeSecrets{values: map[string]string{"env-key": "sk"}},
+		Defaults:       ModelSpec{Name: "m", APIKeyRef: "env-key"},
+	})
+
+	got := a.sessionServiceFor(tenant.Tenant{ID: "t1"})
+	fo, ok := got.(*storage.FanoutSessionService)
+	if !ok {
+		t.Fatalf("active migration must fan out, got %T", got)
+	}
+	if fo.Primary != redisSvc || fo.Secondary != pgSvc {
+		t.Fatal("backfilling: reads stay on the old backend, writes shadow the new")
+	}
+
+	// After the read switch the new backend serves reads.
+	apps.migrations["t1:session"] = tenant.Migration{ID: "m1", TenantID: "t1", Resource: "session",
+		FromBackend: "redis", ToBackend: "postgres", Phase: tenant.PhaseObserving}
+	fo, ok = a.sessionServiceFor(tenant.Tenant{ID: "t1"}).(*storage.FanoutSessionService)
+	if !ok || fo.Primary != pgSvc || fo.Secondary != redisSvc {
+		t.Fatal("observing: reads must be on the new backend")
+	}
+
+	// A tenant without a migration keeps its plain backend.
+	if got := a.sessionServiceFor(tenant.Tenant{ID: "t2"}); got != redisSvc {
+		t.Fatalf("unrelated tenant must not fan out, got %T", got)
 	}
 }

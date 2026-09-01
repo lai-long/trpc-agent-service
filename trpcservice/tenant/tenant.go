@@ -59,6 +59,33 @@ func ParseRateLimit(raw json.RawMessage) RateLimit {
 	return rl
 }
 
+// Migration is one active storage_migration row (design 5.2.6): a tenant's
+// backend switch in flight. Terminal phases (done/failed/aborted) are not
+// loaded into the resolver snapshot.
+type Migration struct {
+	ID          string
+	TenantID    string
+	Resource    string // "session" (knowledge / artifact arrive later)
+	FromBackend string // redis / postgres
+	ToBackend   string
+	Phase       string // dual_write / backfilling / observing
+}
+
+// Migration phases (design 5.2.6 四步).
+const (
+	// PhaseDualWrite: writes fan out to both backends, reads stay on From.
+	PhaseDualWrite = "dual_write"
+	// PhaseBackfilling: historical data is being copied; dual write on.
+	PhaseBackfilling = "backfilling"
+	// PhaseObserving: reads switched to To after the consistency check; dual
+	// write stays on for the observation window, then the migration is done.
+	PhaseObserving = "observing"
+	// Terminal phases.
+	PhaseDone    = "done"
+	PhaseFailed  = "failed"
+	PhaseAborted = "aborted"
+)
+
 // AgentApp is one row of agent_app: a versioned agent configuration owned by
 // a tenant (status draft / published / disabled).
 type AgentApp struct {
