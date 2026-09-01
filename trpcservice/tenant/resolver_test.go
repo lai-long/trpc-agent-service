@@ -78,6 +78,33 @@ func TestResolveDisabledTenant(t *testing.T) {
 	}
 }
 
+func TestAppByIDKnown(t *testing.T) {
+	r := tenant.NewResolver(&fakeStore{data: testData()})
+	app, tn, err := r.AppByID(context.Background(), "a1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if app.ID != "a1" || tn.ID != "t1" {
+		t.Fatalf("unexpected app/tenant: %+v / %+v", app, tn)
+	}
+}
+
+func TestAppByIDUnknown(t *testing.T) {
+	r := tenant.NewResolver(&fakeStore{data: testData()})
+	_, _, err := r.AppByID(context.Background(), "nope")
+	if !errors.Is(err, tenant.ErrUnknownApp) {
+		t.Fatalf("want ErrUnknownApp, got %v", err)
+	}
+}
+
+func TestAppByIDDisabledTenant(t *testing.T) {
+	r := tenant.NewResolver(&fakeStore{data: testData()})
+	_, _, err := r.AppByID(context.Background(), "a2")
+	if !errors.Is(err, tenant.ErrInactive) {
+		t.Fatalf("want ErrInactive for a disabled tenant's app, got %v", err)
+	}
+}
+
 func TestCacheTTL(t *testing.T) {
 	store := &fakeStore{data: testData()}
 	r := tenant.NewResolverWithTTL(store, 50*time.Millisecond)

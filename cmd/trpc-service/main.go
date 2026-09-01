@@ -156,7 +156,7 @@ func serve() error {
 		IdleTimeout:       60 * time.Second,
 	}
 
-	processor, cleanup := buildProcessor(ctx, cfg, rdb, auditor, pgPool, kb)
+	processor, cleanup := buildProcessor(ctx, cfg, rdb, auditor, pgPool, kb, resolver)
 	defer cleanup()
 
 	consumer := fmt.Sprintf("%s-%d", "allinone", os.Getpid())
@@ -244,13 +244,13 @@ func startWecom(cfg config.Config) *wecom.Channel {
 }
 
 // buildProcessor assembles the processing chain: the platform tool registry,
-// the dangerous-tool Approver, the Runner-backed inner processor (llmagent +
-// session backend + memory service + optional knowledge base), and the
+// the dangerous-tool Approver, the per-app Assembler (one Runner per
+// agent_app, rebuilt when the resolver reports a config change), and the
 // Guarded guardrail wrapper that owns input/output checks and message-level
-// auditing. It falls back to EchoProcessor when the model key is missing, so
-// the pipeline stays demoable without LLM access.
+// auditing. Apps whose model key is missing are served by the echo fallback,
+// so the pipeline stays demoable without LLM access.
 // The returned cleanup closes resources.
-func buildProcessor(ctx context.Context, cfg config.Config, rdb *redis.Client, auditor *storage.Auditor, pgPool *pgxpool.Pool, kb *knowledge.BuiltinKnowledge) (agent.Processor, func()) {
+func buildProcessor(ctx context.Context, cfg config.Config, rdb *redis.Client, auditor *storage.Auditor, pgPool *pgxpool.Pool, kb *knowledge.BuiltinKnowledge, resolver *tenant.Resolver) (agent.Processor, func()) {
 	noop := func() {}
 
 	registry := tool.DemoTools()
@@ -263,13 +263,6 @@ func buildProcessor(ctx context.Context, cfg config.Config, rdb *redis.Client, a
 			Input:    []agent.InputChecker{agent.SensitiveWordInput(agent.DefaultBlockedWords)},
 			Output:   []agent.OutputChecker{agent.RedactOutput()},
 		}
-	}
-
-	resolver := config.NewFileResolver(cfg.SecretsDir)
-	apiKey, err := resolver.Resolve(ctx, cfg.ModelAPIKeyRef)
-	if err != nil {
-		plog.Warnf("model key %q unavailable (%v), falling back to echo processor", cfg.ModelAPIKeyRef, err)
-		return wrap(agent.EchoProcessor{}), noop
 	}
 
 	// Session backend: redis (hot data, default) or postgres (event journal +
@@ -301,43 +294,51 @@ func buildProcessor(ctx context.Context, cfg config.Config, rdb *redis.Client, a
 		sess, sessCleanup = rs, func() { _ = rs.Close() }
 	}
 
+	timeout, err := time.ParseDuration(cfg.ModelTimeout)
+	if err != nil || timeout <= 0 {
+		plog.Warnf("invalid TRPC_MODEL_TIMEOUT %q, defaulting to %s", cfg.ModelTimeout, agent.DefaultRunTimeout)
+		timeout = agent.DefaultRunTimeout
+	}
+
 	// Memory service over the PG memory_item table (two-level scope, soft
-	// delete); knowledge gets the tenant/app metadata filter for isolation.
+	// delete), shared by all per-app runners; knowledge is likewise shared,
+	// with the assembler scoping each app's searches by metadata filter.
 	var memService memory.Service
-	var knowledgeFilter map[string]any
 	if pgPool != nil {
 		memService = storage.NewPGMemoryService(pgPool)
-		var tenantID string
-		if err := pgPool.QueryRow(ctx,
-			`SELECT tenant_id FROM agent_app WHERE id = $1`, cfg.AppName).Scan(&tenantID); err != nil {
-			plog.Warnf("resolve tenant for app %s: %v (memory/knowledge disabled)", cfg.AppName, err)
-			memService = nil
-		} else {
-			knowledgeFilter = map[string]any{"tenant_id": tenantID, "app_id": cfg.AppName}
-		}
 	}
 
 	callbacks := ttool.NewCallbacks().RegisterBeforeTool(approver.BeforeTool)
-	// Guard the typed-nil interface: a nil *BuiltinKnowledge must stay a nil
-	// Knowledge, or the agent would wire a knowledge tool onto nothing.
+	// Guard the typed-nil interfaces: a nil *tenant.Resolver / nil
+	// *BuiltinKnowledge must stay nil behind the interface, or the assembler
+	// would route to nothing / wire a knowledge tool onto nothing.
+	var apps agent.AppProvider
+	if resolver != nil {
+		apps = resolver
+	}
 	var kbIface knowledge.Knowledge
 	if kb != nil {
 		kbIface = kb
 	}
-	p := agent.NewRunnerProcessor(agent.RunnerConfig{
-		AppName:         cfg.AppName,
-		BaseURL:         cfg.ModelBaseURL,
-		APIKey:          apiKey,
-		ModelName:       cfg.ModelName,
-		SessionService:  sess,
-		Tools:           registry.All(),
-		ToolCallbacks:   callbacks,
-		MemoryService:   memService,
-		Knowledge:       kbIface,
-		KnowledgeFilter: knowledgeFilter,
+	assembler := agent.NewAssembler(agent.AssemblerConfig{
+		Apps:      apps,
+		Secrets:   config.NewFileResolver(cfg.SecretsDir),
+		Registry:  registry,
+		Sessions:  sess,
+		Memory:    memService,
+		Knowledge: kbIface,
+		Callbacks: callbacks,
+		Defaults: agent.ModelSpec{
+			Name:      cfg.ModelName,
+			BaseURL:   cfg.ModelBaseURL,
+			APIKeyRef: cfg.ModelAPIKeyRef,
+		},
+		DefaultApp: cfg.AppName,
+		Timeout:    timeout,
+		Retries:    1,
 	})
-	plog.Infof("runner processor ready (model=%s)", cfg.ModelName)
-	return wrap(p), func() { _ = p.Close(); sessCleanup() }
+	plog.Infof("per-app runner assembler ready (model default=%s, timeout=%s)", cfg.ModelName, timeout)
+	return wrap(assembler), func() { _ = assembler.Close(); sessCleanup() }
 }
 
 // buildKnowledge builds the pgvector-backed knowledge base when an

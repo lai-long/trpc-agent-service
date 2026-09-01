@@ -18,9 +18,9 @@ type Tool struct {
 	Dangerous bool
 }
 
-// Registry is the set of platform tools an agent may use. Tenant-level
-// whitelisting (per tenant.tool_policy) filters this list per tenant once the
-// Admin API lands; until then all tenants share the registry.
+// Registry is the set of platform tools an agent may use. Tenant- and
+// app-level whitelisting (tenant.tool_policy / agent_app.config.tools)
+// narrows this set per message through Allowed.
 type Registry struct {
 	tools map[string]Tool
 }
@@ -47,6 +47,46 @@ func (r *Registry) All() []ttool.Tool {
 func (r *Registry) IsDangerous(name string) bool {
 	t, ok := r.tools[name]
 	return ok && t.Dangerous
+}
+
+// ToolPolicy restricts the registry: a non-empty Allow list is a whitelist
+// (only listed tools are kept), and Deny entries are subtracted afterwards.
+// tenant.tool_policy and agent_app.config.tools share this shape; the app
+// policy can only narrow what the tenant policy allows. Names not present in
+// the registry are ignored.
+type ToolPolicy struct {
+	Allow []string `json:"allow"`
+	Deny  []string `json:"deny"`
+}
+
+// Allowed returns the registry tools surviving both policies, tenant first,
+// then app. An empty policy keeps everything.
+func (r *Registry) Allowed(policies ...ToolPolicy) []ttool.Tool {
+	allowed := make(map[string]bool, len(r.tools))
+	for name := range r.tools {
+		allowed[name] = true
+	}
+	for _, p := range policies {
+		if len(p.Allow) > 0 {
+			keep := make(map[string]bool, len(p.Allow))
+			for _, name := range p.Allow {
+				if allowed[name] {
+					keep[name] = true
+				}
+			}
+			allowed = keep
+		}
+		for _, name := range p.Deny {
+			delete(allowed, name)
+		}
+	}
+	out := make([]ttool.Tool, 0, len(allowed))
+	for name, ok := range allowed {
+		if ok {
+			out = append(out, r.tools[name].Tool)
+		}
+	}
+	return out
 }
 
 // Call executes a tool directly with JSON arguments. It is used to release

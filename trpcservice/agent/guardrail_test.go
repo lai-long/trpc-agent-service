@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync"
 	"testing"
@@ -146,5 +147,99 @@ func TestGuardedSignalReplacesReply(t *testing.T) {
 	evs := aud.syncDecisions()
 	if len(evs) != 1 || evs[0].Decision != "review" || evs[0].ToolName != "op_a" {
 		t.Fatalf("want sync review for op_a, got %+v", evs)
+	}
+}
+
+// failProcessor always fails with the given error.
+type failProcessor struct{ err error }
+
+func (f failProcessor) Process(context.Context, channels.InboundMessage) (channels.OutboundMessage, error) {
+	return channels.OutboundMessage{}, f.err
+}
+
+func TestGuardedModelTimeoutDegradesToBusyReply(t *testing.T) {
+	aud := &fakeAuditor{}
+	g := &Guarded{
+		Inner:   failProcessor{err: &ModelError{Err: context.DeadlineExceeded}},
+		Auditor: aud,
+	}
+	out, err := g.Process(context.Background(), testMsg("hello"))
+	if err != nil {
+		t.Fatalf("model failures degrade to a reply, got err %v", err)
+	}
+	if out.Text != degradedReply {
+		t.Fatalf("want busy reply, got %q", out.Text)
+	}
+	// The degraded reply must keep the routing fields for the sender.
+	if out.SessionKey != "dm:mock:u1" || out.UserID != "u1" {
+		t.Fatalf("routing fields lost: %+v", out)
+	}
+	evs := aud.asyncDecisions()
+	if len(evs) != 1 || evs[0].Decision != "allow" || evs[0].ErrorType != "model_timeout" {
+		t.Fatalf("want async allow/model_timeout, got %+v", evs)
+	}
+}
+
+func TestGuardedModelErrorDegradesToBusyReply(t *testing.T) {
+	aud := &fakeAuditor{}
+	g := &Guarded{
+		Inner:   failProcessor{err: &ModelError{Err: errors.New("boom")}},
+		Auditor: aud,
+	}
+	out, err := g.Process(context.Background(), testMsg("hello"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Text != degradedReply {
+		t.Fatalf("want busy reply, got %q", out.Text)
+	}
+	evs := aud.asyncDecisions()
+	if len(evs) != 1 || evs[0].ErrorType != "model_error" {
+		t.Fatalf("want model_error audit, got %+v", evs)
+	}
+}
+
+func TestGuardedInfraErrorPropagates(t *testing.T) {
+	// Non-model failures keep the message pending for redelivery: the error
+	// propagates to the worker, which does not ack (design 5.2.2).
+	aud := &fakeAuditor{}
+	g := &Guarded{
+		Inner:   failProcessor{err: errors.New("pg down")},
+		Auditor: aud,
+	}
+	_, err := g.Process(context.Background(), testMsg("hello"))
+	if err == nil {
+		t.Fatal("infra errors must propagate")
+	}
+	evs := aud.asyncDecisions()
+	if len(evs) != 1 || evs[0].ErrorType != "process_error" {
+		t.Fatalf("want process_error audit, got %+v", evs)
+	}
+}
+
+func TestGuardedModelErrorWithPendingSignalDeliversConfirmation(t *testing.T) {
+	// A dangerous call was intercepted during the failed run: the pending
+	// approval is real, so the confirmation notice wins over the busy reply.
+	aud := &fakeAuditor{}
+	ap := NewApprover(nil, testRegistry(), 0)
+	ap.setSignal("dm:mock:u1", Signal{
+		Kind: "created", ToolName: "op_a", Args: `{"x":"1"}`,
+		Deadline: time.Now().Add(5 * time.Minute), Fresh: true,
+	})
+	g := &Guarded{
+		Inner:    failProcessor{err: &ModelError{Err: errors.New("boom")}},
+		Approver: ap,
+		Auditor:  aud,
+	}
+	out, err := g.Process(context.Background(), testMsg("执行操作"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.Text, "危险操作") || !strings.Contains(out.Text, "op_a") {
+		t.Fatalf("want confirmation notice, got %q", out.Text)
+	}
+	evs := aud.syncDecisions()
+	if len(evs) != 1 || evs[0].Decision != "review" {
+		t.Fatalf("want sync review, got %+v", evs)
 	}
 }

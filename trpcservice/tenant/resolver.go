@@ -35,6 +35,8 @@ const DefaultCacheTTL = 30 * time.Second
 var (
 	// ErrUnknownBinding means no channel_binding row serves the webhook path.
 	ErrUnknownBinding = errors.New("unknown channel binding")
+	// ErrUnknownApp means no agent_app row matches the requested app ID.
+	ErrUnknownApp = errors.New("unknown agent app")
 	// ErrInactive means the binding, its tenant or its app is disabled.
 	ErrInactive = errors.New("tenant route inactive")
 )
@@ -113,6 +115,35 @@ func (r *Resolver) Invalidate() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.loaded = false
+}
+
+// AppByID resolves an app and its owning tenant from the cached snapshot.
+// The Worker's per-app assembly uses it to load the app config and tenant
+// policies for the app stamped on the message; the same staleness and
+// invalidation semantics as Resolve apply.
+func (r *Resolver) AppByID(ctx context.Context, appID string) (AgentApp, Tenant, error) {
+	if err := r.refresh(ctx); err != nil {
+		return AgentApp{}, Tenant{}, err
+	}
+
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	app, ok := r.apps[appID]
+	if !ok {
+		return AgentApp{}, Tenant{}, fmt.Errorf("%w: %s", ErrUnknownApp, appID)
+	}
+	if app.Status == StatusDisabled {
+		return AgentApp{}, Tenant{}, fmt.Errorf("%w: app %s disabled", ErrInactive, app.ID)
+	}
+	t, ok := r.tenants[app.TenantID]
+	if !ok {
+		return AgentApp{}, Tenant{}, fmt.Errorf("%w: app %s references missing tenant %s",
+			ErrUnknownApp, app.ID, app.TenantID)
+	}
+	if t.Status != StatusActive {
+		return AgentApp{}, Tenant{}, fmt.Errorf("%w: tenant %s status %q", ErrInactive, t.ID, t.Status)
+	}
+	return app, t, nil
 }
 
 // WatchInvalidations subscribes to the invalidation channel until ctx is

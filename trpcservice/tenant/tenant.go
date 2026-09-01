@@ -6,8 +6,10 @@
 //
 //	webhook_path → channel_binding → tenant + agent_app
 //
-// The stamped tenant_id then travels on the message through the Worker into
-// audit and metrics, giving every downstream component its isolation key.
+// The same Resolver serves the Worker's per-app Runner assembly
+// (Resolver.AppByID: app config + tenant policies by app ID). The stamped
+// tenant_id then travels on the message through the Worker into audit and
+// metrics, giving every downstream component its isolation key.
 package tenant
 
 import "encoding/json"

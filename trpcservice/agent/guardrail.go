@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
 	plog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/metrics"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/storage"
 )
 
@@ -39,6 +41,11 @@ type OutputChecker func(ctx context.Context, msg channels.InboundMessage, reply 
 // DefaultBlockedWords is the demo input denylist. Tenant-level lists arrive
 // with tenant.tool_policy once the Admin API lands.
 var DefaultBlockedWords = []string{"赌博", "毒品", "枪支"}
+
+// degradedReply answers the user when the model keeps failing after its
+// retry (design 5.2.2 模型超时 row): the message is acked and answered
+// immediately instead of riding the Stream redelivery path.
+const degradedReply = "服务繁忙，请稍后再试。"
 
 // Guarded wraps a Processor with the guardrail chain (design 4.3):
 //
@@ -88,7 +95,6 @@ func (g *Guarded) Process(ctx context.Context, msg channels.InboundMessage) (cha
 	//    async lane; process errors ride the same event as error_type.
 	started := time.Now()
 	out, err := g.Inner.Process(ctx, msg)
-	g.asyncAudit(msg, started, err)
 
 	// Drain the interception signal even on error: a redelivery regenerates
 	// it, and a stale signal must not leak into an unrelated run.
@@ -98,8 +104,33 @@ func (g *Guarded) Process(ctx context.Context, msg channels.InboundMessage) (cha
 		sig, signaled = g.Approver.TakeSignal(msg.SessionKey)
 	}
 	if err != nil {
-		return out, err
+		var mErr *ModelError
+		if !errors.As(err, &mErr) {
+			// Infrastructure failure (session store, queue, ...): leave the
+			// message pending for Stream redelivery (design 5.2.2).
+			g.asyncAudit(msg, started, err)
+			return out, err
+		}
+		// Model failure (deadline hit, retried once by the runner already):
+		// degrade to a busy reply so the user gets an immediate answer
+		// instead of waiting minutes for a redelivery that will likely fail
+		// the same way (design 5.2.2: 仍失败回复「服务繁忙请稍后再试」并记审计).
+		if signaled {
+			// A dangerous call was intercepted before the failure: the
+			// pending approval is real, so the confirmation notice (not the
+			// busy reply) is what the user needs.
+			g.syncAudit(msg, signalDecision(sig))
+			out = replyShell(msg)
+			out.Text = signalReply(sig)
+			return out, nil
+		}
+		metrics.ProcessErrorTotal.Add(ctx, 1, processAttr(msg))
+		g.asyncModelAudit(msg, started, mErr)
+		out = replyShell(msg)
+		out.Text = degradedReply
+		return out, nil
 	}
+	g.asyncAudit(msg, started, nil)
 
 	// 4. Output checks (desensitization).
 	for _, check := range g.Output {
@@ -204,6 +235,28 @@ func (g *Guarded) asyncAudit(msg channels.InboundMessage, started time.Time, pro
 		ev.ErrorType = "process_error"
 	}
 	g.Auditor.LogAsync(ev)
+}
+
+// asyncModelAudit records a degraded model failure: the decision stays
+// "allow" (the message itself was let through) and error_type carries the
+// cause — model_timeout vs model_error.
+func (g *Guarded) asyncModelAudit(msg channels.InboundMessage, started time.Time, mErr *ModelError) {
+	if g.Auditor == nil {
+		return
+	}
+	errorType := "model_error"
+	if errors.Is(mErr.Err, context.DeadlineExceeded) {
+		errorType = "model_timeout"
+	}
+	g.Auditor.LogAsync(storage.AuditEvent{
+		TenantID:  tenantOrZero(msg.TenantID),
+		Channel:   msg.Channel,
+		UserID:    msg.UserID,
+		Decision:  "allow",
+		LatencyMs: int(time.Since(started).Milliseconds()),
+		ErrorType: errorType,
+		TraceID:   msg.TraceID,
+	})
 }
 
 // syncAudit writes a critical guardrail decision synchronously: deny /

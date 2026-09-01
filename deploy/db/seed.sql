@@ -13,9 +13,15 @@
 INSERT INTO tenant (id, name, status) VALUES
     ('00000000-0000-0000-0000-000000000001', 'demo-tenant', 'active');
 
+-- The demo app config drives the per-app Runner assembly: prompt becomes the
+-- system instruction, tools.allow whitelists platform tools (the tenant's
+-- tool_policy, empty here, would narrow first). Unset model fields inherit
+-- tenant.model_config, then the TRPC_MODEL_* env defaults.
 INSERT INTO agent_app (id, tenant_id, name, agent_type, config, version, status) VALUES
     ('00000000-0000-0000-0000-000000000101', '00000000-0000-0000-0000-000000000001',
-     'assistant', 'llm', '{}', 1, 'published');
+     'assistant', 'llm',
+     '{"prompt": "你是演示助手，回答简洁友好。", "tools": {"allow": ["get_weather", "delete_user_data"]}}',
+     1, 'published');
 
 INSERT INTO channel_binding (id, tenant_id, channel, app_id, webhook_path, status) VALUES
     ('00000000-0000-0000-0000-000000000201', '00000000-0000-0000-0000-000000000001',

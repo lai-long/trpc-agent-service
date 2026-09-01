@@ -26,14 +26,18 @@ type Config struct {
 	ModelBaseURL   string // TRPC_MODEL_BASE_URL: OpenAI-compatible endpoint (DeepSeek default)
 	ModelName      string // TRPC_MODEL_NAME: model name, e.g. deepseek-v4-flash (cheapest)
 	ModelAPIKeyRef string // TRPC_MODEL_APIKEY_REF: secret ref (NOT the key itself) resolved via SecretResolver
+	// ModelTimeout bounds one model run (design 5.2.2: 60s deadline, retry
+	// once, then a busy reply). Go duration syntax.
+	ModelTimeout string // TRPC_MODEL_TIMEOUT
 
 	// SessionBackend selects the session store: "redis" (default, hot data)
 	// or "postgres" (event journal + snapshot in the 5.1.3 tables).
 	SessionBackend string // TRPC_SESSION_BACKEND
-	// AppName is the framework runner's app name. Until per-app Runner
-	// assembly lands (Admin API stage), it carries the agent_app UUID the
-	// deployment serves — the PG session backend maps it onto session.app_id.
-	// The default is the seed demo app.
+	// AppName is the fallback runner app name for messages the Gateway could
+	// not route (tenant routing disabled, e.g. PG down at startup). Routed
+	// messages run under their own agent_app ID; the env model config above
+	// serves as the lowest-precedence default beneath tenant.model_config and
+	// agent_app.config. The default is the seed demo app.
 	AppName string // TRPC_APP_NAME
 
 	// WeCom channel: enabled when TRPC_WECOM_CORP_ID is set. All secret
@@ -75,6 +79,7 @@ func Load() Config {
 		ModelBaseURL:   getenv("TRPC_MODEL_BASE_URL", "https://api.deepseek.com"),
 		ModelName:      getenv("TRPC_MODEL_NAME", "deepseek-v4-flash"),
 		ModelAPIKeyRef: getenv("TRPC_MODEL_APIKEY_REF", "deepseek-apikey"),
+		ModelTimeout:   getenv("TRPC_MODEL_TIMEOUT", "60s"),
 
 		SessionBackend: getenv("TRPC_SESSION_BACKEND", "redis"),
 		AppName:        getenv("TRPC_APP_NAME", "00000000-0000-0000-0000-000000000101"),

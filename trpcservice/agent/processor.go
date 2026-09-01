@@ -2,8 +2,10 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"go.opentelemetry.io/otel/attribute"
 	otelmetric "go.opentelemetry.io/otel/metric"
@@ -22,10 +24,24 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/metrics"
 )
 
+// DefaultRunTimeout bounds one model run (design 5.2.2: 60s).
+const DefaultRunTimeout = 60 * time.Second
+
+// ModelError marks a failure of the model call itself (timeout, LLM API
+// error, empty response), as opposed to a platform infrastructure failure
+// (session store, queue). The guardrail degrades a ModelError to a busy
+// reply; any other error keeps the message pending for redelivery (5.2.2).
+type ModelError struct{ Err error }
+
+func (e *ModelError) Error() string { return e.Err.Error() }
+func (e *ModelError) Unwrap() error { return e.Err }
+
 // RunnerProcessor processes messages with the tRPC-Agent-Go runner.Runner.
 // Session persistence is delegated to the framework's session.Service.
 type RunnerProcessor struct {
-	runner runner.Runner
+	runner  runner.Runner
+	timeout time.Duration
+	retries int
 }
 
 // RunnerConfig is the minimal parameter set for assembling a Runner.
@@ -36,7 +52,14 @@ type RunnerConfig struct {
 	BaseURL        string // OpenAI-compatible endpoint
 	APIKey         string // resolved model key in plaintext (never log it)
 	ModelName      string
+	Instruction    string   // system prompt from agent_app.config
+	Temperature    *float64 // nil means the model default
 	SessionService session.Service
+	// Timeout bounds one run and Retries is the number of re-attempts after a
+	// failed run (design 5.2.2: 60s deadline, retry once, then degrade).
+	// Zero values default to 60s / 1.
+	Timeout time.Duration
+	Retries int
 	// Tools and ToolCallbacks wire the platform tool registry and the
 	// guardrail's dangerous-tool interception into the agent.
 	Tools         []tool.Tool
@@ -61,9 +84,13 @@ func NewRunnerProcessor(cfg RunnerConfig) *RunnerProcessor {
 	if cfg.MemoryService != nil {
 		tools = append(append([]tool.Tool{}, tools...), cfg.MemoryService.Tools()...)
 	}
+	genConfig := model.GenerationConfig{Stream: false, Temperature: cfg.Temperature}
 	opts := []llmagent.Option{
 		llmagent.WithModel(m),
-		llmagent.WithGenerationConfig(model.GenerationConfig{Stream: false}),
+		llmagent.WithGenerationConfig(genConfig),
+	}
+	if cfg.Instruction != "" {
+		opts = append(opts, llmagent.WithInstruction(cfg.Instruction))
 	}
 	if len(tools) > 0 {
 		opts = append(opts, llmagent.WithTools(tools))
@@ -83,10 +110,26 @@ func NewRunnerProcessor(cfg RunnerConfig) *RunnerProcessor {
 		runnerOpts = append(runnerOpts, runner.WithMemoryService(cfg.MemoryService))
 	}
 	r := runner.NewRunner(cfg.AppName, llm, runnerOpts...)
-	return &RunnerProcessor{runner: r}
+	return newRunnerProcessor(r, cfg.Timeout, cfg.Retries)
 }
 
-// Process implements Processor.
+// newRunnerProcessor wraps an existing runner; tests use it to inject fakes.
+func newRunnerProcessor(r runner.Runner, timeout time.Duration, retries int) *RunnerProcessor {
+	if timeout <= 0 {
+		timeout = DefaultRunTimeout
+	}
+	if retries < 0 {
+		retries = 0
+	}
+	return &RunnerProcessor{runner: r, timeout: timeout, retries: retries}
+}
+
+// Process implements Processor: run with a per-run deadline, retrying a
+// failed run up to cfg.Retries times (design 5.2.2: retry once, then the
+// guardrail degrades to a busy reply). Model-side failures come back as
+// *ModelError; infrastructure failures (runner.Run itself refusing the run)
+// are returned raw so the worker leaves the message pending for redelivery.
+//
 // The event channel must be consumed until closed, otherwise framework-side
 // goroutines block and leak.
 func (p *RunnerProcessor) Process(ctx context.Context, msg channels.InboundMessage) (channels.OutboundMessage, error) {
@@ -100,15 +143,58 @@ func (p *RunnerProcessor) Process(ctx context.Context, msg channels.InboundMessa
 		TraceID:    msg.TraceID,
 	}
 
-	events, err := p.runner.Run(ctx, msg.UserID, msg.SessionKey, model.NewUserMessage(msg.Text))
+	var lastErr error
+	for attempt := 0; attempt <= p.retries; attempt++ {
+		if attempt > 0 {
+			plog.Warnf("retrying run (attempt %d/%d, session=%s): %v",
+				attempt+1, p.retries+1, msg.SessionKey, lastErr)
+		}
+		reply, err := p.runOnce(ctx, msg)
+		if err == nil {
+			out.Text = reply
+			zap.L().Debug("runner replied",
+				zap.String(plog.FieldSessionKey, msg.SessionKey),
+				zap.String(plog.FieldTraceID, msg.TraceID),
+				zap.Int("reply_len", len(out.Text)))
+			return out, nil
+		}
+		lastErr = err
+		var infra *infraError
+		if errors.As(err, &infra) {
+			return out, infra.Err
+		}
+		if ctx.Err() != nil {
+			break // shutting down: no further attempts
+		}
+	}
+	return out, &ModelError{Err: lastErr}
+}
+
+// infraError wraps failures of runner.Run itself (session store down, etc.)
+// to keep them off the ModelError degradation path.
+type infraError struct{ Err error }
+
+func (e *infraError) Error() string { return e.Err.Error() }
+func (e *infraError) Unwrap() error { return e.Err }
+
+// runOnce executes a single run under a fresh deadline and drains the event
+// channel to close (also after cancellation — the framework shuts its
+// goroutines down on ctx cancel and then closes the channel).
+func (p *RunnerProcessor) runOnce(ctx context.Context, msg channels.InboundMessage) (string, error) {
+	runCtx, cancel := context.WithTimeout(ctx, p.timeout)
+	defer cancel()
+
+	events, err := p.runner.Run(runCtx, msg.UserID, msg.SessionKey, model.NewUserMessage(msg.Text))
 	if err != nil {
-		return out, fmt.Errorf("runner run: %w", err)
+		return "", &infraError{Err: fmt.Errorf("runner run: %w", err)}
 	}
 
 	var reply strings.Builder
+	var runErr error
 	for evt := range events { // ranging until close satisfies the drain requirement
 		if evt.Error != nil {
 			plog.Warnf("runner event error: %s", evt.Error.Message)
+			runErr = errors.New(evt.Error.Message)
 			continue
 		}
 		if evt.Response != nil && evt.Response.Usage != nil {
@@ -119,16 +205,16 @@ func (p *RunnerProcessor) Process(ctx context.Context, msg channels.InboundMessa
 			reply.WriteString(evt.Response.Choices[0].Message.Content)
 		}
 	}
-	if reply.Len() == 0 {
-		return out, fmt.Errorf("runner produced no final response")
+	if reply.Len() > 0 {
+		return reply.String(), nil
 	}
-
-	out.Text = reply.String()
-	zap.L().Debug("runner replied",
-		zap.String(plog.FieldSessionKey, msg.SessionKey),
-		zap.String(plog.FieldTraceID, msg.TraceID),
-		zap.Int("reply_len", len(out.Text)))
-	return out, nil
+	if errors.Is(runCtx.Err(), context.DeadlineExceeded) {
+		return "", fmt.Errorf("model timeout after %s: %w", p.timeout, context.DeadlineExceeded)
+	}
+	if runErr != nil {
+		return "", runErr
+	}
+	return "", errors.New("runner produced no final response")
 }
 
 // Close shuts down the underlying runner (call at process exit).
