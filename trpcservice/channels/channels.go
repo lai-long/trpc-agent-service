@@ -46,6 +46,13 @@ type OutboundMessage struct {
 	TenantID    string // owning tenant UUID, carried through for sender metrics
 	TraceID     string
 	TraceParent string // W3C traceparent, carried through to the outbound span
+
+	// Token usage of the generating run plus the model that produced it, for
+	// audit/cost accounting (design 5.1.3 audit_log cost columns). Never sent
+	// to the IM; the sender ignores these fields.
+	PromptTokens     int
+	CompletionTokens int
+	Model            string
 }
 
 // SessionKey builds the unique conversation key:

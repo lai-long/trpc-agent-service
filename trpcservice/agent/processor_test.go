@@ -62,7 +62,7 @@ func scriptedEvents(events ...*event.Event) func(context.Context, int) (<-chan *
 }
 
 func TestRunnerProcessorSuccess(t *testing.T) {
-	p := newRunnerProcessor(&fakeRunner{run: scriptedEvents(finalEvent("你好"))}, time.Second, 1)
+	p := newRunnerProcessor(&fakeRunner{run: scriptedEvents(finalEvent("你好"))}, "test-model", time.Second, 1)
 	out, err := p.Process(context.Background(), testMsg("hi"))
 	if err != nil {
 		t.Fatal(err)
@@ -83,7 +83,7 @@ func TestRunnerProcessorRetriesThenSucceeds(t *testing.T) {
 		}
 		return scriptedEvents(finalEvent("ok"))(ctx, call)
 	}}
-	p := newRunnerProcessor(r, time.Second, 1)
+	p := newRunnerProcessor(r, "test-model", time.Second, 1)
 	out, err := p.Process(context.Background(), testMsg("hi"))
 	if err != nil {
 		t.Fatal(err)
@@ -98,7 +98,7 @@ func TestRunnerProcessorRetriesThenSucceeds(t *testing.T) {
 
 func TestRunnerProcessorModelErrorAfterRetries(t *testing.T) {
 	r := &fakeRunner{run: scriptedEvents(errorEvent("boom"))}
-	p := newRunnerProcessor(r, time.Second, 1)
+	p := newRunnerProcessor(r, "test-model", time.Second, 1)
 	_, err := p.Process(context.Background(), testMsg("hi"))
 	var mErr *ModelError
 	if !errors.As(err, &mErr) {
@@ -119,7 +119,7 @@ func TestRunnerProcessorTimeout(t *testing.T) {
 		}()
 		return ch, nil
 	}}
-	p := newRunnerProcessor(r, 50*time.Millisecond, 0)
+	p := newRunnerProcessor(r, "test-model", 50*time.Millisecond, 0)
 	started := time.Now()
 	_, err := p.Process(context.Background(), testMsg("hi"))
 	var mErr *ModelError
@@ -139,7 +139,7 @@ func TestRunnerProcessorInfraErrorNotRetried(t *testing.T) {
 	r := &fakeRunner{run: func(context.Context, int) (<-chan *event.Event, error) {
 		return nil, infra
 	}}
-	p := newRunnerProcessor(r, time.Second, 1)
+	p := newRunnerProcessor(r, "test-model", time.Second, 1)
 	_, err := p.Process(context.Background(), testMsg("hi"))
 	if !errors.Is(err, infra) {
 		t.Fatalf("want the raw infra error, got %v", err)
@@ -156,7 +156,7 @@ func TestRunnerProcessorInfraErrorNotRetried(t *testing.T) {
 func TestRunnerProcessorEmptyResponseIsModelError(t *testing.T) {
 	// Channel closes without a final response and without an error event.
 	r := &fakeRunner{run: scriptedEvents()}
-	p := newRunnerProcessor(r, time.Second, 0)
+	p := newRunnerProcessor(r, "test-model", time.Second, 0)
 	_, err := p.Process(context.Background(), testMsg("hi"))
 	var mErr *ModelError
 	if !errors.As(err, &mErr) {

@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sync/atomic"
 	"time"
@@ -27,7 +28,10 @@ type AuditEvent struct {
 	PromptTokens     int
 	CompletionTokens int
 	TraceID          string
-	CreatedAt        time.Time
+	// Detail carries the before/after payload of admin write operations
+	// ({"before": ..., "after": ...}, design 5.4 变更审计); empty means NULL.
+	Detail    json.RawMessage
+	CreatedAt time.Time
 }
 
 const (
@@ -188,18 +192,22 @@ func (a *Auditor) insert(ctx context.Context, events []AuditEvent) error {
 	const q = `INSERT INTO audit_log
 		(tenant_id, channel, user_id, session_id, agent_name, tool_name,
 		 decision, latency_ms, error_type, cost, prompt_tokens, completion_tokens,
-		 trace_id, created_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`
+		 trace_id, detail, created_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`
 	batch := &pgx.Batch{}
 	for _, ev := range events {
 		var sessionID *string
 		if ev.SessionID != "" {
 			sessionID = &ev.SessionID
 		}
+		var detail []byte
+		if len(ev.Detail) > 0 {
+			detail = ev.Detail
+		}
 		batch.Queue(q,
 			ev.TenantID, ev.Channel, ev.UserID, sessionID, ev.AgentName, ev.ToolName,
 			ev.Decision, ev.LatencyMs, ev.ErrorType, ev.Cost, ev.PromptTokens,
-			ev.CompletionTokens, ev.TraceID, ev.CreatedAt,
+			ev.CompletionTokens, ev.TraceID, detail, ev.CreatedAt,
 		)
 	}
 	results := a.pool.SendBatch(ctx, batch)

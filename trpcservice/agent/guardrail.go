@@ -8,6 +8,8 @@ import (
 	"strings"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
 	plog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/metrics"
@@ -66,6 +68,16 @@ type Guarded struct {
 
 // Process implements Processor.
 func (g *Guarded) Process(ctx context.Context, msg channels.InboundMessage) (channels.OutboundMessage, error) {
+	// The guardrail is a distinct link in the trace chain (design 6.1:
+	// 单条 trace 串联 … → Guardrail → …, 覆盖率 100%).
+	ctx, span := tracer.Start(ctx, "guardrail.process")
+	defer span.End()
+	span.SetAttributes(
+		attribute.String("channel", msg.Channel),
+		attribute.String("tenant_id", msg.TenantID),
+		attribute.String("session_key", msg.SessionKey),
+	)
+
 	// 1. A pending approval consumes confirm/reject answers before anything
 	//    else runs.
 	if g.Approver != nil {
@@ -74,6 +86,7 @@ func (g *Guarded) Process(ctx context.Context, msg channels.InboundMessage) (cha
 			return channels.OutboundMessage{}, err
 		}
 		if handled {
+			span.SetAttributes(attribute.String("decision", firstNonEmpty(dec.decision, "allow")))
 			g.syncAudit(msg, dec)
 			return out, nil
 		}
@@ -83,6 +96,7 @@ func (g *Guarded) Process(ctx context.Context, msg channels.InboundMessage) (cha
 	for _, check := range g.Input {
 		reason, denied := check(ctx, msg)
 		if denied {
+			span.SetAttributes(attribute.String("decision", "deny"))
 			plog.Warnf("input denied (session=%s): %s", msg.SessionKey, reason)
 			g.syncAudit(msg, auditDecision{decision: "deny", errorType: "sensitive_input"})
 			out := replyShell(msg)
@@ -108,7 +122,9 @@ func (g *Guarded) Process(ctx context.Context, msg channels.InboundMessage) (cha
 		if !errors.As(err, &mErr) {
 			// Infrastructure failure (session store, queue, ...): leave the
 			// message pending for Stream redelivery (design 5.2.2).
-			g.asyncAudit(msg, started, err)
+			span.SetAttributes(attribute.String("decision", "error"))
+			span.RecordError(err)
+			g.asyncAudit(msg, out, started, err)
 			return out, err
 		}
 		// Model failure (deadline hit, retried once by the runner already):
@@ -119,18 +135,20 @@ func (g *Guarded) Process(ctx context.Context, msg channels.InboundMessage) (cha
 			// A dangerous call was intercepted before the failure: the
 			// pending approval is real, so the confirmation notice (not the
 			// busy reply) is what the user needs.
+			span.SetAttributes(attribute.String("decision", signalDecision(sig).decision))
 			g.syncAudit(msg, signalDecision(sig))
 			out = replyShell(msg)
 			out.Text = signalReply(sig)
 			return out, nil
 		}
+		span.SetAttributes(attribute.String("decision", "degraded"))
 		metrics.ProcessErrorTotal.Add(ctx, 1, processAttr(msg))
-		g.asyncModelAudit(msg, started, mErr)
+		g.asyncModelAudit(msg, out, started, mErr)
 		out = replyShell(msg)
 		out.Text = degradedReply
 		return out, nil
 	}
-	g.asyncAudit(msg, started, nil)
+	g.asyncAudit(msg, out, started, nil)
 
 	// 4. Output checks (desensitization).
 	for _, check := range g.Output {
@@ -141,9 +159,12 @@ func (g *Guarded) Process(ctx context.Context, msg channels.InboundMessage) (cha
 	//    with full tenant context and replace the LLM reply with the
 	//    deterministic confirmation/conflict/timeout notice.
 	if signaled {
+		span.SetAttributes(attribute.String("decision", signalDecision(sig).decision))
 		g.syncAudit(msg, signalDecision(sig))
 		out.Text = signalReply(sig)
+		return out, nil
 	}
+	span.SetAttributes(attribute.String("decision", "allow"))
 	return out, nil
 }
 
@@ -217,19 +238,23 @@ func signalReply(sig Signal) string {
 }
 
 // asyncAudit records the routine (allow) decision for a processed message,
-// off the request path. Messages that bypassed tenant routing (dev fallback)
+// off the request path, with the run's token usage and cost attached (design
+// 5.1.3 audit fields). Messages that bypassed tenant routing (dev fallback)
 // are filed under the zero UUID.
-func (g *Guarded) asyncAudit(msg channels.InboundMessage, started time.Time, processErr error) {
+func (g *Guarded) asyncAudit(msg channels.InboundMessage, out channels.OutboundMessage, started time.Time, processErr error) {
 	if g.Auditor == nil {
 		return
 	}
 	ev := storage.AuditEvent{
-		TenantID:  tenantOrZero(msg.TenantID),
-		Channel:   msg.Channel,
-		UserID:    msg.UserID,
-		Decision:  "allow",
-		LatencyMs: int(time.Since(started).Milliseconds()),
-		TraceID:   msg.TraceID,
+		TenantID:         tenantOrZero(msg.TenantID),
+		Channel:          msg.Channel,
+		UserID:           msg.UserID,
+		Decision:         "allow",
+		LatencyMs:        int(time.Since(started).Milliseconds()),
+		TraceID:          msg.TraceID,
+		PromptTokens:     out.PromptTokens,
+		CompletionTokens: out.CompletionTokens,
+		Cost:             CostUSD(out.Model, out.PromptTokens, out.CompletionTokens),
 	}
 	if processErr != nil {
 		ev.ErrorType = "process_error"
@@ -239,8 +264,9 @@ func (g *Guarded) asyncAudit(msg channels.InboundMessage, started time.Time, pro
 
 // asyncModelAudit records a degraded model failure: the decision stays
 // "allow" (the message itself was let through) and error_type carries the
-// cause — model_timeout vs model_error.
-func (g *Guarded) asyncModelAudit(msg channels.InboundMessage, started time.Time, mErr *ModelError) {
+// cause — model_timeout vs model_error. Tokens burned before the failure are
+// still accounted.
+func (g *Guarded) asyncModelAudit(msg channels.InboundMessage, out channels.OutboundMessage, started time.Time, mErr *ModelError) {
 	if g.Auditor == nil {
 		return
 	}
@@ -249,13 +275,16 @@ func (g *Guarded) asyncModelAudit(msg channels.InboundMessage, started time.Time
 		errorType = "model_timeout"
 	}
 	g.Auditor.LogAsync(storage.AuditEvent{
-		TenantID:  tenantOrZero(msg.TenantID),
-		Channel:   msg.Channel,
-		UserID:    msg.UserID,
-		Decision:  "allow",
-		LatencyMs: int(time.Since(started).Milliseconds()),
-		ErrorType: errorType,
-		TraceID:   msg.TraceID,
+		TenantID:         tenantOrZero(msg.TenantID),
+		Channel:          msg.Channel,
+		UserID:           msg.UserID,
+		Decision:         "allow",
+		LatencyMs:        int(time.Since(started).Milliseconds()),
+		ErrorType:        errorType,
+		TraceID:          msg.TraceID,
+		PromptTokens:     out.PromptTokens,
+		CompletionTokens: out.CompletionTokens,
+		Cost:             CostUSD(out.Model, out.PromptTokens, out.CompletionTokens),
 	})
 }
 
@@ -288,4 +317,11 @@ func tenantOrZero(tenantID string) string {
 		return "00000000-0000-0000-0000-000000000000"
 	}
 	return tenantID
+}
+
+func firstNonEmpty(s, fallback string) string {
+	if s != "" {
+		return s
+	}
+	return fallback
 }

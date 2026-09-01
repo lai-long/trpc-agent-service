@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -325,5 +326,77 @@ func TestAdminAuthAndAuditQuery(t *testing.T) {
 	rows = doJSONList(t, mux2, "/admin/audit?trace_id=admin-test-trace&decision=deny")
 	if len(rows) != 0 {
 		t.Fatalf("decision filter must exclude the row: %+v", rows)
+	}
+}
+
+// A write operation must be audited with its before/after content (design 5.4
+// 变更审计): creating a tenant leaves an audit row whose detail carries the
+// creation payload.
+func TestAdminAuditDetail(t *testing.T) {
+	ctx := context.Background()
+	pool, err := storage.NewPG(ctx, "postgres://trpc:trpc-dev-only@localhost:5432/trpc?sslmode=disable")
+	if err != nil {
+		t.Skipf("postgres unavailable (%v), skipping integration test", err)
+	}
+	t.Cleanup(func() { pool.Close() })
+
+	auditor := storage.NewAuditor(pool)
+	mux := http.NewServeMux()
+	web.NewAdminAPI(pool, auditor, nil, "").RegisterRoutes(mux)
+
+	name := fmt.Sprintf("audit-detail-%d", time.Now().UnixNano())
+	code, out := doJSON(t, mux, http.MethodPost, "/admin/tenants",
+		fmt.Sprintf(`{"name":%q,"model_config":{"model":"m1"}}`, name))
+	if code != http.StatusCreated {
+		t.Fatalf("create tenant: %d %v", code, out)
+	}
+	tenantID, _ := out["id"].(string)
+	t.Cleanup(func() {
+		_, _ = pool.Exec(ctx, `DELETE FROM tenant WHERE id = $1`, tenantID)
+		_, _ = pool.Exec(ctx, `DELETE FROM audit_log WHERE tenant_id = $1`, tenantID)
+	})
+
+	var detail []byte
+	if err := pool.QueryRow(ctx,
+		`SELECT detail FROM audit_log WHERE tenant_id = $1 AND tool_name = 'create_tenant'`,
+		tenantID).Scan(&detail); err != nil {
+		t.Fatalf("audit row for create_tenant: %v", err)
+	}
+	var parsed struct {
+		After struct {
+			Name string `json:"name"`
+		} `json:"after"`
+	}
+	if err := json.Unmarshal(detail, &parsed); err != nil {
+		t.Fatalf("audit detail not parseable: %v (%s)", err, detail)
+	}
+	if parsed.After.Name != name {
+		t.Fatalf("audit detail must carry the creation payload, got %s", detail)
+	}
+
+	// And the update path records the before image.
+	code, _ = doJSON(t, mux, http.MethodPatch, "/admin/tenants/"+tenantID,
+		`{"name":"renamed-tenant"}`)
+	if code != http.StatusOK {
+		t.Fatalf("update tenant: %d", code)
+	}
+	if err := pool.QueryRow(ctx,
+		`SELECT detail FROM audit_log WHERE tenant_id = $1 AND tool_name = 'update_tenant'`,
+		tenantID).Scan(&detail); err != nil {
+		t.Fatalf("audit row for update_tenant: %v", err)
+	}
+	var upd struct {
+		Before struct {
+			Name string `json:"name"`
+		} `json:"before"`
+		After struct {
+			Name string `json:"name"`
+		} `json:"after"`
+	}
+	if err := json.Unmarshal(detail, &upd); err != nil {
+		t.Fatalf("update audit detail not parseable: %v (%s)", err, detail)
+	}
+	if upd.Before.Name != name || upd.After.Name != "renamed-tenant" {
+		t.Fatalf("want before/after names, got %s", detail)
 	}
 }

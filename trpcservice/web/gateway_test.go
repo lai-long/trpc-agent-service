@@ -147,6 +147,10 @@ func TestEnqueueRateLimited(t *testing.T) {
 		t.Skipf("redis unavailable (%v), skipping integration test", err)
 	}
 	defer func() { _ = rdb.Close() }()
+	// Start from a clean slate: bucket keys outlive a crashed test run
+	// (10min TTL), and a stale empty bucket would reject even the first
+	// message.
+	rdb.Del(ctx, "ratelimit:tenant:t1")
 	t.Cleanup(func() { rdb.Del(context.Background(), "ratelimit:tenant:t1") })
 
 	h := web.EnqueueHandler{
@@ -165,18 +169,20 @@ func TestEnqueueRateLimited(t *testing.T) {
 			Text: "hi", WebhookPath: "/mock/callback",
 		}
 	}
-	if _, err := h.Handle(ctx, mk("rl-1")); err != nil {
+	id1 := fmt.Sprintf("rl-1-%d", time.Now().UnixNano())
+	id2 := fmt.Sprintf("rl-2-%d", time.Now().UnixNano())
+	t.Cleanup(func() { rdb.Del(context.Background(), "dedup:mock:"+id1) })
+	if _, err := h.Handle(ctx, mk(id1)); err != nil {
 		t.Fatalf("first message must pass: %v", err)
 	}
-	_, err = h.Handle(ctx, mk("rl-2"))
+	_, err = h.Handle(ctx, mk(id2))
 	if !errors.Is(err, web.ErrOverloaded) {
 		t.Fatalf("want ErrOverloaded, got %v", err)
 	}
-	// The rejection happened before dedup: no key was consumed for rl-2.
-	if n, _ := rdb.Exists(ctx, "dedup:mock:rl-2").Result(); n != 0 {
+	// The rejection happened before dedup: no key was consumed for id2.
+	if n, _ := rdb.Exists(ctx, "dedup:mock:"+id2).Result(); n != 0 {
 		t.Fatal("rate-limited message must not consume its dedup key")
 	}
-	t.Cleanup(func() { rdb.Del(context.Background(), "dedup:mock:rl-1") })
 }
 
 // With the queue at the backpressure limit the gateway rejects and rolls back
@@ -190,8 +196,8 @@ func TestEnqueueBackpressure(t *testing.T) {
 	defer func() { _ = rdb.Close() }()
 
 	inbound := "test:inbound-bp:" + t.Name()
+	rdb.Del(ctx, inbound) // clean slate: a leftover entry would trip backpressure immediately
 	t.Cleanup(func() { rdb.Del(context.Background(), inbound) })
-	t.Cleanup(func() { rdb.Del(context.Background(), "dedup:mock:bp-1", "dedup:mock:bp-2") })
 
 	h := web.EnqueueHandler{
 		Stream: storage.NewStream(rdb), Dedup: storage.NewDeduper(rdb),
@@ -204,13 +210,16 @@ func TestEnqueueBackpressure(t *testing.T) {
 			Text: "hi", WebhookPath: "/mock/callback",
 		}
 	}
-	if _, err := h.Handle(ctx, mk("bp-1")); err != nil {
+	id1 := fmt.Sprintf("bp-1-%d", time.Now().UnixNano())
+	id2 := fmt.Sprintf("bp-2-%d", time.Now().UnixNano())
+	t.Cleanup(func() { rdb.Del(context.Background(), "dedup:mock:"+id1, "dedup:mock:"+id2) })
+	if _, err := h.Handle(ctx, mk(id1)); err != nil {
 		t.Fatalf("empty queue must accept: %v", err)
 	}
-	if _, err := h.Handle(ctx, mk("bp-2")); !errors.Is(err, web.ErrOverloaded) {
+	if _, err := h.Handle(ctx, mk(id2)); !errors.Is(err, web.ErrOverloaded) {
 		t.Fatalf("full queue must reject with ErrOverloaded, got %v", err)
 	}
-	if n, _ := rdb.Exists(ctx, "dedup:mock:bp-2").Result(); n != 0 {
+	if n, _ := rdb.Exists(ctx, "dedup:mock:"+id2).Result(); n != 0 {
 		t.Fatal("backpressure rejection must roll back the dedup key")
 	}
 }

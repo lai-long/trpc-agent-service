@@ -168,6 +168,9 @@ CREATE TABLE audit_log (
     prompt_tokens     int,
     completion_tokens int,
     trace_id          varchar(128),
+    -- Admin write operations record the before/after payload here
+    -- ({"before": ..., "after": ...}), design 5.4 变更审计.
+    detail            jsonb,
     created_at        timestamptz  NOT NULL DEFAULT now()
 );
 CREATE INDEX idx_audit_tenant_time ON audit_log (tenant_id, created_at);
@@ -205,6 +208,7 @@ CREATE TABLE audit_log_archive (
     prompt_tokens     int,
     completion_tokens int,
     trace_id          varchar(128),
+    detail            jsonb,
     created_at        timestamptz  NOT NULL
 );
 CREATE INDEX idx_audit_archive_tenant_time ON audit_log_archive (tenant_id, created_at);

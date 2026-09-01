@@ -243,3 +243,39 @@ func TestGuardedModelErrorWithPendingSignalDeliversConfirmation(t *testing.T) {
 		t.Fatalf("want sync review, got %+v", evs)
 	}
 }
+
+// usageProcessor returns a fixed reply with token usage, as RunnerProcessor
+// does after a real run.
+type usageProcessor struct{}
+
+func (usageProcessor) Process(_ context.Context, msg channels.InboundMessage) (channels.OutboundMessage, error) {
+	out := channels.OutboundMessage{
+		Channel: msg.Channel, MsgID: msg.MsgID, SessionKey: msg.SessionKey,
+		UserID: msg.UserID, ChatID: msg.ChatID, TenantID: msg.TenantID,
+		Text: "ok", PromptTokens: 1000, CompletionTokens: 500, Model: "m-test",
+	}
+	return out, nil
+}
+
+func TestGuardedAuditCarriesUsageAndCost(t *testing.T) {
+	SetModelPricing(map[string][2]float64{"m-test": {1.0, 2.0}}) // $1/$2 per 1M tokens
+	t.Cleanup(func() { SetModelPricing(nil) })
+
+	aud := &fakeAuditor{}
+	g := &Guarded{Inner: usageProcessor{}, Auditor: aud}
+	if _, err := g.Process(context.Background(), testMsg("hello")); err != nil {
+		t.Fatal(err)
+	}
+	evs := aud.asyncDecisions()
+	if len(evs) != 1 {
+		t.Fatalf("want 1 audit event, got %d", len(evs))
+	}
+	ev := evs[0]
+	if ev.PromptTokens != 1000 || ev.CompletionTokens != 500 {
+		t.Fatalf("token usage missing from audit: %+v", ev)
+	}
+	// 1000*$1 + 500*$2 per 1M = $0.002
+	if ev.Cost < 0.0019 || ev.Cost > 0.0021 {
+		t.Fatalf("cost miscalculated: %+v", ev)
+	}
+}

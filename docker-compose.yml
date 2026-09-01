@@ -81,6 +81,7 @@ services:
     image: prom/prometheus:v2.54.1
     volumes:
       - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./deploy/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
     extra_hosts:
       # The service runs on the host (go run / start.sh), not in compose.
       - "host.docker.internal:host-gateway"

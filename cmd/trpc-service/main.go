@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -198,6 +199,9 @@ func serve() error {
 		g.Go(func() error { archiver.Run(gctx); return nil })
 	}
 
+	// Queue depth / pending gauges feeding the alerts of design 5.2.4.
+	metrics.StartStreamCollector(gctx, stream, 15*time.Second)
+
 	// Graceful shutdown: stop pulling new messages first, let in-flight
 	// processing finish, then close the HTTP server.
 	g.Go(func() error {
@@ -272,6 +276,17 @@ func buildProcessor(ctx context.Context, cfg config.Config, rdb *redis.Client, a
 
 	registry := tool.DemoTools()
 	approver := agent.NewApprover(rdb, registry, 0)
+
+	// Cost accounting: token counts are always recorded in audit; prices turn
+	// them into cost where configured.
+	if cfg.ModelPrices != "" {
+		var table map[string][2]float64
+		if err := json.Unmarshal([]byte(cfg.ModelPrices), &table); err != nil {
+			plog.Warnf("invalid TRPC_MODEL_PRICES, cost tracking disabled: %v", err)
+		} else {
+			agent.SetModelPricing(table)
+		}
+	}
 	wrap := func(inner agent.Processor) agent.Processor {
 		return &agent.Guarded{
 			Inner:    inner,

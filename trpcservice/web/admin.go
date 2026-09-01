@@ -106,7 +106,7 @@ func (a *AdminAPI) createTenant(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	a.afterWrite(r, "create_tenant", id)
+	a.afterWrite(r, "create_tenant", id, nil, in)
 	writeJSON(w, http.StatusCreated, map[string]any{"id": id})
 }
 
@@ -208,6 +208,7 @@ func (a *AdminAPI) updateTenant(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "nothing to update")
 		return
 	}
+	before := a.rowJSON(r.Context(), "tenant", "id", r.PathValue("id"))
 	tag, err := a.pool.Exec(r.Context(),
 		fmt.Sprintf(`UPDATE tenant SET %s, updated_at = now() WHERE id = $1`, strings.Join(sets, ", ")),
 		args...)
@@ -219,7 +220,7 @@ func (a *AdminAPI) updateTenant(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "tenant not found")
 		return
 	}
-	a.afterWrite(r, "update_tenant", r.PathValue("id"))
+	a.afterWrite(r, "update_tenant", r.PathValue("id"), before, in)
 	writeJSON(w, http.StatusOK, map[string]any{"updated": true})
 }
 
@@ -253,7 +254,9 @@ func (a *AdminAPI) createApp(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	a.afterWrite(r, "create_app", tenantID)
+	a.afterWrite(r, "create_app", tenantID, nil, map[string]any{
+		"id": id, "version": version, "name": in.Name, "agent_type": in.AgentType, "config": in.Config,
+	})
 	writeJSON(w, http.StatusCreated, map[string]any{"id": id, "version": version, "status": "draft"})
 }
 
@@ -296,6 +299,7 @@ func (a *AdminAPI) updateApp(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "config is required")
 		return
 	}
+	before := a.rowJSON(r.Context(), "agent_app", "id", r.PathValue("app"))
 	tag, err := a.pool.Exec(r.Context(),
 		`UPDATE agent_app SET config = $3, updated_at = now()
 		 WHERE id = $1 AND tenant_id = $2 AND status = 'draft'`,
@@ -308,7 +312,7 @@ func (a *AdminAPI) updateApp(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "app not found or not in draft status")
 		return
 	}
-	a.afterWrite(r, "update_app", r.PathValue("id"))
+	a.afterWrite(r, "update_app", r.PathValue("id"), before, in)
 	writeJSON(w, http.StatusOK, map[string]any{"updated": true})
 }
 
@@ -316,11 +320,13 @@ func (a *AdminAPI) updateApp(w http.ResponseWriter, r *http.Request) {
 // previously published version leaves published status and the target takes
 // it, guarded by the partial unique index (design 5.1.3).
 func (a *AdminAPI) publishApp(w http.ResponseWriter, r *http.Request) {
-	if err := a.publish(r.Context(), r.PathValue("id")); err != nil {
+	before := a.rowJSON(r.Context(), "agent_app", "id", r.PathValue("id"))
+	tenantID, err := a.publish(r.Context(), r.PathValue("id"))
+	if err != nil {
 		writeError(w, errStatus(err), err.Error())
 		return
 	}
-	a.afterWrite(r, "publish_app", "")
+	a.afterWrite(r, "publish_app", tenantID, before, map[string]any{"published": r.PathValue("id")})
 	writeJSON(w, http.StatusOK, map[string]any{"published": r.PathValue("id")})
 }
 
@@ -376,19 +382,22 @@ func (a *AdminAPI) rollbackApp(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if err := a.publish(ctx, targetID); err != nil {
+	if _, err := a.publish(ctx, targetID); err != nil {
 		writeError(w, errStatus(err), err.Error())
 		return
 	}
-	a.afterWrite(r, "rollback_app", tenantID)
+	a.afterWrite(r, "rollback_app", tenantID,
+		map[string]any{"id": appID, "version": version},
+		map[string]any{"published": targetID, "version": target})
 	writeJSON(w, http.StatusOK, map[string]any{"published": targetID, "version": target})
 }
 
-// publish switches the published version of the app family in one tx.
-func (a *AdminAPI) publish(ctx context.Context, appID string) error {
+// publish switches the published version of the app family in one tx and
+// returns the owning tenant ID (for the audit record).
+func (a *AdminAPI) publish(ctx context.Context, appID string) (string, error) {
 	tx, err := a.pool.Begin(ctx)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
@@ -397,26 +406,26 @@ func (a *AdminAPI) publish(ctx context.Context, appID string) error {
 		`SELECT tenant_id, name, status FROM agent_app WHERE id = $1 FOR UPDATE`, appID).
 		Scan(&tenantID, &name, &status)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return errNotFound("app not found")
+		return "", errNotFound("app not found")
 	}
 	if err != nil {
-		return err
+		return "", err
 	}
 	if status == "published" {
-		return errConflict("app version is already published")
+		return "", errConflict("app version is already published")
 	}
 	if _, err := tx.Exec(ctx,
 		`UPDATE agent_app SET status = 'disabled', updated_at = now()
 		 WHERE tenant_id = $1 AND name = $2 AND status = 'published'`,
 		tenantID, name); err != nil {
-		return fmt.Errorf("unpublish current: %w", err)
+		return "", fmt.Errorf("unpublish current: %w", err)
 	}
 	if _, err := tx.Exec(ctx,
 		`UPDATE agent_app SET status = 'published', updated_at = now() WHERE id = $1`,
 		appID); err != nil {
-		return fmt.Errorf("publish: %w", err)
+		return "", fmt.Errorf("publish: %w", err)
 	}
-	return tx.Commit(ctx)
+	return tenantID, tx.Commit(ctx)
 }
 
 // ---------------------------------------------------------------------------
@@ -458,7 +467,10 @@ func (a *AdminAPI) createBinding(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	a.afterWrite(r, "create_binding", tenantID)
+	a.afterWrite(r, "create_binding", tenantID, nil, map[string]any{
+		"id": id, "channel": in.Channel, "webhook_path": in.WebhookPath,
+		"token_ref": in.TokenRef, "aeskey_ref": in.AESKeyRef, "config": in.Config,
+	})
 	writeJSON(w, http.StatusCreated, map[string]any{"id": id})
 }
 
@@ -490,6 +502,7 @@ func (a *AdminAPI) listBindings(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *AdminAPI) deleteBinding(w http.ResponseWriter, r *http.Request) {
+	before := a.rowJSON(r.Context(), "channel_binding", "id", r.PathValue("binding"))
 	tag, err := a.pool.Exec(r.Context(),
 		`DELETE FROM channel_binding WHERE id = $1 AND app_id = $2`,
 		r.PathValue("binding"), r.PathValue("id"))
@@ -501,7 +514,7 @@ func (a *AdminAPI) deleteBinding(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "binding not found")
 		return
 	}
-	a.afterWrite(r, "delete_binding", "")
+	a.afterWrite(r, "delete_binding", tenantIDOf(before), before, nil)
 	writeJSON(w, http.StatusOK, map[string]any{"deleted": true})
 }
 
@@ -552,7 +565,8 @@ func (a *AdminAPI) addKnowledgeDocument(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusInternalServerError, fmt.Sprintf("ingest document: %v", err))
 		return
 	}
-	a.afterWrite(r, "add_knowledge_document", tenantID)
+	// The document content can be large; the audit records the metadata only.
+	a.afterWrite(r, "add_knowledge_document", tenantID, nil, map[string]any{"name": in.Name})
 	writeJSON(w, http.StatusCreated, map[string]any{"ingested": in.Name})
 }
 
@@ -569,7 +583,8 @@ func (a *AdminAPI) queryAudit(w http.ResponseWriter, r *http.Request) {
 	rows, err := a.pool.Query(r.Context(),
 		`SELECT id, tenant_id, COALESCE(channel,''), COALESCE(user_id,''),
 		        COALESCE(session_id::text,''), COALESCE(tool_name,''), decision,
-		        COALESCE(error_type,''), COALESCE(latency_ms,0), COALESCE(trace_id,''), created_at
+		        COALESCE(error_type,''), COALESCE(latency_ms,0), COALESCE(trace_id,''),
+		        detail, created_at
 		 FROM audit_log
 		 WHERE ($1 = '' OR tenant_id = $1::uuid)
 		   AND ($2 = '' OR session_id = $2::uuid)
@@ -586,9 +601,10 @@ func (a *AdminAPI) queryAudit(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var id, tenantID, channel, userID, sessionID, toolName, decision, errorType, traceID string
 		var latency int
+		var detail []byte
 		var createdAt time.Time
 		if err := rows.Scan(&id, &tenantID, &channel, &userID, &sessionID, &toolName,
-			&decision, &errorType, &latency, &traceID, &createdAt); err != nil {
+			&decision, &errorType, &latency, &traceID, &detail, &createdAt); err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
@@ -596,7 +612,7 @@ func (a *AdminAPI) queryAudit(w http.ResponseWriter, r *http.Request) {
 			"id": id, "tenant_id": tenantID, "channel": channel, "user_id": userID,
 			"session_id": sessionID, "tool_name": toolName, "decision": decision,
 			"error_type": errorType, "latency_ms": latency, "trace_id": traceID,
-			"created_at": createdAt,
+			"detail": jsonOrNull(detail), "created_at": createdAt,
 		})
 	}
 	writeJSON(w, http.StatusOK, out)
@@ -606,10 +622,11 @@ func (a *AdminAPI) queryAudit(w http.ResponseWriter, r *http.Request) {
 // helpers
 // ---------------------------------------------------------------------------
 
-// afterWrite audits the write operation and broadcasts config invalidation
-// (design 5.2.3: workers drop their cache within seconds; TTL is the
-// fallback when the notification is lost).
-func (a *AdminAPI) afterWrite(r *http.Request, op, tenantID string) {
+// afterWrite audits the write operation (operator + before/after content,
+// design 5.4 变更审计) and broadcasts config invalidation (design 5.2.3:
+// workers drop their cache within seconds; TTL is the fallback when the
+// notification is lost).
+func (a *AdminAPI) afterWrite(r *http.Request, op, tenantID string, before, after any) {
 	if a.rdb != nil {
 		if err := tenant.PublishInvalidation(r.Context(), a.rdb); err != nil {
 			plog.Warnf("admin %s: invalidation broadcast failed (TTL fallback): %v", op, err)
@@ -629,10 +646,45 @@ func (a *AdminAPI) afterWrite(r *http.Request, op, tenantID string) {
 	defer cancel()
 	if err := a.auditor.LogSync(ctx, storage.AuditEvent{
 		TenantID: tenantID, Channel: "admin", UserID: operator,
-		ToolName: op, Decision: "allow",
+		ToolName: op, Decision: "allow", Detail: changeDetail(before, after),
 	}); err != nil {
 		plog.Errorf("admin %s audit failed: %v", op, err)
 	}
+}
+
+// changeDetail packs the before/after images of a change, dropping nil sides.
+func changeDetail(before, after any) json.RawMessage {
+	if before == nil && after == nil {
+		return nil
+	}
+	d := map[string]any{}
+	if before != nil {
+		d["before"] = before
+	}
+	if after != nil {
+		d["after"] = after
+	}
+	raw, err := json.Marshal(d)
+	if err != nil {
+		return nil
+	}
+	return raw
+}
+
+// rowJSON reads one row as JSONB for the audit's before image. A missing row
+// yields nil (delete of a phantom); read errors are logged and yield nil —
+// audit detail must never fail the operation itself.
+func (a *AdminAPI) rowJSON(ctx context.Context, table, idColumn, id string) json.RawMessage {
+	var raw []byte
+	err := a.pool.QueryRow(ctx,
+		fmt.Sprintf(`SELECT to_jsonb(t) FROM %s t WHERE %s = $1`, table, idColumn), id).Scan(&raw)
+	if err != nil {
+		if !errors.Is(err, pgx.ErrNoRows) {
+			plog.Warnf("audit before-image read %s.%s=%s: %v", table, idColumn, id, err)
+		}
+		return nil
+	}
+	return raw
 }
 
 type httpError struct {
@@ -692,4 +744,15 @@ func nullStr(s string) any {
 		return nil
 	}
 	return s
+}
+
+// tenantIDOf extracts tenant_id from a to_jsonb row image (audit detail).
+func tenantIDOf(row json.RawMessage) string {
+	var m struct {
+		TenantID string `json:"tenant_id"`
+	}
+	if err := json.Unmarshal(row, &m); err != nil {
+		return ""
+	}
+	return m.TenantID
 }

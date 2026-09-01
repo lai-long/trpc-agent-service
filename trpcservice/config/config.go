@@ -29,6 +29,10 @@ type Config struct {
 	// ModelTimeout bounds one model run (design 5.2.2: 60s deadline, retry
 	// once, then a busy reply). Go duration syntax.
 	ModelTimeout string // TRPC_MODEL_TIMEOUT
+	// ModelPrices maps model name to USD per 1M tokens for cost accounting
+	// (audit_log.cost), JSON: {"deepseek-v4-flash":[0.1,0.4]}. Empty means
+	// cost is not tracked (token counts always are).
+	ModelPrices string // TRPC_MODEL_PRICES
 
 	// SessionBackend selects the session store: "redis" (default, hot data)
 	// or "postgres" (event journal + snapshot in the 5.1.3 tables).
@@ -100,6 +104,7 @@ func Load() Config {
 		ModelName:      getenv("TRPC_MODEL_NAME", "deepseek-v4-flash"),
 		ModelAPIKeyRef: getenv("TRPC_MODEL_APIKEY_REF", "deepseek-apikey"),
 		ModelTimeout:   getenv("TRPC_MODEL_TIMEOUT", "60s"),
+		ModelPrices:    getenv("TRPC_MODEL_PRICES", ""),
 
 		SessionBackend: getenv("TRPC_SESSION_BACKEND", "redis"),
 		AppName:        getenv("TRPC_APP_NAME", "00000000-0000-0000-0000-000000000101"),

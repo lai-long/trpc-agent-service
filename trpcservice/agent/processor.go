@@ -40,6 +40,7 @@ func (e *ModelError) Unwrap() error { return e.Err }
 // Session persistence is delegated to the framework's session.Service.
 type RunnerProcessor struct {
 	runner  runner.Runner
+	model   string
 	timeout time.Duration
 	retries int
 }
@@ -113,18 +114,18 @@ func NewRunnerProcessor(cfg RunnerConfig) *RunnerProcessor {
 		runnerOpts = append(runnerOpts, runner.WithMemoryService(cfg.MemoryService))
 	}
 	r := runner.NewRunner(cfg.AppName, llm, runnerOpts...)
-	return newRunnerProcessor(r, cfg.Timeout, cfg.Retries)
+	return newRunnerProcessor(r, cfg.ModelName, cfg.Timeout, cfg.Retries)
 }
 
 // newRunnerProcessor wraps an existing runner; tests use it to inject fakes.
-func newRunnerProcessor(r runner.Runner, timeout time.Duration, retries int) *RunnerProcessor {
+func newRunnerProcessor(r runner.Runner, modelName string, timeout time.Duration, retries int) *RunnerProcessor {
 	if timeout <= 0 {
 		timeout = DefaultRunTimeout
 	}
 	if retries < 0 {
 		retries = 0
 	}
-	return &RunnerProcessor{runner: r, timeout: timeout, retries: retries}
+	return &RunnerProcessor{runner: r, model: modelName, timeout: timeout, retries: retries}
 }
 
 // Process implements Processor: run with a per-run deadline, retrying a
@@ -144,6 +145,7 @@ func (p *RunnerProcessor) Process(ctx context.Context, msg channels.InboundMessa
 		ChatID:     msg.ChatID,
 		TenantID:   msg.TenantID,
 		TraceID:    msg.TraceID,
+		Model:      p.model,
 	}
 
 	var lastErr error
@@ -152,7 +154,9 @@ func (p *RunnerProcessor) Process(ctx context.Context, msg channels.InboundMessa
 			plog.Warnf("retrying run (attempt %d/%d, session=%s): %v",
 				attempt+1, p.retries+1, msg.SessionKey, lastErr)
 		}
-		reply, err := p.runOnce(ctx, msg)
+		reply, usage, err := p.runOnce(ctx, msg)
+		out.PromptTokens += usage.prompt
+		out.CompletionTokens += usage.completion
 		if err == nil {
 			out.Text = reply
 			zap.L().Debug("runner replied",
@@ -180,16 +184,20 @@ type infraError struct{ Err error }
 func (e *infraError) Error() string { return e.Err.Error() }
 func (e *infraError) Unwrap() error { return e.Err }
 
+// tokenUsage accumulates the LLM token usage observed on the event stream.
+type tokenUsage struct{ prompt, completion int }
+
 // runOnce executes a single run under a fresh deadline and drains the event
 // channel to close (also after cancellation — the framework shuts its
 // goroutines down on ctx cancel and then closes the channel).
-func (p *RunnerProcessor) runOnce(ctx context.Context, msg channels.InboundMessage) (string, error) {
+func (p *RunnerProcessor) runOnce(ctx context.Context, msg channels.InboundMessage) (string, tokenUsage, error) {
+	var usage tokenUsage
 	runCtx, cancel := context.WithTimeout(ctx, p.timeout)
 	defer cancel()
 
 	events, err := p.runner.Run(runCtx, msg.UserID, msg.SessionKey, model.NewUserMessage(msg.Text))
 	if err != nil {
-		return "", &infraError{Err: fmt.Errorf("runner run: %w", err)}
+		return "", usage, &infraError{Err: fmt.Errorf("runner run: %w", err)}
 	}
 
 	var reply strings.Builder
@@ -201,29 +209,34 @@ func (p *RunnerProcessor) runOnce(ctx context.Context, msg channels.InboundMessa
 			continue
 		}
 		if evt.Response != nil && evt.Response.Usage != nil {
-			metrics.TokensTotal.Add(ctx, int64(evt.Response.Usage.PromptTokens), tokenAttr("prompt"))
-			metrics.TokensTotal.Add(ctx, int64(evt.Response.Usage.CompletionTokens), tokenAttr("completion"))
+			usage.prompt += evt.Response.Usage.PromptTokens
+			usage.completion += evt.Response.Usage.CompletionTokens
+			metrics.TokensTotal.Add(ctx, int64(evt.Response.Usage.PromptTokens), tokenAttr(msg.TenantID, "prompt"))
+			metrics.TokensTotal.Add(ctx, int64(evt.Response.Usage.CompletionTokens), tokenAttr(msg.TenantID, "completion"))
 		}
 		if evt.IsFinalResponse() && evt.Response != nil && len(evt.Response.Choices) > 0 {
 			reply.WriteString(evt.Response.Choices[0].Message.Content)
 		}
 	}
 	if reply.Len() > 0 {
-		return reply.String(), nil
+		return reply.String(), usage, nil
 	}
 	if errors.Is(runCtx.Err(), context.DeadlineExceeded) {
-		return "", fmt.Errorf("model timeout after %s: %w", p.timeout, context.DeadlineExceeded)
+		return "", usage, fmt.Errorf("model timeout after %s: %w", p.timeout, context.DeadlineExceeded)
 	}
 	if runErr != nil {
-		return "", runErr
+		return "", usage, runErr
 	}
-	return "", errors.New("runner produced no final response")
+	return "", usage, errors.New("runner produced no final response")
 }
 
 // Close shuts down the underlying runner (call at process exit).
 func (p *RunnerProcessor) Close() error { return p.runner.Close() }
 
-// tokenAttr tags token usage by kind (prompt / completion).
-func tokenAttr(kind string) otelmetric.MeasurementOption {
-	return otelmetric.WithAttributes(attribute.String("kind", kind))
+// tokenAttr tags token usage by tenant and kind (prompt / completion).
+func tokenAttr(tenantID, kind string) otelmetric.MeasurementOption {
+	return otelmetric.WithAttributes(
+		attribute.String("tenant_id", tenantID),
+		attribute.String("kind", kind),
+	)
 }

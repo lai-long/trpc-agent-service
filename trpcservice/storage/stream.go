@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -71,6 +72,34 @@ func (s *Stream) Len(ctx context.Context, stream string) (int64, error) {
 		return 0, fmt.Errorf("xlen %s: %w", stream, err)
 	}
 	return n, nil
+}
+
+// Pending reports a consumer group's backlog: how many messages sit pending
+// and how long the oldest has been waiting (design 5.2.4 队列指标:
+// pending 数、最老 pending 停留时长). A missing group reports zeros.
+func (s *Stream) Pending(ctx context.Context, stream, group string) (count int64, oldestIdle time.Duration, err error) {
+	summary, err := s.rdb.XPending(ctx, stream, group).Result()
+	if err != nil {
+		if strings.HasPrefix(err.Error(), "NOGROUP") {
+			return 0, 0, nil
+		}
+		return 0, 0, fmt.Errorf("xpending %s %s: %w", stream, group, err)
+	}
+	if summary.Count == 0 {
+		return 0, 0, nil
+	}
+	// IDs are time-ordered, so the first entry of the extended form is the
+	// oldest pending message.
+	ext, err := s.rdb.XPendingExt(ctx, &redis.XPendingExtArgs{
+		Stream: stream, Group: group, Start: "-", End: "+", Count: 1,
+	}).Result()
+	if err != nil {
+		return summary.Count, 0, fmt.Errorf("xpending ext %s %s: %w", stream, group, err)
+	}
+	if len(ext) > 0 {
+		oldestIdle = ext[0].Idle
+	}
+	return summary.Count, oldestIdle, nil
 }
 
 // EnsureGroup creates the consumer group if missing; an existing group is
