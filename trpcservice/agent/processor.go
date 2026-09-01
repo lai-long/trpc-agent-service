@@ -166,6 +166,9 @@ func (p *RunnerProcessor) Process(ctx context.Context, msg channels.InboundMessa
 		out.CompletionTokens += usage.completion
 		if err == nil {
 			out.Text = reply
+			if channels.LooksMarkdown(reply) {
+				out.TextType = channels.TextTypeMarkdown
+			}
 			zap.L().Debug("runner replied",
 				zap.String(plog.FieldSessionKey, msg.SessionKey),
 				zap.String(plog.FieldTraceID, msg.TraceID),

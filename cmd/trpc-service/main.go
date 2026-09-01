@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -22,6 +24,7 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels/mock"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels/wecom"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/channels/wxkf"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/config"
 	plog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/metrics"
@@ -48,34 +51,48 @@ func main() {
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
 		case "serve":
-			if err := serve(); err != nil {
-				zap.L().Fatal("serve exited", zap.Error(err))
+			role := "all"
+			if len(os.Args) > 2 {
+				role = os.Args[2]
 			}
-			return
+			switch role {
+			case "all", "gateway", "worker", "admin":
+				if err := serve(role); err != nil {
+					zap.L().Fatal("serve exited", zap.Error(err))
+				}
+				return
+			}
 		case "-h", "--help":
-			fmt.Fprintf(os.Stderr, "usage: %s [serve]\n", os.Args[0])
+			fmt.Fprintf(os.Stderr, "usage: %s serve [all|gateway|worker|admin]\n", os.Args[0])
 			return
 		}
 	}
 
 	fmt.Printf("trpc-agent-service %s\n", trpcservice.Version)
 	fmt.Println("multi-tenant node-based agent platform on tRPC-Agent-Go")
-	fmt.Fprintf(os.Stderr, "usage: %s [serve]\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "usage: %s serve [all|gateway|worker|admin]\n", os.Args[0])
 }
 
-// serve runs the all-in-one role: gateway + worker + sender in one process,
-// backed by the Redis Streams from docker-compose.
+// serve runs one deployment role (design 5.2.5): "all" packs everything into
+// one process (local/demo); "gateway" serves IM callbacks and outbound
+// delivery; "worker" consumes the inbound stream and runs agents; "admin"
+// serves the Admin API and housekeeping (archival). Roles share the Redis
+// Streams and PG/Redis state, so any mix of replicas forms one platform.
 //
 // Chain (sync ack + async consume):
 //
-//	mock callback → EnqueueHandler → stream:inbound → Worker(Runner) → stream:outbound → Sender → channel.Send
-func serve() error {
+//	IM callback → EnqueueHandler → stream:inbound → Worker(Runner) → stream:outbound → Sender → channel.Send
+func serve(role string) error {
 	cfg := config.Load()
 	plog.Init(cfg.LogLevel, cfg.LogFormat != "json")
 	defer plog.Sync()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// One secret resolver per process (design 决策三): file backend for local
+	// dev, KMS sidecar when configured, always behind the short-TTL cache.
+	secrets := buildSecretResolver(ctx, cfg)
 
 	// Tracing goes up before anything that emits spans. Endpoint comes from
 	// OTEL_EXPORTER_OTLP_ENDPOINT; the platform adds spans around the callback,
@@ -111,135 +128,243 @@ func serve() error {
 	// pipeline must not depend on them.
 	auditor, resolver, pgPool, pgCleanup := startPGConsumers(ctx, cfg)
 	defer pgCleanup()
-
-	// Session services: one per supported backend (design 5.1.1 受控菜单).
-	// The tenant's storage_config.session.type routes its apps;
-	// TRPC_SESSION_BACKEND picks the platform default.
-	sessByType, defaultSess, sessErr := buildSessionServices(ctx, cfg, pgPool)
-	if sessErr != nil {
-		plog.Warnf("session services unavailable (%v)", sessErr)
+	// Every role watches config invalidations (publish/rollback/migration
+	// read-switch broadcast by the admin role, design 5.2.3); the TTL remains
+	// the fallback when a notification is lost.
+	if resolver != nil {
+		resolver.WatchInvalidations(ctx, rdb)
 	}
-	defer func() {
-		for _, s := range sessByType {
-			_ = s.Close()
+
+	wantGateway := role == "all" || role == "gateway"
+	wantWorker := role == "all" || role == "worker"
+	wantAdmin := role == "all" || role == "admin"
+
+	// Knowledge base: enabled only with an embeddings-capable endpoint
+	// (TRPC_EMBEDDER_*); the default DeepSeek chat endpoint has none.
+	// Worker (agent retrieval) and admin (document ingestion) both use it.
+	var kb *knowledge.BuiltinKnowledge
+	if wantWorker || wantAdmin {
+		kb = buildKnowledge(ctx, cfg, secrets)
+	}
+
+	// Worker-side infrastructure: session backends, artifact store, processor.
+	var (
+		sessByType       map[string]session.Service
+		defaultSess      string
+		processor        agent.Processor = agent.EchoProcessor{}
+		processorCleanup                 = func() {}
+	)
+	// Artifact storage (S3-compatible, MinIO locally): the gateway's media
+	// sink and the worker's runner artifact service share one instance.
+	var artifacts artifact.Service
+	if wantWorker || wantGateway {
+		artifacts = buildArtifact(cfg, secrets)
+	}
+	if wantWorker {
+		var sessErr error
+		sessByType, defaultSess, sessErr = buildSessionServices(ctx, cfg, pgPool, secrets)
+		if sessErr != nil {
+			plog.Warnf("session services unavailable (%v)", sessErr)
 		}
-	}()
-
-	// Artifact storage (S3-compatible, MinIO locally); optional.
-	artifacts := buildArtifact(cfg)
-
-	ch := mock.New()
-	enqueue := web.EnqueueHandler{
-		Stream:       stream,
-		Dedup:        storage.NewDeduper(rdb),
-		Routes:       resolver,
-		Limiter:      storage.NewLimiter(rdb),
-		DefaultQPS:   parseFloat(cfg.GatewayRateQPS, 50),
-		DefaultBurst: parseInt(cfg.GatewayRateBurst, 100),
-	}
-	mux := http.NewServeMux()
-	ch.RegisterRoutes(mux, enqueue)
-
-	// Channel registry for the outbound sender: mock always, wecom when
-	// configured. Channel misconfiguration disables only that channel.
-	channelSet := map[string]channels.Channel{ch.Name(): ch}
-	if wc := startWecom(cfg); wc != nil {
-		wc.RegisterRoutes(mux, enqueue)
-		channelSet[wc.Name()] = wc
+		defer func() {
+			for _, s := range sessByType {
+				_ = s.Close()
+			}
+		}()
+		processor, processorCleanup = buildProcessor(ctx, cfg, rdb, auditor, pgPool, kb, resolver, sessByType, defaultSess, artifacts, secrets)
+		defer processorCleanup()
+	} else {
+		// The admin role only needs the default backend name (migration
+		// from_backend default).
+		defaultSess = cfg.SessionBackend
+		if defaultSess != "postgres" {
+			defaultSess = "redis"
+		}
 	}
 
 	metricsHandler, err := metrics.InitMetrics()
 	if err != nil {
 		return err
 	}
-	mux.Handle("GET /metrics", metricsHandler)
 
-	// Knowledge base: enabled only with an embeddings-capable endpoint
-	// (TRPC_EMBEDDER_*); the default DeepSeek chat endpoint has none.
-	kb := buildKnowledge(ctx, cfg)
-
-	// Admin API needs PG; it also starts the resolver's invalidation watch so
-	// publish/rollback reaches workers in seconds (design 5.2.3). The storage
-	// migration executor lives on the same dependency.
-	if pgPool != nil {
-		adminAPI := web.NewAdminAPI(pgPool, auditor, rdb, cfg.AdminToken)
-		adminAPI.Knowledge = kb
-		adminAPI.DefaultSessionBackend = defaultSess
-		adminAPI.RegisterRoutes(mux)
-		resolver.WatchInvalidations(ctx, rdb)
-		if cfg.AdminToken == "" {
-			plog.Warnf("admin API unprotected (TRPC_ADMIN_TOKEN unset) — dev mode only")
-		}
-		plog.Infof("admin API enabled (/admin/...)")
-	}
-
-	srv := &http.Server{
-		Addr:    cfg.HTTPAddr,
-		Handler: mux,
-		// Timeouts against slow/lazy clients (Slowloris): callback bodies are
-		// small and replies are immediate in the async chain, so tight limits
-		// are safe. WriteTimeout stays unset to leave room for future SSE.
-		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       10 * time.Second,
-		IdleTimeout:       60 * time.Second,
-	}
-
-	processor, cleanup := buildProcessor(ctx, cfg, rdb, auditor, pgPool, kb, resolver, sessByType, defaultSess, artifacts)
-	defer cleanup()
-
-	consumer := fmt.Sprintf("%s-%d", "allinone", os.Getpid())
 	g, gctx := errgroup.WithContext(ctx)
+	consumer := fmt.Sprintf("%s-%d", role, os.Getpid())
+	var gatewayMux *http.ServeMux
 
-	g.Go(func() error {
-		zap.L().Info("listening",
-			zap.String("addr", cfg.HTTPAddr), zap.String("mock_callback", "POST /mock/callback"))
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			return err
+	// --- Gateway role: IM callbacks in, replies out -------------------------
+	if wantGateway {
+		ch := mock.New()
+		enqueue := web.EnqueueHandler{
+			Stream:       stream,
+			Dedup:        storage.NewDeduper(rdb),
+			Routes:       resolver,
+			Limiter:      storage.NewLimiter(rdb),
+			DefaultQPS:   parseFloat(cfg.GatewayRateQPS, 50),
+			DefaultBurst: parseInt(cfg.GatewayRateBurst, 100),
 		}
-		return nil
-	})
-	worker := &agent.Worker{Stream: stream, Lock: storage.NewLock(rdb), Processor: processor, Name: consumer + "-w"}
-	g.Go(func() error { return worker.Run(gctx) })
+		gatewayMux = http.NewServeMux()
+		mux := gatewayMux
+		ch.RegisterRoutes(mux, enqueue)
+		mux.Handle("GET /metrics", metricsHandler)
 
-	sender := &channels.Sender{
-		Stream:    stream,
-		Sent:      storage.NewSentMarker(rdb),
-		Channels:  channelSet,
-		Name:      consumer + "-s",
-		Limiter:   storage.NewLimiter(rdb),
-		SendQPS:   parseFloat(cfg.SendRateQPS, 20),
-		SendBurst: parseInt(cfg.SendRateBurst, 40),
+		// Channel registry for the outbound sender: mock always, wecom and
+		// wxkf when configured. Channel misconfiguration disables only that
+		// channel. The artifact store doubles as the wecom media sink.
+		var mediaSink channels.MediaStore
+		if s3, ok := artifacts.(*storage.S3ArtifactService); ok {
+			mediaSink = s3
+		}
+		channelSet := map[string]channels.Channel{ch.Name(): ch}
+		if wc := startWecom(cfg, mediaSink, secrets); wc != nil {
+			wc.RegisterRoutes(mux, enqueue)
+			channelSet[wc.Name()] = wc
+		}
+		if kf := startWxkf(cfg, secrets); kf != nil {
+			kf.RegisterRoutes(mux, enqueue)
+			channelSet[kf.Name()] = kf
+		}
+
+		srv := &http.Server{
+			Addr:    cfg.HTTPAddr,
+			Handler: mux,
+			// Timeouts against slow/lazy clients (Slowloris): callback bodies
+			// are small and replies are immediate in the async chain, so tight
+			// limits are safe. WriteTimeout stays unset for future SSE.
+			ReadHeaderTimeout: 5 * time.Second,
+			ReadTimeout:       10 * time.Second,
+			IdleTimeout:       60 * time.Second,
+		}
+		g.Go(func() error {
+			zap.L().Info("gateway listening",
+				zap.String("addr", cfg.HTTPAddr), zap.String("mock_callback", "POST /mock/callback"))
+			if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				return err
+			}
+			return nil
+		})
+		g.Go(func() error {
+			<-gctx.Done()
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			return srv.Shutdown(shutdownCtx)
+		})
+
+		sender := &channels.Sender{
+			Stream:    stream,
+			Sent:      storage.NewSentMarker(rdb),
+			Channels:  channelSet,
+			Name:      consumer + "-s",
+			Limiter:   storage.NewLimiter(rdb),
+			SendQPS:   parseFloat(cfg.SendRateQPS, 20),
+			SendBurst: parseInt(cfg.SendRateBurst, 40),
+		}
+		g.Go(func() error { return sender.Run(gctx) })
 	}
-	g.Go(func() error { return sender.Run(gctx) })
 
-	// Monthly-ish archival (design 5.1.3): move old session_event / audit_log
-	// rows to the archive tables so the hot tables stay small.
-	if pgPool != nil {
-		archiver := storage.NewArchiver(pgPool,
-			parseDuration(cfg.ArchiveRetention, 30*24*time.Hour),
-			parseDuration(cfg.ArchiveInterval, 24*time.Hour))
-		g.Go(func() error { archiver.Run(gctx); return nil })
+	// --- Worker role: consume, run agents, drain on shutdown ----------------
+	if wantWorker {
+		worker := &agent.Worker{
+			Stream: stream, Lock: storage.NewLock(rdb), Processor: processor,
+			Name: consumer + "-w",
+		}
+		g.Go(func() error { return worker.Run(gctx) })
+
+		// Storage migration executor (design 5.2.6): advances active
+		// migrations through backfilling → read switch → observation → done.
+		if pgPool != nil && len(sessByType) > 0 {
+			migrator := storage.NewMigrator(pgPool, rdb, sessByType,
+				parseDuration(cfg.MigrationObserve, 24*time.Hour))
+			g.Go(func() error { migrator.Run(gctx); return nil })
+		}
+
+		// A split worker still exports metrics on its own listener. The
+		// listener is auxiliary: a bind failure (e.g. colocated gateway on
+		// the same address in local dev) must not kill the worker.
+		if role == "worker" {
+			mux := http.NewServeMux()
+			mux.Handle("GET /metrics", metricsHandler)
+			srv := &http.Server{Addr: cfg.WorkerAddr, Handler: mux,
+				ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second}
+			g.Go(func() error {
+				zap.L().Info("worker metrics listening", zap.String("addr", cfg.WorkerAddr))
+				if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+					plog.Warnf("worker metrics listener failed (metrics off): %v", err)
+				}
+				return nil
+			})
+			g.Go(func() error {
+				<-gctx.Done()
+				shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				return srv.Shutdown(shutdownCtx)
+			})
+		}
+	}
+
+	// --- Admin role: management API + housekeeping --------------------------
+	if wantAdmin {
+		if pgPool == nil {
+			plog.Warnf("admin role degraded: PG unreachable, Admin API and archiver disabled")
+		} else {
+			adminAPI := web.NewAdminAPI(pgPool, auditor, rdb, cfg.AdminToken)
+			adminAPI.Knowledge = kb
+			adminAPI.DefaultSessionBackend = defaultSess
+
+			// In all-in-one mode the admin routes share the gateway listener
+			// (bearer token is the guard there); split mode serves them on a
+			// separate internal address (TRPC_ADMIN_ADDR, internal network
+			// only per design 5.4), optionally with mTLS.
+			var adminMux *http.ServeMux
+			if role == "all" {
+				adminMux = gatewayMux
+			} else {
+				adminMux = http.NewServeMux()
+				adminMux.Handle("GET /metrics", metricsHandler)
+				srv := &http.Server{Addr: cfg.AdminAddr, Handler: adminMux,
+					ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second}
+				tlsCfg, err := adminTLSConfig(cfg)
+				if err != nil {
+					return err
+				}
+				srv.TLSConfig = tlsCfg
+				g.Go(func() error {
+					zap.L().Info("admin listening", zap.String("addr", cfg.AdminAddr),
+						zap.Bool("mtls", tlsCfg != nil))
+					var err error
+					if tlsCfg != nil {
+						err = srv.ListenAndServeTLS("", "")
+					} else {
+						err = srv.ListenAndServe()
+					}
+					if err != nil && !errors.Is(err, http.ErrServerClosed) {
+						return err
+					}
+					return nil
+				})
+				g.Go(func() error {
+					<-gctx.Done()
+					shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					defer cancel()
+					return srv.Shutdown(shutdownCtx)
+				})
+			}
+			adminAPI.RegisterRoutes(adminMux)
+			if cfg.AdminToken == "" {
+				plog.Warnf("admin API unprotected (TRPC_ADMIN_TOKEN unset) — dev mode only")
+			}
+			plog.Infof("admin API enabled (/admin/...)")
+
+			// Monthly-ish archival (design 5.1.3): move old session_event /
+			// audit_log rows to the archive tables so the hot tables stay small.
+			archiver := storage.NewArchiver(pgPool,
+				parseDuration(cfg.ArchiveRetention, 30*24*time.Hour),
+				parseDuration(cfg.ArchiveInterval, 24*time.Hour))
+			g.Go(func() error { archiver.Run(gctx); return nil })
+		}
 	}
 
 	// Queue depth / pending gauges feeding the alerts of design 5.2.4.
 	metrics.StartStreamCollector(gctx, stream, 15*time.Second)
-
-	// Storage migration executor (design 5.2.6): advances active migrations
-	// through backfilling → read switch → observation → done.
-	if pgPool != nil {
-		migrator := storage.NewMigrator(pgPool, rdb, sessByType,
-			parseDuration(cfg.MigrationObserve, 24*time.Hour))
-		g.Go(func() error { migrator.Run(gctx); return nil })
-	}
-
-	// Graceful shutdown: stop pulling new messages first, let in-flight
-	// processing finish, then close the HTTP server.
-	g.Go(func() error {
-		<-gctx.Done()
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		return srv.Shutdown(shutdownCtx)
-	})
 
 	return g.Wait()
 }
@@ -268,8 +393,9 @@ func startPGConsumers(ctx context.Context, cfg config.Config) (*storage.Auditor,
 
 // startWecom builds the WeCom channel from env config; it returns nil (with a
 // warning) when the channel is not configured or its secrets are missing, so
-// the rest of the platform keeps serving the other channels.
-func startWecom(cfg config.Config) *wecom.Channel {
+// the rest of the platform keeps serving the other channels. media is the
+// artifact store for inbound media_id fetches (nil degrades to placeholders).
+func startWecom(cfg config.Config, media channels.MediaStore, secrets config.SecretResolver) *wecom.Channel {
 	if cfg.WecomCorpID == "" {
 		return nil
 	}
@@ -285,7 +411,8 @@ func startWecom(cfg config.Config) *wecom.Channel {
 		AESKeyRef: cfg.WecomAESKeyRef,
 		SecretRef: cfg.WecomSecretRef,
 		APIBase:   cfg.WecomAPIBase,
-	}, config.NewFileResolver(cfg.SecretsDir))
+		Media:     media,
+	}, secrets)
 	if err != nil {
 		plog.Warnf("wecom channel disabled: %v", err)
 		return nil
@@ -294,12 +421,34 @@ func startWecom(cfg config.Config) *wecom.Channel {
 	return wc
 }
 
+// startWxkf builds the WeChat KF channel from env config (design 5.3.1 通道二);
+// same degradation rule as startWecom.
+func startWxkf(cfg config.Config, secrets config.SecretResolver) *wxkf.Channel {
+	if cfg.WxkfCorpID == "" || cfg.WxkfKfAccount == "" {
+		return nil
+	}
+	ch, err := wxkf.New(wxkf.Config{
+		CorpID:    cfg.WxkfCorpID,
+		KfAccount: cfg.WxkfKfAccount,
+		TokenRef:  cfg.WxkfTokenRef,
+		AESKeyRef: cfg.WxkfAESKeyRef,
+		SecretRef: cfg.WxkfSecretRef,
+		APIBase:   cfg.WxkfAPIBase,
+	}, secrets)
+	if err != nil {
+		plog.Warnf("wxkf channel disabled: %v", err)
+		return nil
+	}
+	plog.Infof("wxkf channel enabled (callback: POST /wxkf/callback)")
+	return ch
+}
+
 // buildSessionServices builds one session service per supported backend
 // (design 5.1.1 受控菜单) plus the platform default selection. WithEnableTracing
 // is required beyond observability: with tracing disabled, the redis session
 // service's startSpan falls back to the caller's active span and its defer
 // span.End() would end OUR worker span prematurely (framework quirk).
-func buildSessionServices(ctx context.Context, cfg config.Config, pgPool *pgxpool.Pool) (map[string]session.Service, string, error) {
+func buildSessionServices(ctx context.Context, cfg config.Config, pgPool *pgxpool.Pool, secrets config.SecretResolver) (map[string]session.Service, string, error) {
 	byType := map[string]session.Service{}
 	rs, err := sessionredis.NewService(
 		sessionredis.WithRedisClientURL("redis://"+cfg.RedisAddr),
@@ -311,7 +460,7 @@ func buildSessionServices(ctx context.Context, cfg config.Config, pgPool *pgxpoo
 	byType["redis"] = rs
 	if pgPool != nil {
 		var sessOpts []storage.PGSessionOption
-		if sm := buildSummarizer(ctx, cfg); sm != nil {
+		if sm := buildSummarizer(ctx, cfg, secrets); sm != nil {
 			sessOpts = append(sessOpts, storage.WithSummarizer(sm))
 		}
 		byType["postgres"] = storage.NewPGSessionService(pgPool, sessOpts...)
@@ -328,7 +477,7 @@ func buildSessionServices(ctx context.Context, cfg config.Config, pgPool *pgxpoo
 
 // buildArtifact builds the S3-compatible artifact store (design: Artifact =
 // S3, MinIO locally); unreachable endpoints degrade to nil with a warning.
-func buildArtifact(cfg config.Config) artifact.Service {
+func buildArtifact(cfg config.Config, secrets config.SecretResolver) artifact.Service {
 	if cfg.S3Endpoint == "" {
 		return nil
 	}
@@ -339,7 +488,7 @@ func buildArtifact(cfg config.Config) artifact.Service {
 		Bucket:       cfg.S3Bucket,
 		Secure:       cfg.S3Secure == "true",
 		Prefix:       "artifact/",
-		Secrets:      config.NewFileResolver(cfg.SecretsDir),
+		Secrets:      secrets,
 	})
 	if err != nil {
 		plog.Warnf("artifact store unavailable (%v), artifacts disabled", err)
@@ -356,7 +505,7 @@ func buildArtifact(cfg config.Config) artifact.Service {
 // auditing. Apps whose model key is missing are served by the echo fallback,
 // so the pipeline stays demoable without LLM access.
 // The returned cleanup closes resources.
-func buildProcessor(ctx context.Context, cfg config.Config, rdb *redis.Client, auditor *storage.Auditor, pgPool *pgxpool.Pool, kb *knowledge.BuiltinKnowledge, resolver *tenant.Resolver, sessByType map[string]session.Service, defaultSess string, artifacts artifact.Service) (agent.Processor, func()) {
+func buildProcessor(ctx context.Context, cfg config.Config, rdb *redis.Client, auditor *storage.Auditor, pgPool *pgxpool.Pool, kb *knowledge.BuiltinKnowledge, resolver *tenant.Resolver, sessByType map[string]session.Service, defaultSess string, artifacts artifact.Service, secrets config.SecretResolver) (agent.Processor, func()) {
 	noop := func() {}
 
 	registry := tool.DemoTools()
@@ -397,7 +546,7 @@ func buildProcessor(ctx context.Context, cfg config.Config, rdb *redis.Client, a
 	// endpoint the service gains semantic recall (async embedding worker).
 	var memService memory.Service
 	if pgPool != nil {
-		if emb, _, err := buildEmbedder(ctx, cfg); err == nil && emb != nil {
+		if emb, _, err := buildEmbedder(ctx, cfg, secrets); err == nil && emb != nil {
 			memService = storage.NewPGMemoryService(pgPool, storage.WithMemoryEmbedder(emb))
 		} else {
 			memService = storage.NewPGMemoryService(pgPool)
@@ -418,7 +567,7 @@ func buildProcessor(ctx context.Context, cfg config.Config, rdb *redis.Client, a
 	}
 	assembler := agent.NewAssembler(agent.AssemblerConfig{
 		Apps:      apps,
-		Secrets:   config.NewFileResolver(cfg.SecretsDir),
+		Secrets:   secrets,
 		Registry:  registry,
 		Memory:    memService,
 		Knowledge: kbIface,
@@ -439,16 +588,27 @@ func buildProcessor(ctx context.Context, cfg config.Config, rdb *redis.Client, a
 	})
 	plog.Infof("per-app runner assembler ready (model default=%s, timeout=%s, session backends=%v)",
 		cfg.ModelName, timeout, slices.Sorted(maps.Keys(sessByType)))
-	return wrap(assembler), func() { _ = assembler.Close() }
+	guarded := wrap(assembler).(*agent.Guarded)
+	// Recall events mark the session state on the tenant's session backend
+	// (design 5.3.2); the marker is best-effort and never blocks the ack.
+	guarded.StateMark = func(ctx context.Context, msg channels.InboundMessage, key string, value []byte) error {
+		svc, err := assembler.SessionServiceFor(ctx, msg.AppID)
+		if err != nil {
+			return err
+		}
+		return svc.UpdateSessionState(ctx,
+			session.Key{AppName: msg.AppID, UserID: msg.UserID, SessionID: msg.SessionKey},
+			session.StateMap{key: value})
+	}
+	return guarded, func() { _ = assembler.Close() }
 }
 
 // buildSummarizer builds the framework session summarizer on the platform
 // default model. Summarization is a background maintenance job, so it uses
 // the env default model rather than per-tenant model config. Without a model
 // key, summaries are disabled and sessions always replay in full.
-func buildSummarizer(ctx context.Context, cfg config.Config) sessionsummary.SessionSummarizer {
-	resolver := config.NewFileResolver(cfg.SecretsDir)
-	key, err := resolver.Resolve(ctx, cfg.ModelAPIKeyRef)
+func buildSummarizer(ctx context.Context, cfg config.Config, secrets config.SecretResolver) sessionsummary.SessionSummarizer {
+	key, err := secrets.Resolve(ctx, cfg.ModelAPIKeyRef)
 	if err != nil {
 		plog.Warnf("model key %q unavailable (%v), session summaries disabled", cfg.ModelAPIKeyRef, err)
 		return nil
@@ -491,15 +651,62 @@ func parseDuration(s string, def time.Duration) time.Duration {
 	return v
 }
 
+// adminTLSConfig builds the mTLS config for the split admin listener (design
+// 5.4: 管理端鉴权 mTLS 或 SSO token 二选一). Nil when the three envs are not
+// all set; set means TLS + verified client certificates.
+func adminTLSConfig(cfg config.Config) (*tls.Config, error) {
+	if cfg.AdminTLSCert == "" || cfg.AdminTLSKey == "" || cfg.AdminTLSClientCA == "" {
+		return nil, nil
+	}
+	cert, err := tls.LoadX509KeyPair(cfg.AdminTLSCert, cfg.AdminTLSKey)
+	if err != nil {
+		return nil, fmt.Errorf("admin tls keypair: %w", err)
+	}
+	ca, err := os.ReadFile(cfg.AdminTLSClientCA)
+	if err != nil {
+		return nil, fmt.Errorf("admin tls client ca: %w", err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(ca) {
+		return nil, fmt.Errorf("admin tls client ca %s: no PEM certificates", cfg.AdminTLSClientCA)
+	}
+	return &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+		ClientCAs:    pool,
+		MinVersion:   tls.VersionTLS12,
+	}, nil
+}
+
+// buildSecretResolver builds the secret backend (design 决策三): the file
+// resolver for local development, the KMS sidecar when TRPC_SECRET_RESOLVER=kms
+// (its bearer token bootstraps from the file resolver), and in both cases the
+// short-TTL cache that absorbs a KMS blip.
+func buildSecretResolver(ctx context.Context, cfg config.Config) config.SecretResolver {
+	file := config.NewFileResolver(cfg.SecretsDir)
+	base := config.SecretResolver(file)
+	if cfg.SecretResolverType == "kms" {
+		token, err := file.Resolve(ctx, cfg.KMSTokenRef)
+		if err != nil {
+			plog.Warnf("KMS token %q unavailable (%v), falling back to file resolver", cfg.KMSTokenRef, err)
+		} else if kms, err := config.NewKMSResolver(cfg.KMSEndpoint, token); err != nil {
+			plog.Warnf("KMS resolver unavailable (%v), falling back to file resolver", err)
+		} else {
+			base = kms
+			plog.Infof("secret resolver: kms (%s)", cfg.KMSEndpoint)
+		}
+	}
+	return config.NewCachedResolver(base, parseDuration(cfg.SecretCacheTTL, time.Minute))
+}
+
 // buildEmbedder builds the OpenAI-compatible embeddings client shared by
 // Knowledge and memory semantic recall; (nil, 0, nil) when TRPC_EMBEDDER_MODEL
 // is unset — the default chat endpoint (DeepSeek) has no embeddings API.
-func buildEmbedder(ctx context.Context, cfg config.Config) (embedder.Embedder, int, error) {
+func buildEmbedder(ctx context.Context, cfg config.Config, secrets config.SecretResolver) (embedder.Embedder, int, error) {
 	if cfg.EmbedderModel == "" {
 		return nil, 0, nil
 	}
-	resolver := config.NewFileResolver(cfg.SecretsDir)
-	key, err := resolver.Resolve(ctx, cfg.EmbedderKeyRef)
+	key, err := secrets.Resolve(ctx, cfg.EmbedderKeyRef)
 	if err != nil {
 		return nil, 0, fmt.Errorf("embedder key %q: %w", cfg.EmbedderKeyRef, err)
 	}
@@ -518,8 +725,8 @@ func buildEmbedder(ctx context.Context, cfg config.Config) (embedder.Embedder, i
 // buildKnowledge builds the pgvector-backed knowledge base when an
 // embeddings-capable endpoint is configured; otherwise it returns nil and the
 // agent runs without knowledge retrieval.
-func buildKnowledge(ctx context.Context, cfg config.Config) *knowledge.BuiltinKnowledge {
-	emb, dim, err := buildEmbedder(ctx, cfg)
+func buildKnowledge(ctx context.Context, cfg config.Config, secrets config.SecretResolver) *knowledge.BuiltinKnowledge {
+	emb, dim, err := buildEmbedder(ctx, cfg, secrets)
 	if err != nil {
 		plog.Warnf("embedder unavailable (%v), knowledge disabled", err)
 		return nil

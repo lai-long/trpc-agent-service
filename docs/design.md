@@ -169,13 +169,14 @@ sequenceDiagram
   | `trpcservice/tenant` | 租户模型与路由：租户/应用/绑定的加载与缓存、tenant_id 全链路透传、租户级配置解析 | 新建，平台层核心 |
   | `trpcservice/agent` | Agent 定义与 Runner 装配：按 `agent_app` 配置组装 Agent（prompt/模型/工具），调用 runner.Runner | 基于框架扩展点实现 |
   | `trpcservice/tool` | 平台内置工具注册与租户级工具权限过滤 | 基于框架 Tool 扩展点实现 |
-  | `trpcservice/skill` | 租户级 Skill（可复用能力包）的加载与挂载 | 基于框架扩展点实现 |
   | `trpcservice/config` | 服务自身配置（端口、DB、Redis、KMS 地址）与 Secret Resolver 抽象 | 新建 |
   | `trpcservice/web` | Admin API + Gateway HTTP 入口：租户/应用/绑定 CRUD、IM 回调接收 | 新建 |
   | `trpcservice/metrics` | OTel trace/metrics 初始化与通用埋点（复用框架 Telemetry Hooks） | 基于框架扩展点实现 |
   | `trpcservice/log` | 结构化日志，密钥脱敏中间件 | 新建 |
-  | `trpcservice/workspace` | 运行时工作目录与临时文件管理（Artifact 落地中转） | 新建 |
   | `cmd/trpc-service` | 进程入口：按启动参数以 gateway / worker / admin / all-in-one 角色启动 | 新建 |
+
+  注：设计中的 `skill`（租户级能力包）与 `workspace`（Artifact 落盘中转）两个目录当前未交付实现，
+  已从代码树移除；框架自带 skill 加载能力，需要时按 `llmagent` skill 扩展点接入即可。
   | `trpcservice/storage` | Storage Adapter：Session/Memory/Knowledge/Artifact 四类框架接口的多后端实现（Redis/PG），含审计日志 PG 写入；租户级可配 | 新建，实现框架已有接口 |
   | Guardrail 链 | 输入白名单/脱敏、输出预算/敏感词，产出审计事件 | 基于框架 Plugin/Guardrail 扩展点实现 |
 
@@ -519,7 +520,7 @@ PG 要求分区键包含在所有唯一约束中，与 `(session_id, event_seq)`
 | `stream:outbound` | Stream | `stream:outbound` | 回复消息 JSON | 队列 MAXLEN 10 万条截断 | Worker→Channel Adapter 出站队列，消费组 `senders` |
 | `dedup:{channel}:{msg_id}` | String | `dedup:wecom:msg123` | `1` 或请求 ID | 24 小时 | 消息幂等 |
 | `lock:sess:{session_id}` | String | `lock:sess:8b3c...` | 请求唯一标识 | 5–10 秒 | 防止并发修改同一会话 |
-| `sent:{session_id}:{event_seq}` | String | `sent:8b3c...:1024` | IM 返回的消息 ID | 24 小时 | 出站回复幂等，防发送重试造成 IM 侧重复消息 |
+| `sent:{channel}:{msg_id}` | String | `sent:wecom:msg123` | IM 返回的消息 ID | 24 小时 | 出站回复幂等，防发送重试造成 IM 侧重复消息。实现注：幂等单元取「入站消息的回复」（一条入站一条回复），比 `{session_id}:{event_seq}` 更贴合出站消费语义，效果等价 |
 
 Session 存储优先复用框架后端（`session/redis` / `session/postgres`），平台不自建会话缓存层。
 框架后端须同时满足三点——`(session_id, event_seq)` 级幂等唯一约束、summary 覆盖游标语义、
@@ -552,7 +553,7 @@ SET dedup:{channel}:{msg_id} {request_id} NX EX 86400
   被 XCLAIM 重投时不经过 Gateway，dedup 管不到；重复消费会产生相同 event_seq 的事件，
   被数据库唯一约束拒绝，事件层保证不重复。
 
-出站幂等：出站消费组发送前先查 `sent:{session_id}:{event_seq}`，命中说明已发过，直接 XACK；
+出站幂等：出站消费组发送前先查 `sent:{channel}:{msg_id}`（见上表实现注），命中说明已发过，直接 XACK；
 未命中则调 IM 发送接口，成功后写入该 key 再 XACK。「发送成功但 ACK 前崩溃」导致的重投
 不会让用户收到重复回复。
 
@@ -730,14 +731,16 @@ Go 并发安全专项（Worker 长进程不泄漏）：
 Guardrail 命中需审批的工具调用时走带内确认，不引入带外审批系统：
 
 1. Guardrail 拦截工具调用，当前执行轮次收尾：经 Outbound 向用户发送确认消息（工具名、
-   参数摘要、有效期），`session.state` 写入 `pending_approval`（工具调用 ID + 截止时间），
-   审计记 `decision=review`，随后释放会话锁——挂起期间不持锁，Worker 保持无状态。
+   参数摘要、有效期），写入待审批记录（工具调用 ID + 截止时间），审计记 `decision=review`，
+   随后释放会话锁——挂起期间不持锁，Worker 保持无状态。
+   （实现注：待审批记录存 Redis `approval:{session_key}` 而非 `session.state`——同为节点共享
+   持久化，但带原生 TTL、无需加载整个 session 即可读，且不占事件序列；语义等价。）
 2. 用户在 IM 内回复「确认/拒绝」：作为普通消息进入同一 `session_key`，分布式锁保证与
-   其他执行串行；Worker 加载 state 检出 `pending_approval`，由 Guardrail 先做答复匹配——
+   其他执行串行；Worker 检出待审批记录，由 Guardrail 先做答复匹配——
    仅精确匹配确认/拒绝指令（或按钮回调事件）才消费为审批答复：确认人、调用 ID 匹配且未超时
    则放行原工具调用，明确拒绝则终止并告知用户。
 3. **非答复消息不打断审批**：挂起期间用户发送的其他内容不匹配答复格式，既不作为审批答复
-   消费，也不终止 `pending_approval`——按普通新消息走正常处理流程，审批继续挂起至超时。
+   消费，也不终止待审批记录——按普通新消息走正常处理流程，审批继续挂起至超时。
    （避免用户随口一句话意外作废待审批的危险操作；该消息若触发新的危险工具调用，按第 5 条处理。）
 4. 超时（默认 5 分钟，租户可配）按拒绝处理，审计记 `review_timeout`。
 5. **同一会话同一时刻只允许一个 `pending_approval`**：已有挂起审批时，新的危险工具调用

@@ -213,3 +213,87 @@ func TestVerifyURL(t *testing.T) {
 		t.Fatalf("verify failed: status=%d body=%q", rec.Code, rec.Body.String())
 	}
 }
+
+// fakeMediaStore captures SaveMedia calls.
+type fakeMediaStore struct{ refs []string }
+
+func (f *fakeMediaStore) SaveMedia(_ context.Context, channel, msgID, filename, mime string, data []byte) (string, error) {
+	f.refs = append(f.refs, filename)
+	return "s3://bucket/artifact/" + filename, nil
+}
+
+func TestCallbackRecall(t *testing.T) {
+	c := testChannel(t, "")
+	var got channels.InboundMessage
+	mux := http.NewServeMux()
+	c.RegisterRoutes(mux, channels.HandlerFunc(func(_ context.Context, msg channels.InboundMessage) (channels.OutboundMessage, error) {
+		got = msg
+		return channels.OutboundMessage{}, nil
+	}))
+
+	inner := `<xml><ToUserName><![CDATA[ww1234567890]]></ToUserName><FromUserName><![CDATA[zhangsan]]></FromUserName><CreateTime>1700000000</CreateTime><MsgType><![CDATA[event]]></MsgType><Event><![CDATA[revoke]]></Event><MsgId>555000111</MsgId><AgentID>1000002</AgentID></xml>`
+	body, query := forgeCallback(t, inner)
+	req := httptest.NewRequest(http.MethodPost, "/wecom/callback?"+query, strings.NewReader(string(body)))
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("recall callback status = %d", rec.Code)
+	}
+	if got.Type != channels.TypeRecall {
+		t.Fatalf("want recall type, got %+v", got)
+	}
+	// The recall gets its own dedup namespace so it is never dropped as a
+	// duplicate of the recalled message.
+	if got.MsgID != "recall:555000111" {
+		t.Fatalf("recall msg id must be namespaced, got %q", got.MsgID)
+	}
+}
+
+func TestCallbackMedia(t *testing.T) {
+	// Fake WeCom API: token + media download.
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasPrefix(r.URL.Path, "/cgi-bin/gettoken"):
+			_, _ = w.Write([]byte(`{"access_token":"t-1","expires_in":7200}`))
+		case strings.HasPrefix(r.URL.Path, "/cgi-bin/media/get"):
+			w.Header().Set("Content-Type", "image/jpeg")
+			_, _ = w.Write([]byte("jpeg-bytes"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer api.Close()
+
+	c, err := New(Config{
+		CorpID: testCorpID, AgentID: 1000002,
+		TokenRef: "tok", AESKeyRef: "aes", SecretRef: "secret", APIBase: api.URL,
+		Media: &fakeMediaStore{},
+	}, mapResolver{"tok": testToken, "aes": testAESKey, "secret": "corp-secret"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got channels.InboundMessage
+	mux := http.NewServeMux()
+	c.RegisterRoutes(mux, channels.HandlerFunc(func(_ context.Context, msg channels.InboundMessage) (channels.OutboundMessage, error) {
+		got = msg
+		return channels.OutboundMessage{}, nil
+	}))
+
+	inner := `<xml><ToUserName><![CDATA[ww1234567890]]></ToUserName><FromUserName><![CDATA[zhangsan]]></FromUserName><CreateTime>1700000000</CreateTime><MsgType><![CDATA[image]]></MsgType><PicUrl><![CDATA[https://wework.qpic.cn/x]]></PicUrl><MediaId><![CDATA[MEDIA123]]></MediaId><MsgId>777000222</MsgId><AgentID>1000002</AgentID></xml>`
+	body, query := forgeCallback(t, inner)
+	req := httptest.NewRequest(http.MethodPost, "/wecom/callback?"+query, strings.NewReader(string(body)))
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("media callback status = %d", rec.Code)
+	}
+	if got.Type != channels.TypeMedia {
+		t.Fatalf("want media type, got %+v", got)
+	}
+	if !strings.HasPrefix(got.MediaRef, "s3://bucket/artifact/") || !strings.HasSuffix(got.MediaRef, ".jpg") {
+		t.Fatalf("media must land in the artifact store with a reference: %q", got.MediaRef)
+	}
+	if !strings.Contains(got.Text, "图片") {
+		t.Fatalf("media text must carry a placeholder: %q", got.Text)
+	}
+}

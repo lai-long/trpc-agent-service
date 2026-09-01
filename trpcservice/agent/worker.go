@@ -88,6 +88,12 @@ type Worker struct {
 	// the lock before being re-queued.
 	LockTTL  time.Duration
 	LockWait time.Duration
+
+	// DrainTimeout bounds the graceful shutdown drain (design 5.2.2 进程退出
+	// 时先停止拉新消息、排空在途会话后再退出): after Run's ctx is canceled
+	// the in-flight message keeps processing until it finishes or this
+	// timeout forces cancellation.
+	DrainTimeout time.Duration
 }
 
 func (w *Worker) reapInterval() time.Duration {
@@ -125,6 +131,13 @@ func (w *Worker) lockWait() time.Duration {
 	return 15 * time.Second
 }
 
+func (w *Worker) drainTimeout() time.Duration {
+	if w.DrainTimeout > 0 {
+		return w.DrainTimeout
+	}
+	return 2 * time.Minute
+}
+
 func (w *Worker) inStream() string {
 	if w.InStream != "" {
 		return w.InStream
@@ -142,7 +155,20 @@ func (w *Worker) outStream() string {
 // Run consumes until ctx is canceled; a nil return means a clean shutdown.
 // Every reapInterval it also takes over pending messages orphaned by crashed
 // consumers (XCLAIM semantics via XAUTOCLAIM).
+//
+// Graceful drain (design 5.2.2): on shutdown the worker stops pulling new
+// messages, and the in-flight message keeps its own process context — it
+// finishes (or force-cancels at DrainTimeout) before Run returns, so a
+// rolling update does not interrupt a session mid-run.
 func (w *Worker) Run(ctx context.Context) error {
+	// processCtx outlives the stop signal: handlers use it instead of ctx.
+	processCtx, stopProcessing := context.WithCancel(context.Background())
+	defer stopProcessing()
+	go func() {
+		<-ctx.Done()
+		time.AfterFunc(w.drainTimeout(), stopProcessing)
+	}()
+
 	lastReap := time.Now()
 	for {
 		if ctx.Err() != nil {
@@ -150,7 +176,7 @@ func (w *Worker) Run(ctx context.Context) error {
 		}
 
 		if time.Since(lastReap) >= w.reapInterval() {
-			w.reap(ctx)
+			w.reap(processCtx)
 			lastReap = time.Now()
 		}
 
@@ -171,7 +197,7 @@ func (w *Worker) Run(ctx context.Context) error {
 		}
 
 		for _, m := range msgs {
-			w.handle(ctx, m)
+			w.handle(processCtx, m)
 		}
 	}
 }
@@ -224,6 +250,15 @@ func (w *Worker) handle(ctx context.Context, m storage.Message) {
 		metrics.ProcessErrorTotal.Add(ctx, 1, processAttr(msg))
 		plog.Errorf("worker %s process %s failed: %v", w.Name, m.ID, err)
 		span.RecordError(err)
+		return
+	}
+
+	// An empty reply means "handled, nothing to send" (recall events): ack
+	// without an outbound hop.
+	if out.Text == "" {
+		if err := w.Stream.Ack(ctx, w.inStream(), "workers", m.ID); err != nil {
+			plog.Warnf("worker %s ack %s: %v", w.Name, m.ID, err)
+		}
 		return
 	}
 

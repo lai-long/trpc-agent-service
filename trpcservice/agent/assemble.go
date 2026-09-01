@@ -349,6 +349,20 @@ func (a *Assembler) activeMigration(tenantID string) *tenant.Migration {
 	return a.cfg.Apps.ActiveMigration(tenantID, "session")
 }
 
+// SessionServiceFor resolves the session backend of the given app (tenant
+// routing + migration fanout), for out-of-band state writes such as the
+// recall marker (design 5.3.2).
+func (a *Assembler) SessionServiceFor(ctx context.Context, appID string) (session.Service, error) {
+	if a.cfg.Apps == nil {
+		return nil, errors.New("no app provider")
+	}
+	_, t, err := a.cfg.Apps.AppByID(ctx, appID)
+	if err != nil {
+		return nil, err
+	}
+	return a.sessionServiceFor(t), nil
+}
+
 // migrationFingerprint distinguishes assemblies built under different
 // migration states so a phase change rebuilds the runner.
 func migrationFingerprint(m *tenant.Migration) []byte {

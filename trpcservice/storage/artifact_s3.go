@@ -319,3 +319,15 @@ func validateArtifactFilename(filename string) error {
 	}
 	return nil
 }
+
+// SaveMedia implements channels.MediaStore: IM media fetched by channel
+// adapters lands under a media-scoped session tree and the reference handed
+// to the message pipeline is a compact "s3://bucket/key" string (the agent
+// only ever sees the reference, design 5.3.2).
+func (s *S3ArtifactService) SaveMedia(ctx context.Context, channel, msgID, filename, mimeType string, data []byte) (string, error) {
+	info := artifact.SessionInfo{AppName: "inbound-media", UserID: channel, SessionID: msgID}
+	if _, err := s.SaveArtifact(ctx, info, filename, &artifact.Artifact{Data: data, MimeType: mimeType}); err != nil {
+		return "", err
+	}
+	return "s3://" + s.bucket + "/" + s.objectKey(info, filename, 0), nil
+}

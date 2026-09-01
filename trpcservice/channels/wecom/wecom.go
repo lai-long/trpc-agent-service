@@ -21,6 +21,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -55,6 +56,9 @@ type Config struct {
 	AESKeyRef string // EncodingAESKey secret ref
 	SecretRef string // corpsecret secret ref (for access_token)
 	APIBase   string // default https://qyapi.weixin.qq.com
+	// Media stores fetched media_id content (design 5.3.2); nil degrades
+	// media messages to a placeholder text.
+	Media channels.MediaStore
 }
 
 // Channel is the WeCom implementation of channels.Channel.
@@ -63,6 +67,9 @@ type Channel struct {
 	crypt  *wxbizmsgcrypt.WXBizMsgCrypt
 	secret config.SecretResolver
 	client *http.Client
+	// media is the artifact store for inbound media_id fetches (design
+	// 5.3.2); nil degrades media messages to a placeholder text.
+	media channels.MediaStore
 
 	tokenMu     sync.Mutex
 	accessToken string
@@ -92,6 +99,7 @@ func New(cfg Config, resolver config.SecretResolver) (*Channel, error) {
 		crypt:  wxbizmsgcrypt.NewWXBizMsgCrypt(token, aesKey, cfg.CorpID, wxbizmsgcrypt.XmlType),
 		secret: resolver,
 		client: &http.Client{Timeout: 10 * time.Second},
+		media:  cfg.Media,
 	}, nil
 }
 
@@ -148,10 +156,25 @@ func (c *Channel) receive(w http.ResponseWriter, r *http.Request, h channels.Han
 		writeSuccess(w)
 		return
 	}
-	// Only text messages enter the pipeline; events (enter_agent, ...) and
-	// media-only messages are acked and skipped (media handling is a 5.3.2
-	// follow-up). Text without a MsgId cannot be deduplicated — skip it too.
-	if cm.MsgType != "text" || cm.MsgID == "" {
+	// Only text, media and recall events enter the pipeline; other events
+	// (enter_agent, ...) are acked and skipped. Messages without a MsgId
+	// cannot be deduplicated — skip them too.
+	switch {
+	case cm.MsgType == "text" && cm.MsgID != "":
+		// normal text path below
+	case cm.MsgType == "event" && cm.Event == "revoke" && cm.MsgID != "":
+		// Message recalled (design 5.3.2): the MsgId is the RECALLED message's
+		// id, so the recall gets its own dedup namespace; the guardrail audits
+		// it and marks the session state instead of running the model.
+		msg := c.baseMessage(r, &cm)
+		msg.Type = channels.TypeRecall
+		msg.MsgID = "recall:" + cm.MsgID
+		c.hand(ctxOf(r), w, h, msg, cm.MsgID)
+		return
+	case mediaTypes[cm.MsgType] != "" && cm.MsgID != "":
+		c.receiveMedia(r, w, h, &cm)
+		return
+	default:
 		writeSuccess(w)
 		return
 	}
@@ -163,24 +186,116 @@ func (c *Channel) receive(w http.ResponseWriter, r *http.Request, h channels.Han
 		UserID:      cm.FromUserName,
 		ChatID:      cm.ChatID,
 		Text:        cm.Content,
+		Type:        channels.TypeText,
 		WebhookPath: r.URL.Path,
 		ReceivedAt:  time.Now(),
 	}
-	if _, err := h.Handle(r.Context(), msg); err != nil {
+	c.hand(r.Context(), w, h, msg, cm.MsgID)
+}
+
+// baseMessage builds the shared normalized message skeleton.
+func (c *Channel) baseMessage(r *http.Request, cm *callbackMessage) channels.InboundMessage {
+	return channels.InboundMessage{
+		Channel:     c.Name(),
+		MsgID:       cm.MsgID,
+		SessionKey:  channels.SessionKey(c.Name(), cm.FromUserName, cm.ChatID),
+		UserID:      cm.FromUserName,
+		ChatID:      cm.ChatID,
+		WebhookPath: r.URL.Path,
+		ReceivedAt:  time.Now(),
+	}
+}
+
+func ctxOf(r *http.Request) context.Context { return r.Context() }
+
+// hand runs the handler and maps the outcome onto the callback response:
+// duplicates and success ack 200; failures 5xx so the platform redelivers.
+func (c *Channel) hand(ctx context.Context, w http.ResponseWriter, h channels.Handler, msg channels.InboundMessage, msgID string) {
+	if _, err := h.Handle(ctx, msg); err != nil {
 		if errors.Is(err, channels.ErrDuplicate) {
 			// ErrDuplicate is a success outcome, not a failure: answer 200 so
 			// the platform stops redelivering (see the Handler contract).
-			plog.Warnf("wecom duplicate message %s dropped", cm.MsgID)
+			plog.Warnf("wecom duplicate message %s dropped", msgID)
 			writeSuccess(w)
 			return
 		}
 		// 5xx makes the platform redeliver; the gateway rolls the dedup key
 		// back first so that retry is not swallowed (design 5.1.4).
-		plog.Errorf("wecom handle msg %s: %v", cm.MsgID, err)
+		plog.Errorf("wecom handle msg %s: %v", msgID, err)
 		http.Error(w, "handle error", http.StatusInternalServerError)
 		return
 	}
 	writeSuccess(w)
+}
+
+// receiveMedia fetches the media_id into artifact storage (design 5.3.2:
+// 图片/文件消息只下发 media_id) and normalizes a media message; when the
+// fetch or the store is unavailable, a placeholder text goes through so the
+// agent can still acknowledge the message.
+func (c *Channel) receiveMedia(r *http.Request, w http.ResponseWriter, h channels.Handler, cm *callbackMessage) {
+	msg := c.baseMessage(r, cm)
+	msg.Type = channels.TypeMedia
+	msg.Text = "[" + mediaTypes[cm.MsgType] + "]"
+
+	ref, err := c.fetchMedia(r.Context(), cm)
+	if err != nil {
+		plog.Warnf("wecom media fetch %s: %v", cm.MsgID, err)
+		msg.Text += "（素材拉取失败）"
+	} else {
+		msg.MediaRef = ref
+		msg.Text += " " + ref
+	}
+	c.hand(r.Context(), w, h, msg, cm.MsgID)
+}
+
+// fetchMedia downloads media via the platform media/get API and stores it.
+func (c *Channel) fetchMedia(ctx context.Context, cm *callbackMessage) (string, error) {
+	if c.media == nil {
+		return "", errors.New("media store not configured")
+	}
+	token, err := c.getAccessToken(ctx)
+	if err != nil {
+		return "", err
+	}
+	apiURL := c.cfg.APIBase + "/cgi-bin/media/get?access_token=" + url.QueryEscape(token) +
+		"&media_id=" + url.QueryEscape(cm.MediaID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("wecom media get: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("wecom media get: status %d", resp.StatusCode)
+	}
+	data, err := io.ReadAll(http.MaxBytesReader(nil, resp.Body, 20<<20))
+	if err != nil {
+		return "", err
+	}
+	mime := resp.Header.Get("Content-Type")
+	filename := cm.MsgID + "." + mediaFileExt(cm.MsgType, mime)
+	return c.media.SaveMedia(ctx, c.Name(), cm.MsgID, filename, mime, data)
+}
+
+// mediaFileExt picks a file extension from the message type / content type.
+func mediaFileExt(msgType, mime string) string {
+	if msgType == "voice" {
+		return "amr"
+	}
+	if msgType == "file" {
+		return "bin"
+	}
+	switch {
+	case strings.Contains(mime, "png"):
+		return "png"
+	case strings.Contains(mime, "gif"):
+		return "gif"
+	default:
+		return "jpg"
+	}
 }
 
 // callbackMessage is the decrypted inner XML of a WeCom callback.
@@ -191,9 +306,18 @@ type callbackMessage struct {
 	MsgType      string   `xml:"MsgType"`
 	Content      string   `xml:"Content"`
 	MsgID        string   `xml:"MsgId"`
+	MediaID      string   `xml:"MediaId"` // image/voice/file carry a media_id, not content
+	PicUrl       string   `xml:"PicUrl"`
 	AgentID      int      `xml:"AgentID"`
 	ChatID       string   `xml:"ChatId"` // group chat ID; empty for direct chats
 	Event        string   `xml:"Event"`
+}
+
+// mediaTypes are the callback msgtypes carrying a media_id instead of text.
+var mediaTypes = map[string]string{
+	"image": "图片",
+	"voice": "语音",
+	"file":  "文件",
 }
 
 func writeSuccess(w http.ResponseWriter) {
@@ -243,24 +367,30 @@ func (c *Channel) sendSegment(ctx context.Context, msg channels.OutboundMessage,
 	return nil
 }
 
-// postMessage calls the send API and returns the platform errcode.
+// postMessage calls the send API and returns the platform errcode. Markdown
+// replies use the markdown msgtype (WeCom renders it; channels without
+// markdown downgrade upstream via channels.RenderPlain).
 func (c *Channel) postMessage(ctx context.Context, token string, msg channels.OutboundMessage, text string) (int, error) {
+	msgType, contentKey := "text", "text"
+	if msg.TextType == "markdown" {
+		msgType, contentKey = "markdown", "markdown"
+	}
 	var apiURL string
 	var payload map[string]any
 	if msg.ChatID != "" {
 		apiURL = c.cfg.APIBase + "/cgi-bin/appchat/send?access_token=" + url.QueryEscape(token)
 		payload = map[string]any{
-			"chatid":  msg.ChatID,
-			"msgtype": "text",
-			"text":    map[string]string{"content": text},
+			"chatid":   msg.ChatID,
+			"msgtype":  msgType,
+			contentKey: map[string]string{"content": text},
 		}
 	} else {
 		apiURL = c.cfg.APIBase + "/cgi-bin/message/send?access_token=" + url.QueryEscape(token)
 		payload = map[string]any{
-			"touser":  msg.UserID,
-			"msgtype": "text",
-			"agentid": c.cfg.AgentID,
-			"text":    map[string]string{"content": text},
+			"touser":   msg.UserID,
+			"msgtype":  msgType,
+			"agentid":  c.cfg.AgentID,
+			contentKey: map[string]string{"content": text},
 		}
 	}
 	body, err := json.Marshal(payload)

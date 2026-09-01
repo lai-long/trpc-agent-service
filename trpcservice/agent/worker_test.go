@@ -88,3 +88,67 @@ func TestWorkerSenderRoundTrip(t *testing.T) {
 	}
 	t.Fatal("reply did not arrive in mock inbox within 5s")
 }
+
+// emptyProcessor replies with an empty text (recall events and the like).
+type emptyProcessor struct{}
+
+func (emptyProcessor) Process(_ context.Context, msg channels.InboundMessage) (channels.OutboundMessage, error) {
+	return channels.OutboundMessage{Channel: msg.Channel, MsgID: msg.MsgID,
+		SessionKey: msg.SessionKey, UserID: msg.UserID, TenantID: msg.TenantID}, nil
+}
+
+// An empty reply is handled-and-done: the message is acked without an
+// outbound hop (design 5.3.2 撤回 never replies).
+func TestWorkerSkipsOutboundForEmptyReply(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	rdb, err := storage.NewRedis(ctx, "localhost:6380")
+	if err != nil {
+		t.Skipf("redis unavailable (%v), skipping integration test", err)
+	}
+	t.Cleanup(func() { _ = rdb.Close() })
+
+	stream := storage.NewStream(rdb)
+	inbound := "test:inbound:" + t.Name()
+	outbound := "test:outbound:" + t.Name()
+	t.Cleanup(func() { rdb.Del(context.Background(), inbound, outbound) })
+	if err := stream.EnsureGroup(ctx, inbound, "workers"); err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.EnsureGroup(ctx, outbound, "senders"); err != nil {
+		t.Fatal(err)
+	}
+
+	worker := &agent.Worker{
+		Stream: stream, Processor: emptyProcessor{}, Name: "test-w-empty",
+		InStream: inbound, OutStream: outbound,
+	}
+	go func() { _ = worker.Run(ctx) }()
+
+	payload, _ := json.Marshal(channels.InboundMessage{
+		Channel: "mock", MsgID: "empty-1", SessionKey: "dm:mock:u9",
+		UserID: "u9", Type: channels.TypeRecall, TraceID: "trace-recall",
+	})
+	if _, err := stream.Add(ctx, inbound, payload); err != nil {
+		t.Fatal(err)
+	}
+
+	// The message must be acked (no pending) and nothing enqueued outbound.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		pending, _, err := stream.Pending(ctx, inbound, "workers")
+		if err != nil {
+			t.Fatal(err)
+		}
+		n, _ := stream.Len(ctx, outbound)
+		if pending == 0 {
+			if n != 0 {
+				t.Fatal("empty reply must not enqueue an outbound message")
+			}
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatal("message was not acked within 5s")
+}

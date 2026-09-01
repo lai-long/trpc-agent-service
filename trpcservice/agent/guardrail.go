@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"regexp"
@@ -64,6 +65,9 @@ type Guarded struct {
 	Auditor  auditLogger // nil disables auditing
 	Input    []InputChecker
 	Output   []OutputChecker
+	// StateMark, when set, persists a session-state marker for recall events
+	// (design 5.3.2 撤回: session.state 打标记，不回删 session_event).
+	StateMark func(ctx context.Context, msg channels.InboundMessage, key string, value []byte) error
 }
 
 // Process implements Processor.
@@ -77,6 +81,15 @@ func (g *Guarded) Process(ctx context.Context, msg channels.InboundMessage) (cha
 		attribute.String("tenant_id", msg.TenantID),
 		attribute.String("session_key", msg.SessionKey),
 	)
+
+	// 0. Recall events never reach the model (design 5.3.2 撤回): audit the
+	//    recall, mark the session state (the event journal stays append-only),
+	//    and produce an empty reply — the worker acks without an outbound hop.
+	if msg.Type == channels.TypeRecall {
+		span.SetAttributes(attribute.String("decision", "recall"))
+		g.handleRecall(ctx, msg)
+		return replyShell(msg), nil
+	}
 
 	// 1. A pending approval consumes confirm/reject answers before anything
 	//    else runs.
@@ -203,6 +216,22 @@ func RedactOutput() OutputChecker {
 	}
 }
 
+// handleRecall audits the recall and marks the session state. The recalled
+// message id arrives as "recall:{msgid}" (the adapter namespaces it away from
+// the original message's dedup key).
+func (g *Guarded) handleRecall(ctx context.Context, msg channels.InboundMessage) {
+	recalled := strings.TrimPrefix(msg.MsgID, "recall:")
+	detail, _ := json.Marshal(map[string]string{"recalled_msg_id": recalled})
+	g.syncAuditDetail(msg, auditDecision{decision: "recall"}, detail)
+	if g.StateMark == nil {
+		return
+	}
+	mark, _ := json.Marshal(map[string]any{"at": time.Now().Unix()})
+	if err := g.StateMark(ctx, msg, "recalled:"+recalled, mark); err != nil {
+		plog.Warnf("recall state mark failed (session=%s): %v", msg.SessionKey, err)
+	}
+}
+
 // signalDecision maps an interception signal to its audit event. Re-hitting
 // an already-pending call (Fresh=false) audits nothing: the review was
 // recorded when the pending was first created.
@@ -292,6 +321,12 @@ func (g *Guarded) asyncModelAudit(msg channels.InboundMessage, out channels.Outb
 // review / review_timeout / dangerous-tool execution must not be lost, even
 // at the cost of milliseconds of latency (compliance red line).
 func (g *Guarded) syncAudit(msg channels.InboundMessage, dec auditDecision) {
+	g.syncAuditDetail(msg, dec, nil)
+}
+
+// syncAuditDetail is syncAudit with an optional detail payload (recall events
+// carry the recalled message id).
+func (g *Guarded) syncAuditDetail(msg channels.InboundMessage, dec auditDecision, detail json.RawMessage) {
 	if g.Auditor == nil || dec.decision == "" {
 		return
 	}
@@ -306,6 +341,7 @@ func (g *Guarded) syncAudit(msg channels.InboundMessage, dec auditDecision) {
 		ErrorType: dec.errorType,
 		LatencyMs: dec.latencyMs,
 		TraceID:   msg.TraceID,
+		Detail:    detail,
 	})
 	if err != nil {
 		plog.Errorf("sync audit %s failed: %v", dec.decision, err)

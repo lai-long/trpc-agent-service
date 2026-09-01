@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -20,18 +21,47 @@ import (
 // TenantID/AppID start empty; the Gateway stamps them after resolving
 // WebhookPath through channel_binding (tenant routing).
 type InboundMessage struct {
-	Channel     string    // channel type: mock / wecom / wechat_kf ...
+	Channel     string    // channel type: mock / wecom / wxkf ...
 	MsgID       string    // IM platform message ID, for idempotent dedup (dedup:{channel}:{msg_id})
 	SessionKey  string    // unique conversation key within an app, see SessionKey()
 	UserID      string    // user ID on the IM side (wecom external_userid / wechat openid)
 	ChatID      string    // group chat ID; empty for direct chats
-	Text        string    // text content
+	Text        string    // text content (media messages carry a placeholder)
+	Type        string    // Type* constants; empty means TypeText
+	MediaRef    string    // TypeMedia: artifact reference of the fetched media (design 5.3.2)
 	WebhookPath string    // callback path the message arrived on; routes to tenant/app
 	TenantID    string    // owning tenant UUID, stamped by the Gateway
 	AppID       string    // owning agent app UUID, stamped by the Gateway
 	TraceID     string    // trace ID, spanning callback → Worker → reply
 	TraceParent string    // W3C traceparent, carries the trace across the Stream boundary
 	ReceivedAt  time.Time // when the callback arrived
+}
+
+// Inbound message types (InboundMessage.Type).
+const (
+	// TypeText is a plain text message (the default).
+	TypeText = "text"
+	// TypeMedia is an image/voice/file message: the adapter fetched the
+	// platform's media_id into artifact storage and MediaRef carries the
+	// reference; Text is a human-readable placeholder for the model.
+	TypeMedia = "media"
+	// TypeRecall is a message-recalled event: it never reaches the LLM — the
+	// guardrail audits it and marks the session state (design 5.3.2 撤回).
+	TypeRecall = "recall"
+)
+
+// TextTypeMarkdown marks outbound text carrying markdown markup.
+const TextTypeMarkdown = "markdown"
+
+// LooksMarkdown heuristically detects markdown markup in a reply, so channels
+// that render markdown can use it and others downgrade (RenderPlain).
+func LooksMarkdown(s string) bool {
+	for _, marker := range []string{"```", "**", "## ", "](", "- "} {
+		if strings.Contains(s, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 // OutboundMessage is a normalized outbound reply, produced by the Handler and
@@ -53,6 +83,57 @@ type OutboundMessage struct {
 	PromptTokens     int
 	CompletionTokens int
 	Model            string
+
+	// TextType is the reply markup: "" or "markdown". Channels without
+	// markdown support (e.g. WeChat KF) downgrade via RenderPlain (design
+	// 5.3.2 通道级渲染降级: 卡片 → markdown → 纯文本).
+	TextType string
+}
+
+// RenderPlain strips common markdown syntax for channels that render plain
+// text only (微信客服): bold/italic markers, heading hashes, inline code
+// ticks and link targets are dropped, the visible text is kept.
+func RenderPlain(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c == '*' || c == '`':
+			continue // bold/italic/code markers
+		case c == '#' && (i == 0 || s[i-1] == '\n'):
+			for i+1 < len(s) && s[i+1] == '#' {
+				i++
+			}
+			if i+1 < len(s) && s[i+1] == ' ' {
+				i++
+			}
+			continue // heading prefix
+		case c == '[':
+			// [text](url) → text (url); end is the offset of "]" in s[i:].
+			if end := strings.Index(s[i:], "]("); end > 0 {
+				rest := s[i+end+2:]
+				if close := strings.IndexByte(rest, ')'); close >= 0 {
+					b.WriteString(s[i+1 : i+end])
+					b.WriteString(" (")
+					b.WriteString(rest[:close])
+					b.WriteString(")")
+					i += end + 2 + close
+					continue
+				}
+			}
+			b.WriteByte(c)
+		default:
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
+}
+
+// MediaStore persists IM media fetched by an adapter (design 5.3.2: 素材落
+// Artifact，消息体只带引用). *storage.S3ArtifactService satisfies it.
+type MediaStore interface {
+	SaveMedia(ctx context.Context, channel, msgID, filename, mimeType string, data []byte) (ref string, err error)
 }
 
 // SessionKey builds the unique conversation key:

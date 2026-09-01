@@ -279,3 +279,42 @@ func TestGuardedAuditCarriesUsageAndCost(t *testing.T) {
 		t.Fatalf("cost miscalculated: %+v", ev)
 	}
 }
+
+// A recall event is audited (sync, with the recalled message id in detail)
+// and marked in session state; it never reaches the inner processor and the
+// reply is empty (the worker acks without an outbound hop).
+func TestGuardedRecall(t *testing.T) {
+	aud := &fakeAuditor{}
+	marked := map[string][]byte{}
+	g := &Guarded{
+		Inner:   EchoProcessor{},
+		Auditor: aud,
+		StateMark: func(_ context.Context, msg channels.InboundMessage, key string, value []byte) error {
+			marked[key] = value
+			return nil
+		},
+	}
+	msg := testMsg("")
+	msg.Type = channels.TypeRecall
+	msg.MsgID = "recall:m-42"
+	out, err := g.Process(context.Background(), msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Text != "" {
+		t.Fatalf("recall must not produce a reply, got %q", out.Text)
+	}
+	evs := aud.syncDecisions()
+	if len(evs) != 1 || evs[0].Decision != "recall" {
+		t.Fatalf("want sync recall audit, got %+v", evs)
+	}
+	if !strings.Contains(string(evs[0].Detail), "m-42") {
+		t.Fatalf("audit detail must carry the recalled message id: %s", evs[0].Detail)
+	}
+	if _, ok := marked["recalled:m-42"]; !ok {
+		t.Fatalf("session state not marked: %v", marked)
+	}
+	if n := len(aud.asyncDecisions()); n != 0 {
+		t.Fatalf("recall must not get a routine allow event, got %d", n)
+	}
+}
