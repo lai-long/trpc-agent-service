@@ -326,8 +326,9 @@ func validateArtifactFilename(filename string) error {
 // only ever sees the reference, design 5.3.2).
 func (s *S3ArtifactService) SaveMedia(ctx context.Context, channel, msgID, filename, mimeType string, data []byte) (string, error) {
 	info := artifact.SessionInfo{AppName: "inbound-media", UserID: channel, SessionID: msgID}
-	if _, err := s.SaveArtifact(ctx, info, filename, &artifact.Artifact{Data: data, MimeType: mimeType}); err != nil {
+	ver, err := s.SaveArtifact(ctx, info, filename, &artifact.Artifact{Data: data, MimeType: mimeType})
+	if err != nil {
 		return "", err
 	}
-	return "s3://" + s.bucket + "/" + s.objectKey(info, filename, 0), nil
+	return "s3://" + s.bucket + "/" + s.objectKey(info, filename, ver), nil
 }

@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -191,4 +192,26 @@ type Channel interface {
 	// Send calls the IM proactive-send API (wecom message/send, wechat kf
 	// messages, etc.) to deliver the reply to the user.
 	Send(ctx context.Context, msg OutboundMessage) error
+}
+
+// ScrubError strips credentials from *url.Error values before they reach a
+// log or trace: the WeCom/KF APIs carry access_token (and the corpsecret, on
+// gettoken) in the query string, and net/http embeds the full URL in the
+// error. The field-key log redaction cannot see inside a string, so the
+// scrub happens at the source (design: 密钥零明文红线).
+func ScrubError(err error) error {
+	var ue *url.Error
+	if errors.As(err, &ue) {
+		if u, perr := url.Parse(ue.URL); perr == nil {
+			q := u.Query()
+			for _, k := range []string{"access_token", "corpsecret"} {
+				if q.Has(k) {
+					q.Set(k, "***")
+				}
+			}
+			u.RawQuery = q.Encode()
+			ue.URL = u.String()
+		}
+	}
+	return err
 }

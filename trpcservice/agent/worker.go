@@ -70,6 +70,9 @@ type Worker struct {
 	Stream    *storage.Stream
 	Lock      *storage.Lock // nil disables session locking (single-replica dev)
 	Processor Processor
+	// Processed is the execution-layer idempotency marker (design 5.1.4):
+	// redelivered messages skip reprocessing once done. Nil disables it.
+	Processed *storage.ProcessedMarker
 	Name      string // consumer name identifying pending ownership (e.g. hostname-pid)
 
 	InStream  string // empty means storage.StreamInbound
@@ -224,6 +227,21 @@ func (w *Worker) handle(ctx context.Context, m storage.Message) {
 	)
 	started := time.Now()
 
+	// Execution-layer idempotency (design 5.1.4): a redelivered message whose
+	// reply already made it outbound is acked without reprocessing — the LLM
+	// must not run twice and the journal must not get duplicate events.
+	if w.Processed != nil {
+		done, err := w.Processed.IsDone(ctx, msg.Channel, msg.MsgID)
+		if err != nil {
+			plog.Warnf("worker %s done check %s: %v", w.Name, m.ID, err)
+			// Fall through: better to reprocess than to wedge on a Redis hiccup.
+		} else if done {
+			plog.Infof("worker %s skip already-processed msg %s", w.Name, msg.MsgID)
+			_ = w.Stream.Ack(ctx, w.inStream(), "workers", m.ID)
+			return
+		}
+	}
+
 	// Session lock: serialize concurrent processing of the same session
 	// across replicas. Deferred calls run LIFO: the watchdog stops first,
 	// then the lock is released.
@@ -245,18 +263,24 @@ func (w *Worker) handle(ctx context.Context, m storage.Message) {
 	out, err := w.Processor.Process(ctx, msg)
 	metrics.ProcessDuration.Record(ctx, float64(time.Since(started).Milliseconds()), processAttr(msg))
 	if err != nil {
-		// No Ack: leave it pending for redelivery. Redelivery produces
-		// duplicate events, deduplicated by the (session_id, event_seq)
-		// unique constraint.
+		// No Ack: leave it pending for redelivery. Redelivery of a processed
+		// message is caught by the done marker above; events journaled twice
+		// inside the crash window remain bounded by the (session_id,
+		// event_seq) unique constraint.
 		metrics.ProcessErrorTotal.Add(ctx, 1, processAttr(msg))
 		plog.Errorf("worker %s process %s failed: %v", w.Name, m.ID, err)
 		span.RecordError(err)
 		return
 	}
 
-	// An empty reply means "handled, nothing to send" (recall events): ack
-	// without an outbound hop.
+	// An empty reply means "handled, nothing to send" (recall events): mark
+	// done, ack, no outbound hop.
 	if out.Text == "" {
+		if w.Processed != nil {
+			if err := w.Processed.MarkDone(ctx, msg.Channel, msg.MsgID); err != nil {
+				plog.Warnf("worker %s done mark %s: %v", w.Name, m.ID, err)
+			}
+		}
 		if err := w.Stream.Ack(ctx, w.inStream(), "workers", m.ID); err != nil {
 			plog.Warnf("worker %s ack %s: %v", w.Name, m.ID, err)
 		}
@@ -279,8 +303,14 @@ func (w *Worker) handle(ctx context.Context, m storage.Message) {
 		return
 	}
 
-	// Ack the inbound message only after the reply is enqueued; redelivery
-	// within the crash window is covered by outbound idempotency (sent: key).
+	// Mark done before the Ack: a redelivery after a lost Ack must skip
+	// reprocessing (the reply is already queued; the sent: key covers the
+	// sender side).
+	if w.Processed != nil {
+		if err := w.Processed.MarkDone(ctx, msg.Channel, msg.MsgID); err != nil {
+			plog.Warnf("worker %s done mark %s: %v", w.Name, m.ID, err)
+		}
+	}
 	if err := w.Stream.Ack(ctx, w.inStream(), "workers", m.ID); err != nil {
 		plog.Warnf("worker %s ack %s: %v", w.Name, m.ID, err)
 	}
@@ -355,8 +385,9 @@ func (w *Worker) acquireSession(ctx context.Context, m storage.Message, sessionK
 }
 
 // startLockWatchdog renews the session lock every TTL/3 so long tool calls
-// and slow generations cannot outlive the lease. It exits when ctx is
-// canceled, the lock is lost, or the returned stop is called.
+// and slow generations cannot outlive the lease. A Redis hiccup is retried on
+// the next tick (the TTL has slack for one or two misses); only losing the
+// lock itself (another owner) stops the renewal — the lock is gone anyway.
 func (w *Worker) startLockWatchdog(ctx context.Context, sessionKey, owner string) (stop func()) {
 	done := make(chan struct{})
 	go func() {
@@ -370,8 +401,14 @@ func (w *Worker) startLockWatchdog(ctx context.Context, sessionKey, owner string
 				return
 			case <-ticker.C:
 				ok, err := w.Lock.Extend(ctx, sessionKey, owner, w.lockTTL())
-				if err != nil || !ok {
-					plog.Warnf("worker %s lost session lock %s (extended=%v, err=%v)", w.Name, sessionKey, ok, err)
+				switch {
+				case err != nil:
+					// Transient Redis failure: keep renewing — the lease has
+					// slack for a missed tick, and stopping here would drop
+					// the lock at TTL expiry while processing continues.
+					plog.Warnf("worker %s lock renew %s failed (retrying): %v", w.Name, sessionKey, err)
+				case !ok:
+					plog.Warnf("worker %s lost session lock %s", w.Name, sessionKey)
 					return
 				}
 			}

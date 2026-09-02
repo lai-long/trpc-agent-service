@@ -233,3 +233,53 @@ func TestSenderTenantRateOverride(t *testing.T) {
 	}
 	t.Fatalf("want 3 sends (override tenant not throttled), got %d", ch.Calls())
 }
+
+// A wedged sender's pending reply is taken over and delivered by the reaper
+// (XAUTOCLAIM), symmetric with the worker's crash recovery (design 5.2.2).
+func TestSenderReapsOrphanedPending(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	rdb, err := storage.NewRedis(ctx, "localhost:6380")
+	if err != nil {
+		t.Skipf("redis unavailable (%v), skipping integration test", err)
+	}
+	t.Cleanup(func() { _ = rdb.Close() })
+
+	stream := storage.NewStream(rdb)
+	outbound := "test:reap:out:" + t.Name()
+	t.Cleanup(func() { rdb.Del(context.Background(), outbound) })
+	if err := stream.EnsureGroup(ctx, outbound, "senders"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Plant a pending message owned by a dead consumer: read it (never ack),
+	// then walk away.
+	payload, _ := json.Marshal(channels.OutboundMessage{
+		Channel: "counting", MsgID: "orphan-1", SessionKey: "dm:counting:u1",
+		UserID: "u1", Text: "孤儿回复", TenantID: "t1",
+	})
+	if _, err := stream.Add(ctx, outbound, payload); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stream.Read(ctx, outbound, "senders", "dead-sender", 1, time.Second); err != nil {
+		t.Fatal(err)
+	}
+
+	ch := &countingChannel{}
+	sender := &channels.Sender{
+		Stream: stream, Channels: map[string]channels.Channel{"counting": ch},
+		Name: "test-reaper", InStream: outbound,
+		ReapInterval: 100 * time.Millisecond, MaxIdle: 100 * time.Millisecond,
+	}
+	go func() { _ = sender.Run(ctx) }()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if ch.Calls() >= 1 {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatal("orphaned pending message was not reaped and delivered")
+}

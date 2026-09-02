@@ -75,7 +75,10 @@ func (f *FanoutSessionService) UpdateSessionState(ctx context.Context, key sessi
 
 func (f *FanoutSessionService) AppendEvent(ctx context.Context, sess *session.Session, e *event.Event, opts ...session.Option) error {
 	// Shadow first: a slow secondary must not delay the authoritative write.
-	f.shadow("append_event", f.Secondary.AppendEvent(ctx, sess, e, opts...))
+	// The secondary gets a Clone — AppendEvent mutates the carrier's event
+	// list (UpdateUserSession), and sharing the pointer would append every
+	// event twice into the caller's in-flight session.
+	f.shadow("append_event", f.Secondary.AppendEvent(ctx, sess.Clone(), e, opts...))
 	return f.Primary.AppendEvent(ctx, sess, e, opts...)
 }
 

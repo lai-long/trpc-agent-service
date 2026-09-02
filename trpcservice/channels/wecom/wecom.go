@@ -265,7 +265,7 @@ func (c *Channel) fetchMedia(ctx context.Context, cm *callbackMessage) (string, 
 	}
 	resp, err := c.client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("wecom media get: %w", err)
+		return "", fmt.Errorf("wecom media get: %w", channels.ScrubError(err))
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
@@ -404,7 +404,7 @@ func (c *Channel) postMessage(ctx context.Context, token string, msg channels.Ou
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := c.client.Do(req)
 	if err != nil {
-		return 0, fmt.Errorf("wecom send request: %w", err)
+		return 0, fmt.Errorf("wecom send request: %w", channels.ScrubError(err))
 	}
 	defer func() { _ = resp.Body.Close() }()
 	var result struct {
@@ -440,7 +440,7 @@ func (c *Channel) getAccessToken(ctx context.Context) (string, error) {
 	}
 	resp, err := c.client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("wecom gettoken: %w", err)
+		return "", fmt.Errorf("wecom gettoken: %w", channels.ScrubError(err))
 	}
 	defer func() { _ = resp.Body.Close() }()
 	var result struct {

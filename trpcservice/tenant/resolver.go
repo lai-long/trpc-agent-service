@@ -105,8 +105,10 @@ func (r *Resolver) Resolve(ctx context.Context, webhookPath string) (Route, erro
 		return Route{}, fmt.Errorf("%w: binding %s references missing app %s",
 			ErrUnknownBinding, b.ID, b.AppID)
 	}
-	if app.Status == StatusDisabled {
-		return Route{}, fmt.Errorf("%w: app %s disabled", ErrInactive, app.ID)
+	// Only the published version serves traffic; drafts exist for gray
+	// release staging and must not receive callbacks (design 5.2.3).
+	if app.Status != "published" {
+		return Route{}, fmt.Errorf("%w: app %s status %q", ErrInactive, app.ID, app.Status)
 	}
 	return Route{Tenant: t, App: app, Binding: b}, nil
 }

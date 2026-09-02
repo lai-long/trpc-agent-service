@@ -14,6 +14,7 @@ data:
   TRPC_SUMMARY_EVENT_THRESHOLD: "20"
   TRPC_ARCHIVE_RETENTION: "720h"
   TRPC_SECRET_RESOLVER: "kms" # file for dev, kms in production
+  OTEL_EXPORTER_OTLP_ENDPOINT: "otel-collector.trpc-infra.svc:4317" # Jaeger/Tempo via collector
 ---
 # Infrastructure addresses and secret REFS. In production these come from a
 # Secret object (stringData below is the shape, values are placeholders).

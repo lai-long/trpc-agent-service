@@ -226,3 +226,17 @@ func TestNonAnswerDoesNotDisturbPending(t *testing.T) {
 		t.Fatal("non-answer message must not disturb the pending approval")
 	}
 }
+
+// A fresh "created" signal must survive the model's in-run retry re-hitting
+// the same pending call: overwriting it with the non-fresh variant would drop
+// the review audit (compliance red line) while the user still sees the
+// confirmation.
+func TestApprovalSignalFreshSurvivesRehit(t *testing.T) {
+	ap := NewApprover(nil, testRegistry(), 0)
+	ap.setSignal("s1", Signal{Kind: "created", ToolName: "op_a", Fresh: true})
+	ap.setSignal("s1", Signal{Kind: "created", ToolName: "op_a", Fresh: false}) // retry re-hit
+	sig, ok := ap.TakeSignal("s1")
+	if !ok || !sig.Fresh {
+		t.Fatalf("fresh signal must survive the re-hit, got %+v", sig)
+	}
+}

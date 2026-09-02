@@ -3,6 +3,7 @@ package agent_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"testing"
 	"time"
 
@@ -151,4 +152,67 @@ func TestWorkerSkipsOutboundForEmptyReply(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	t.Fatal("message was not acked within 5s")
+}
+
+// The done marker is the execution-layer idempotency (design 5.1.4): a
+// redelivered message is acked without reprocessing — no second LLM run, no
+// duplicate journal events.
+func TestWorkerSkipsProcessedMessages(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	rdb, err := storage.NewRedis(ctx, "localhost:6380")
+	if err != nil {
+		t.Skipf("redis unavailable (%v), skipping integration test", err)
+	}
+	t.Cleanup(func() { _ = rdb.Close() })
+
+	stream := storage.NewStream(rdb)
+	inbound := "test:inbound:" + t.Name()
+	outbound := "test:outbound:" + t.Name()
+	t.Cleanup(func() { rdb.Del(context.Background(), inbound, outbound) })
+	if err := stream.EnsureGroup(ctx, inbound, "workers"); err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.EnsureGroup(ctx, outbound, "senders"); err != nil {
+		t.Fatal(err)
+	}
+
+	worker := &agent.Worker{
+		Stream: stream, Processor: agent.EchoProcessor{}, Name: "test-w-done",
+		Processed: storage.NewProcessedMarker(rdb),
+		InStream:  inbound, OutStream: outbound,
+	}
+	go func() { _ = worker.Run(ctx) }()
+
+	msg := channels.InboundMessage{
+		Channel: "mock", MsgID: fmt.Sprintf("done-%d", time.Now().UnixNano()),
+		SessionKey: "dm:mock:ud", UserID: "ud", Text: "hi",
+	}
+	payload, _ := json.Marshal(msg)
+	// Same message twice: the second delivery simulates a reaper takeover of
+	// an ack that was lost after processing.
+	if _, err := stream.Add(ctx, inbound, payload); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stream.Add(ctx, inbound, payload); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		pending, _, err := stream.Pending(ctx, inbound, "workers")
+		if err != nil {
+			t.Fatal(err)
+		}
+		n, _ := stream.Len(ctx, outbound)
+		if pending == 0 && n > 0 {
+			if n != 1 {
+				t.Fatalf("duplicate processing must not duplicate the reply: %d outbound entries", n)
+			}
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatal("message pair not drained within 5s")
 }

@@ -14,13 +14,16 @@ spec:
     spec:
       containers:
         - name: gateway
-          image: trpc-agent-service:latest # build from the repo Dockerfile
+          image: trpc-agent-service:v1 # pin a release tag; never :latest in production
           args: ["gateway"]
           envFrom:
             - configMapRef: {name: trpc-service-config}
             - secretRef: {name: trpc-service-infra}
           ports:
             - {containerPort: 8080, name: http}
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
           readinessProbe:
             httpGet: {path: /metrics, port: http}
             initialDelaySeconds: 3

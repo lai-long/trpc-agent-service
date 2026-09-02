@@ -5,6 +5,7 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/sha1"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/xml"
@@ -139,6 +140,9 @@ func (self *WXBizMsgCrypt) pKCS7Unpadding(plaintext []byte, block_size int) ([]b
 		return nil, NewCryptError(DecryptAESError, "pKCS7Unpadding text not a multiple of the block size")
 	}
 	padding_len := int(plaintext[plaintext_len-1])
+	if padding_len <= 0 || padding_len > block_size || padding_len > plaintext_len {
+		return nil, NewCryptError(DecryptAESError, "pKCS7Unpadding invalid padding length")
+	}
 	return plaintext[:plaintext_len-padding_len], nil
 }
 
@@ -240,7 +244,7 @@ func (self *WXBizMsgCrypt) ParsePlainText(plaintext []byte) ([]byte, uint32, []b
 func (self *WXBizMsgCrypt) VerifyURL(msg_signature, timestamp, nonce, echostr string) ([]byte, *CryptError) {
 	signature := self.calSignature(timestamp, nonce, echostr)
 
-	if strings.Compare(signature, msg_signature) != 0 {
+	if subtle.ConstantTimeCompare([]byte(signature), []byte(msg_signature)) != 1 {
 		return nil, NewCryptError(ValidateSignatureError, "signature not equal")
 	}
 
@@ -254,8 +258,7 @@ func (self *WXBizMsgCrypt) VerifyURL(msg_signature, timestamp, nonce, echostr st
 		return nil, err
 	}
 
-	if len(self.receiver_id) > 0 && strings.Compare(string(receiver_id), self.receiver_id) != 0 {
-		fmt.Println(string(receiver_id), self.receiver_id, len(receiver_id), len(self.receiver_id))
+	if len(self.receiver_id) > 0 && subtle.ConstantTimeCompare(receiver_id, []byte(self.receiver_id)) != 1 {
 		return nil, NewCryptError(ValidateCorpidError, "receiver_id is not equil")
 	}
 
@@ -293,7 +296,7 @@ func (self *WXBizMsgCrypt) DecryptMsg(msg_signature, timestamp, nonce string, po
 
 	signature := self.calSignature(timestamp, nonce, msg4_recv.Encrypt)
 
-	if strings.Compare(signature, msg_signature) != 0 {
+	if subtle.ConstantTimeCompare([]byte(signature), []byte(msg_signature)) != 1 {
 		return nil, NewCryptError(ValidateSignatureError, "signature not equal")
 	}
 

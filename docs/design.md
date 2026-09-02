@@ -547,12 +547,13 @@ SET dedup:{channel}:{msg_id} {request_id} NX EX 86400
 返回 nil → 重复消息，直接丢弃
 ```
 
-幂等分两层，职责不同：
+幂等分三层，职责不同：
 
 - 入口层（`dedup:` key）：只挡 IM 平台的重推。企微/微信的重发通常几秒内到达，但应答失败后的重推间隔可达分钟级（最多 3 次），TTL 取 24h 覆盖全部重试窗口，与出站 `sent:` 对齐。
-- 执行层（`(session_id, event_seq)` 唯一约束）：挡 Stream 重投。Worker 崩溃后 pending 消息
-  被 XCLAIM 重投时不经过 Gateway，dedup 管不到；重复消费会产生相同 event_seq 的事件，
-  被数据库唯一约束拒绝，事件层保证不重复。
+- 执行层（`done:{channel}:{msg_id}` 标记 + `(session_id, event_seq)` 唯一约束兜底）：挡 Stream 重投。
+  Worker 在回复入队出站后写 done 标记（24h）；重投消息（崩溃接管、Ack 丢失）命中标记直接跳过处理——
+  因为重投会触发新的 LLM 运行并产生全新的事件 ID，事件唯一约束在这种场景下数学上永远拦不住，
+  只能兜住「同一事件对象被重复追加」的最后防线。done 标记才是执行层幂等的真正实现。
 
 出站幂等：出站消费组发送前先查 `sent:{channel}:{msg_id}`（见上表实现注），命中说明已发过，直接 XACK；
 未命中则调 IM 发送接口，成功后写入该 key 再 XACK。「发送成功但 ACK 前崩溃」导致的重投

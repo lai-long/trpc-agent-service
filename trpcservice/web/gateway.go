@@ -41,8 +41,10 @@ var tracer = otel.Tracer("trpc-agent-service/gateway")
 type EnqueueHandler struct {
 	Stream *storage.Stream
 	Dedup  *storage.Deduper
-	// Routes resolves webhook_path to tenant/app; nil disables tenant routing
-	// (single-tenant dev fallback, messages carry an empty tenant_id).
+	// Routes resolves webhook_path to tenant/app. Fail-closed: a nil Routes
+	// (PG down at startup) rejects callbacks with an error so the IM retries
+	// — unrouted messages must never bypass isolation, rate limiting, or
+	// guardrails.
 	Routes *tenant.Resolver
 	// Limiter is the per-tenant token bucket; nil disables rate limiting.
 	// DefaultQPS/DefaultBurst apply when the tenant's rate_policy is empty.
@@ -83,17 +85,17 @@ var ErrOverloaded = errors.New("gateway overloaded")
 // the async Stream hop.
 func (h EnqueueHandler) Handle(ctx context.Context, msg channels.InboundMessage) (channels.OutboundMessage, error) {
 	// Tenant routing first: a message with no active route is rejected before
-	// consuming dedup keys or queue space.
-	var route tenant.Route
-	if h.Routes != nil {
-		var err error
-		route, err = h.Routes.Resolve(ctx, msg.WebhookPath)
-		if err != nil {
-			return channels.OutboundMessage{}, fmt.Errorf("tenant route: %w", err)
-		}
-		msg.TenantID = route.Tenant.ID
-		msg.AppID = route.App.ID
+	// consuming dedup keys or queue space. No resolver at all (PG down at
+	// startup) is likewise an error — fail closed, the IM will retry.
+	if h.Routes == nil {
+		return channels.OutboundMessage{}, fmt.Errorf("tenant routing unavailable")
 	}
+	route, err := h.Routes.Resolve(ctx, msg.WebhookPath)
+	if err != nil {
+		return channels.OutboundMessage{}, fmt.Errorf("tenant route: %w", err)
+	}
+	msg.TenantID = route.Tenant.ID
+	msg.AppID = route.App.ID
 
 	// Per-tenant admission (before dedup: a rejected message must not consume
 	// the dedup key, or the IM's redelivery would be dropped as a duplicate).

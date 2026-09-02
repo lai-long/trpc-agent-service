@@ -70,6 +70,11 @@ type Config struct {
 	WxkfSecretRef string // TRPC_WXKF_SECRET_REF
 	WxkfAPIBase   string // TRPC_WXKF_API_BASE
 
+	// MockChannel enables the built-in mock channel (demo/dev). Set
+	// TRPC_MOCK_CHANNEL=false in production: the mock callback is an
+	// unauthenticated message injector.
+	MockChannel string // TRPC_MOCK_CHANNEL
+
 	// AdminToken guards the Admin API (Authorization: Bearer); empty means
 	// dev mode with no auth — set it in any shared environment.
 	AdminToken string // TRPC_ADMIN_TOKEN
@@ -170,6 +175,8 @@ func Load() Config {
 		WxkfAESKeyRef: getenv("TRPC_WXKF_AESKEY_REF", "wxkf-aeskey"),
 		WxkfSecretRef: getenv("TRPC_WXKF_SECRET_REF", "wxkf-secret"),
 		WxkfAPIBase:   getenv("TRPC_WXKF_API_BASE", "https://qyapi.weixin.qq.com"),
+
+		MockChannel: getenv("TRPC_MOCK_CHANNEL", "true"),
 
 		AdminToken: getenv("TRPC_ADMIN_TOKEN", ""),
 		// Admin mTLS (split admin role): all three must be set to engage.

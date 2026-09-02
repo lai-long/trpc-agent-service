@@ -17,7 +17,7 @@ spec:
       terminationGracePeriodSeconds: 130 # drain: model timeout x retry + slack
       containers:
         - name: worker
-          image: trpc-agent-service:latest
+          image: trpc-agent-service:v1 # pin a release tag; never :latest in production
           args: ["worker"]
           envFrom:
             - configMapRef: {name: trpc-service-config}
@@ -26,6 +26,17 @@ spec:
             - {name: TRPC_WORKER_ADDR, value: ":8082"}
           ports:
             - {containerPort: 8082, name: metrics}
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+          readinessProbe:
+            httpGet: {path: /metrics, port: metrics}
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: {path: /metrics, port: metrics}
+            initialDelaySeconds: 10
+            periodSeconds: 30
           resources:
             requests: {cpu: "500m", memory: "512Mi"}
             limits: {cpu: "2", memory: "4Gi"}

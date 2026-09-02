@@ -111,13 +111,17 @@ func (g *Guarded) Process(ctx context.Context, msg channels.InboundMessage) (cha
 	}
 
 	// 1. A pending approval consumes confirm/reject answers before anything
-	//    else runs.
+	//    else runs. The approval reply carries a tool RESULT — run the output
+	//    checks on it too (desensitization / deny lists must see it).
 	if g.Approver != nil {
 		handled, out, dec, err := g.Approver.Answer(ctx, msg)
 		if err != nil {
 			return channels.OutboundMessage{}, err
 		}
 		if handled {
+			for _, check := range g.Output {
+				out.Text = check(ctx, msg, out.Text)
+			}
 			span.SetAttributes(attribute.String("decision", firstNonEmpty(dec.decision, "allow")))
 			g.syncAudit(msg, dec)
 			return out, nil

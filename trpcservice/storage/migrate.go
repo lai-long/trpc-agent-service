@@ -9,6 +9,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
+	"trpc.group/trpc-go/trpc-agent-go/event"
 	"trpc.group/trpc-go/trpc-agent-go/session"
 
 	plog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
@@ -297,12 +298,18 @@ func (m *Migrator) copySession(ctx context.Context, mig migrationRow, src, dst s
 		return m.writeSessionToPG(ctx, mig.TenantID, srcSess)
 	}
 	// Redis target: create (idempotent) then append the missing tail.
-	if _, err := dst.CreateSession(ctx, key, srcSess.State); err != nil {
+	// AppendEvent mutates the carrier session's event list, so the events are
+	// snapshotted first (otherwise the loop's slice grows under the iteration
+	// and never terminates) and the destination's own session object is the
+	// carrier.
+	events := append([]event.Event(nil), srcSess.Events...)
+	dstSessNew, err := dst.CreateSession(ctx, key, srcSess.State)
+	if err != nil {
 		return fmt.Errorf("create target session: %w", err)
 	}
-	for i := existing; i < len(srcSess.Events); i++ {
-		evt := srcSess.Events[i]
-		if err := dst.AppendEvent(ctx, srcSess, &evt); err != nil {
+	for i := existing; i < len(events); i++ {
+		evt := events[i]
+		if err := dst.AppendEvent(ctx, dstSessNew, &evt); err != nil {
 			return fmt.Errorf("append event %d: %w", i, err)
 		}
 	}

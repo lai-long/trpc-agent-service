@@ -71,6 +71,15 @@ type Sender struct {
 	// (tenant.rate_policy send_qps/send_burst).
 	SendPolicyFor func(ctx context.Context, tenantID string) (qps float64, burst int, ok bool)
 
+	// ReapInterval is how often pending messages are scanned for takeover,
+	// MaxIdle how long a pending message must sit before it counts as
+	// orphaned (a crashed or wedged sender), and MaxAttempts caps redeliveries
+	// before dead-lettering. Without the reaper an IM API hiccup loses the
+	// reply forever (the pending entry just sits there).
+	ReapInterval time.Duration
+	MaxIdle      time.Duration
+	MaxAttempts  int64
+
 	InStream string // stream to consume; empty means storage.StreamOutbound
 }
 
@@ -102,11 +111,40 @@ func (s *Sender) sendWait() time.Duration {
 	return 30 * time.Second
 }
 
+func (s *Sender) reapInterval() time.Duration {
+	if s.ReapInterval > 0 {
+		return s.ReapInterval
+	}
+	return 30 * time.Second
+}
+
+func (s *Sender) maxIdle() time.Duration {
+	if s.MaxIdle > 0 {
+		return s.MaxIdle
+	}
+	return 10 * time.Minute
+}
+
+func (s *Sender) maxAttempts() int64 {
+	if s.MaxAttempts > 0 {
+		return s.MaxAttempts
+	}
+	return 5
+}
+
 // Run consumes until ctx is canceled; a nil return means a clean shutdown.
+// Every reapInterval it also takes over pending messages orphaned by crashed
+// senders (XCLAIM semantics via XAUTOCLAIM) — symmetric with the Worker.
 func (s *Sender) Run(ctx context.Context) error {
+	lastReap := time.Now()
 	for {
 		if ctx.Err() != nil {
 			return nil
+		}
+
+		if time.Since(lastReap) >= s.reapInterval() {
+			s.reap(ctx)
+			lastReap = time.Now()
 		}
 
 		msgs, err := s.Stream.Read(ctx, s.inStream(), "senders", s.Name, 10, 2*time.Second)
@@ -126,6 +164,37 @@ func (s *Sender) Run(ctx context.Context) error {
 		for _, m := range msgs {
 			s.handle(ctx, m)
 		}
+	}
+}
+
+// reap takes over pending messages idle longer than maxIdle and resends them.
+// A message that keeps failing past maxAttempts is dead-lettered so it cannot
+// loop forever (mirrors the worker's reaper, design 5.2.2).
+func (s *Sender) reap(ctx context.Context) {
+	if err := s.Stream.EnsureGroup(ctx, s.inStream(), "senders"); err != nil {
+		plog.Warnf("sender %s ensure group before reap: %v", s.Name, err)
+		return
+	}
+	msgs, err := s.Stream.AutoClaim(ctx, s.inStream(), "senders", s.Name, s.maxIdle(), 50)
+	if err != nil {
+		plog.Warnf("sender %s autoclaim: %v", s.Name, err)
+		return
+	}
+	for _, m := range msgs {
+		attempts, err := s.Stream.Attempts(ctx, s.inStream(), m.ID)
+		if err != nil {
+			plog.Warnf("sender %s count attempts %s: %v", s.Name, m.ID, err)
+			continue
+		}
+		if attempts > s.maxAttempts() {
+			plog.Errorf("sender %s dead-letters %s after %d attempts", s.Name, m.ID, attempts)
+			if err := s.Stream.DeadLetter(ctx, s.inStream(), "senders", m); err != nil {
+				plog.Errorf("sender %s deadletter %s: %v", s.Name, m.ID, err)
+			}
+			continue
+		}
+		plog.Infof("sender %s takes over %s (attempt %d)", s.Name, m.ID, attempts)
+		s.handle(ctx, m)
 	}
 }
 

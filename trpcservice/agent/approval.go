@@ -28,6 +28,10 @@ const DefaultApprovalTimeout = 5 * time.Minute
 // silently vanishing.
 const approvalKeyGrace = 5 * time.Minute
 
+// approvalToolTimeout bounds the approved tool call itself (it runs outside
+// the runner's per-run deadline).
+const approvalToolTimeout = time.Minute
+
 // PendingApproval is a dangerous tool call waiting for in-band user
 // confirmation. It is stored in Redis (key approval:{session_key}) rather
 // than in framework session.state: same node-shared durability, but with a
@@ -210,7 +214,12 @@ func (a *Approver) Answer(ctx context.Context, msg channels.InboundMessage) (han
 	}
 
 	started := time.Now()
-	result, callErr := a.tools.Call(ctx, p.ToolName, p.Arguments)
+	// The approved tool runs outside the runner, so the per-run model deadline
+	// does not cover it: give the call its own timeout or a hung tool wedges
+	// the session lock until the drain/crash paths kick in.
+	toolCtx, cancel := context.WithTimeout(ctx, approvalToolTimeout)
+	defer cancel()
+	result, callErr := a.tools.Call(toolCtx, p.ToolName, p.Arguments)
 	dec = auditDecision{
 		decision: "allow", toolName: p.ToolName,
 		latencyMs: int(time.Since(started).Milliseconds()),
@@ -237,6 +246,14 @@ func (a *Approver) TakeSignal(sessionKey string) (Signal, bool) {
 func (a *Approver) setSignal(sessionKey string, s Signal) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	// A fresh "created" signal (the one carrying the review decision the
+	// guardrail must audit synchronously) must not be overwritten by the
+	// non-fresh re-hit the model's in-run retry produces — losing it would
+	// drop the review audit while the user still gets the confirmation.
+	if existing, ok := a.signals[sessionKey]; ok &&
+		existing.Kind == "created" && existing.Fresh && s.Kind == "created" && !s.Fresh {
+		return
+	}
 	a.signals[sessionKey] = s
 }
 

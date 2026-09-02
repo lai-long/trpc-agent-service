@@ -15,7 +15,7 @@ spec:
     spec:
       containers:
         - name: admin
-          image: trpc-agent-service:latest
+          image: trpc-agent-service:v1 # pin a release tag; never :latest in production
           args: ["admin"]
           envFrom:
             - configMapRef: {name: trpc-service-config}
@@ -24,6 +24,13 @@ spec:
             - {name: TRPC_ADMIN_TOKEN, valueFrom: {secretKeyRef: {name: trpc-admin-token, key: token}}}
           ports:
             - {containerPort: 8081, name: http}
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+          readinessProbe:
+            httpGet: {path: /metrics, port: http}
+            initialDelaySeconds: 3
+            periodSeconds: 10
           resources:
             requests: {cpu: "250m", memory: "256Mi"}
             limits: {cpu: "1", memory: "2Gi"}

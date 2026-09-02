@@ -188,6 +188,10 @@ func (a *AdminAPI) updateTenant(w http.ResponseWriter, r *http.Request) {
 		add("name = $%d", *in.Name)
 	}
 	if in.Status != nil {
+		if *in.Status != "active" && *in.Status != "disabled" {
+			writeError(w, http.StatusBadRequest, "status must be active or disabled")
+			return
+		}
 		add("status = $%d", *in.Status)
 	}
 	if in.ModelConfig != nil {
@@ -259,6 +263,12 @@ func (a *AdminAPI) createApp(w http.ResponseWriter, r *http.Request) {
 		 RETURNING id, version`,
 		tenantID, in.Name, in.AgentType, []byte(in.Config)).Scan(&id, &version)
 	if err != nil {
+		// Concurrent creates race on (tenant_id, name, version): ask the
+		// caller to retry instead of a 500.
+		if strings.Contains(err.Error(), "uk_agent_app_version") {
+			writeError(w, http.StatusConflict, "concurrent create raced the version; retry")
+			return
+		}
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -401,7 +411,9 @@ func (a *AdminAPI) rollbackApp(w http.ResponseWriter, r *http.Request) {
 }
 
 // publish switches the published version of the app family in one tx and
-// returns the owning tenant ID (for the audit record).
+// returns the owning tenant ID (for the audit record). Bindings follow the
+// published version: channel_binding.app_id references a concrete version
+// row, so the repoint must ride the same transaction.
 func (a *AdminAPI) publish(ctx context.Context, appID string) (string, error) {
 	tx, err := a.pool.Begin(ctx)
 	if err != nil {
@@ -433,6 +445,15 @@ func (a *AdminAPI) publish(ctx context.Context, appID string) (string, error) {
 		appID); err != nil {
 		return "", fmt.Errorf("publish: %w", err)
 	}
+	// Bindings reference a concrete version row; repoint them at the newly
+	// published version in the same tx, or callbacks keep routing to the
+	// version that just left "published" and got disabled.
+	if _, err := tx.Exec(ctx,
+		`UPDATE channel_binding SET app_id = $1, updated_at = now()
+		 WHERE app_id IN (SELECT id FROM agent_app WHERE tenant_id = $2 AND name = $3)`,
+		appID, tenantID, name); err != nil {
+		return "", fmt.Errorf("repoint bindings: %w", err)
+	}
 	return tenantID, tx.Commit(ctx)
 }
 
@@ -456,15 +477,17 @@ func (a *AdminAPI) createBinding(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var id, tenantID string
+	// Only a published app is bindable: binding a draft would route traffic
+	// around the gray-release flow (design 5.2.3).
 	err := a.pool.QueryRow(r.Context(),
 		`INSERT INTO channel_binding (tenant_id, channel, app_id, webhook_path, token_ref, aeskey_ref, config)
-		 SELECT tenant_id, $2, id, $3, $4, $5, $6 FROM agent_app WHERE id = $1
+		 SELECT tenant_id, $2, id, $3, $4, $5, $6 FROM agent_app WHERE id = $1 AND status = 'published'
 		 RETURNING id, tenant_id`,
 		r.PathValue("id"), in.Channel, in.WebhookPath,
 		nullStr(in.TokenRef), nullStr(in.AESKeyRef), rawOrNil(in.Config),
 	).Scan(&id, &tenantID)
 	if errors.Is(err, pgx.ErrNoRows) {
-		writeError(w, http.StatusNotFound, "app not found")
+		writeError(w, http.StatusNotFound, "app not found or not published")
 		return
 	}
 	if err != nil {

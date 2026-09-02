@@ -23,9 +23,12 @@ import (
 // state snapshot" two-layer store of design decision 2:
 //
 //   - session_event is append-only; the UNIQUE (session_id, event_seq)
-//     constraint keeps events ordered without duplicates and is the
-//     execution-layer idempotency backstop for Stream redeliveries
-//     (ON CONFLICT DO NOTHING: a late duplicate is dropped, never an error).
+//     constraint keeps events ordered and is the last-resort duplicate
+//     backstop. Execution-layer idempotency for Stream redeliveries lives
+//     one level up, in the worker's done:{channel}:{msg_id} marker — a
+//     redelivered message re-runs the model and produces NEW framework event
+//     IDs, so the constraint alone could never catch it (see
+//     storage.ProcessedMarker).
 //   - session.state is a materialized snapshot for fast reads; the event
 //     stream is the source of truth a crashed session can be replayed from.
 //   - summary compresses old events: GetSession replays only the events

@@ -197,6 +197,33 @@ func TestAdminLifecycle(t *testing.T) {
 	if list[0]["token_ref"] != "wecom-token" {
 		t.Fatalf("token_ref must be a reference, got %v", list[0]["token_ref"])
 	}
+
+	// Publishing must repoint bindings at the new version in the same tx —
+	// otherwise callbacks keep routing to the version that just left
+	// "published" (which is now disabled) and the gateway rejects everything.
+	code, _ = doJSON(t, mux, http.MethodPost, "/admin/apps/"+appV2+"/publish", "")
+	if code != http.StatusOK {
+		t.Fatalf("re-publish v2: %d", code)
+	}
+	var boundApp string
+	if err := pool.QueryRow(ctx,
+		`SELECT app_id FROM channel_binding WHERE id = $1`, bindingID).Scan(&boundApp); err != nil {
+		t.Fatal(err)
+	}
+	if boundApp != appV2 {
+		t.Fatalf("binding must follow the published version: want %s, got %s", appV2, boundApp)
+	}
+	code, _ = doJSON(t, mux, http.MethodPost, "/admin/apps/"+appV2+"/rollback", "")
+	if code != http.StatusOK {
+		t.Fatalf("rollback to v1: %d", code)
+	}
+	if err := pool.QueryRow(ctx,
+		`SELECT app_id FROM channel_binding WHERE id = $1`, bindingID).Scan(&boundApp); err != nil {
+		t.Fatal(err)
+	}
+	if boundApp != appV1 {
+		t.Fatalf("rollback must repoint bindings too: want %s, got %s", appV1, boundApp)
+	}
 	code, _ = doJSON(t, mux, http.MethodDelete, "/admin/apps/"+appV1+"/bindings/"+bindingID, "")
 	if code != http.StatusOK {
 		t.Fatalf("delete binding: %d", code)

@@ -189,11 +189,9 @@ func serve(role string) error {
 
 	g, gctx := errgroup.WithContext(ctx)
 	consumer := fmt.Sprintf("%s-%d", role, os.Getpid())
-	var gatewayMux *http.ServeMux
 
 	// --- Gateway role: IM callbacks in, replies out -------------------------
 	if wantGateway {
-		ch := mock.New()
 		enqueue := web.EnqueueHandler{
 			Stream:       stream,
 			Dedup:        storage.NewDeduper(rdb),
@@ -202,19 +200,25 @@ func serve(role string) error {
 			DefaultQPS:   parseFloat(cfg.GatewayRateQPS, 50),
 			DefaultBurst: parseInt(cfg.GatewayRateBurst, 100),
 		}
-		gatewayMux = http.NewServeMux()
-		mux := gatewayMux
-		ch.RegisterRoutes(mux, enqueue)
+		mux := http.NewServeMux()
 		mux.Handle("GET /metrics", metricsHandler)
 
-		// Channel registry for the outbound sender: mock always, wecom and
-		// wxkf when configured. Channel misconfiguration disables only that
-		// channel. The artifact store doubles as the wecom media sink.
+		// Channel registry for the outbound sender: mock (only when enabled —
+		// it is an unauthenticated injector, TRPC_MOCK_CHANNEL=false in prod),
+		// wecom and wxkf when configured. Channel misconfiguration disables
+		// only that channel. The artifact store doubles as the wecom media sink.
+		channelSet := map[string]channels.Channel{}
+		if cfg.MockChannel == "true" {
+			ch := mock.New()
+			ch.RegisterRoutes(mux, enqueue)
+			channelSet[ch.Name()] = ch
+		} else {
+			plog.Infof("mock channel disabled (TRPC_MOCK_CHANNEL=false)")
+		}
 		var mediaSink channels.MediaStore
 		if s3, ok := artifacts.(*storage.S3ArtifactService); ok {
 			mediaSink = s3
 		}
-		channelSet := map[string]channels.Channel{ch.Name(): ch}
 		if wc := startWecom(cfg, mediaSink, secrets); wc != nil {
 			wc.RegisterRoutes(mux, enqueue)
 			channelSet[wc.Name()] = wc
@@ -276,7 +280,8 @@ func serve(role string) error {
 	if wantWorker {
 		worker := &agent.Worker{
 			Stream: stream, Lock: storage.NewLock(rdb), Processor: processor,
-			Name: consumer + "-w",
+			Processed: storage.NewProcessedMarker(rdb),
+			Name:      consumer + "-w",
 		}
 		g.Go(func() error { return worker.Run(gctx) })
 
@@ -321,44 +326,39 @@ func serve(role string) error {
 			adminAPI.Knowledge = kb
 			adminAPI.DefaultSessionBackend = defaultSess
 
-			// In all-in-one mode the admin routes share the gateway listener
-			// (bearer token is the guard there); split mode serves them on a
-			// separate internal address (TRPC_ADMIN_ADDR, internal network
-			// only per design 5.4), optionally with mTLS.
-			var adminMux *http.ServeMux
-			if role == "all" {
-				adminMux = gatewayMux
-			} else {
-				adminMux = http.NewServeMux()
-				adminMux.Handle("GET /metrics", metricsHandler)
-				srv := &http.Server{Addr: cfg.AdminAddr, Handler: adminMux,
-					ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second}
-				tlsCfg, err := adminTLSConfig(cfg)
-				if err != nil {
+			// The admin API always gets its own listener (TRPC_ADMIN_ADDR):
+			// the gateway listener faces the IM platforms (public), the admin
+			// listener must not (design 5.4 仅内网可达; mTLS optional). In
+			// all-in-one mode this moves the admin API off :8080 too.
+			adminMux := http.NewServeMux()
+			adminMux.Handle("GET /metrics", metricsHandler)
+			srv := &http.Server{Addr: cfg.AdminAddr, Handler: adminMux,
+				ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second}
+			tlsCfg, err := adminTLSConfig(cfg)
+			if err != nil {
+				return err
+			}
+			srv.TLSConfig = tlsCfg
+			g.Go(func() error {
+				zap.L().Info("admin listening", zap.String("addr", cfg.AdminAddr),
+					zap.Bool("mtls", tlsCfg != nil))
+				var err error
+				if tlsCfg != nil {
+					err = srv.ListenAndServeTLS("", "")
+				} else {
+					err = srv.ListenAndServe()
+				}
+				if err != nil && !errors.Is(err, http.ErrServerClosed) {
 					return err
 				}
-				srv.TLSConfig = tlsCfg
-				g.Go(func() error {
-					zap.L().Info("admin listening", zap.String("addr", cfg.AdminAddr),
-						zap.Bool("mtls", tlsCfg != nil))
-					var err error
-					if tlsCfg != nil {
-						err = srv.ListenAndServeTLS("", "")
-					} else {
-						err = srv.ListenAndServe()
-					}
-					if err != nil && !errors.Is(err, http.ErrServerClosed) {
-						return err
-					}
-					return nil
-				})
-				g.Go(func() error {
-					<-gctx.Done()
-					shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-					defer cancel()
-					return srv.Shutdown(shutdownCtx)
-				})
-			}
+				return nil
+			})
+			g.Go(func() error {
+				<-gctx.Done()
+				shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				return srv.Shutdown(shutdownCtx)
+			})
 			adminAPI.RegisterRoutes(adminMux)
 			if cfg.AdminToken == "" {
 				plog.Warnf("admin API unprotected (TRPC_ADMIN_TOKEN unset) — dev mode only")
@@ -390,8 +390,15 @@ func startPGConsumers(ctx context.Context, cfg config.Config) (*storage.Auditor,
 	noop := func() {}
 	pool, err := storage.NewPG(ctx, cfg.PGDSN)
 	if err != nil {
-		plog.Warnf("PG unreachable, audit and tenant routing disabled: %v", err)
-		return nil, nil, nil, noop
+		// PG down at startup: build the pool lazily so routing fails CLOSED
+		// (5xx, the IM retries) and recovers when PG returns — never run
+		// fail-open with tenant routing silently off.
+		plog.Warnf("PG unreachable at startup (%v); routing fails closed until PG recovers", err)
+		pool, err = storage.NewPGLazy(ctx, cfg.PGDSN)
+		if err != nil {
+			plog.Errorf("PG DSN invalid: %v", err)
+			return nil, nil, nil, noop
+		}
 	}
 	a := storage.NewAuditor(pool)
 	a.Start()

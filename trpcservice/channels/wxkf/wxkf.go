@@ -291,7 +291,7 @@ func (c *Channel) postMessage(ctx context.Context, token string, msg channels.Ou
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := c.client.Do(req)
 	if err != nil {
-		return 0, fmt.Errorf("wxkf send request: %w", err)
+		return 0, fmt.Errorf("wxkf send request: %w", channels.ScrubError(err))
 	}
 	defer func() { _ = resp.Body.Close() }()
 	var result struct {
@@ -334,7 +334,7 @@ func (c *Channel) getAccessToken(ctx context.Context) (string, error) {
 	}
 	resp, err := c.client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("wxkf gettoken: %w", err)
+		return "", fmt.Errorf("wxkf gettoken: %w", channels.ScrubError(err))
 	}
 	defer func() { _ = resp.Body.Close() }()
 	var result struct {
