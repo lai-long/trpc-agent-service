@@ -291,6 +291,7 @@ func replyShell(msg channels.InboundMessage) channels.OutboundMessage {
 		ChatID:     msg.ChatID,
 		TenantID:   msg.TenantID,
 		TraceID:    msg.TraceID,
+		ReceivedAt: msg.ReceivedAt,
 	}
 }
 

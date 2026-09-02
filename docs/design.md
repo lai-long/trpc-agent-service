@@ -290,7 +290,8 @@ sequenceDiagram
 | `model_config` | `jsonb` | 否 | 模型配置，包括模型、温度、上下文长度等 |
 | `tool_policy` | `jsonb` | 否 | 工具调用策略 |
 | `audit_policy` | `jsonb` | 否 | 审计与数据保留策略 |
-| `rate_policy` | `jsonb` | 否 | 入口限流策略（5.1.4 令牌桶），如 `{"qps":50,"burst":100}`，空走平台默认 |
+| `rate_policy` | `jsonb` | 否 | 入口限流策略（5.1.4 令牌桶），如 `{"qps":50,"burst":100}`，空走平台默认；`send_qps`/`send_burst` 覆盖发送侧限速 |
+| `guardrail_policy` | `jsonb` | 否 | 治理策略（4.3）：`input_allow_users` 用户白名单、`input_deny_words` 输入敏感词（覆盖平台基线）、`output_deny_words` 输出敏感词、`max_tokens_per_day` 日 token 预算 |
 | `storage_config` | `jsonb` | 否 | 数据后端覆盖配置（受控菜单），如 `{"session":{"type":"redis","dsn_ref":"t42-redis"}}`，空表示走平台推荐栈 |
 | `status` | `varchar(32)` | 是 | 状态：`active`、`disabled` 等 |
 | `created_at` | `timestamptz` | 是 | 创建时间 |

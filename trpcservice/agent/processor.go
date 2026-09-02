@@ -153,6 +153,7 @@ func (p *RunnerProcessor) Process(ctx context.Context, msg channels.InboundMessa
 		TenantID:   msg.TenantID,
 		TraceID:    msg.TraceID,
 		Model:      p.model,
+		ReceivedAt: msg.ReceivedAt,
 	}
 
 	var lastErr error

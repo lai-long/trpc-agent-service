@@ -29,22 +29,54 @@ const (
 // parsed by its consumers (agent assembly, guardrail, gateway rate limiting,
 // storage routing) — routing itself only needs identity and status.
 type Tenant struct {
-	ID            string
-	Name          string
-	ModelConfig   json.RawMessage
-	ToolPolicy    json.RawMessage
-	AuditPolicy   json.RawMessage
-	RatePolicy    json.RawMessage
-	StorageConfig json.RawMessage
-	Status        string
+	ID              string
+	Name            string
+	ModelConfig     json.RawMessage
+	ToolPolicy      json.RawMessage
+	AuditPolicy     json.RawMessage
+	GuardrailPolicy json.RawMessage
+	RatePolicy      json.RawMessage
+	StorageConfig   json.RawMessage
+	Status          string
 }
 
 // RateLimit is the tenant's gateway admission quota (design 5.1.4): qps is
 // the token refill rate, burst the bucket capacity. Zero values inherit the
-// platform default.
+// platform default. SendQPS/SendBurst override the outbound pacing for this
+// tenant's sends (design 5.3.2).
 type RateLimit struct {
-	QPS   float64 `json:"qps"`
-	Burst int     `json:"burst"`
+	QPS       float64 `json:"qps"`
+	Burst     int     `json:"burst"`
+	SendQPS   float64 `json:"send_qps"`
+	SendBurst int     `json:"send_burst"`
+}
+
+// GuardrailPolicy is the tenant's governance config (design 4.3 治理):
+// input user allowlist and deny words, output deny words, and the daily
+// token budget. Empty fields inherit the platform defaults.
+type GuardrailPolicy struct {
+	// InputAllowUsers, when non-empty, restricts the agent to these IM user
+	// IDs (IM 用户权限校验).
+	InputAllowUsers []string `json:"input_allow_users"`
+	// InputDenyWords replaces the platform input denylist when non-empty.
+	InputDenyWords []string `json:"input_deny_words"`
+	// OutputDenyWords blocks replies containing any of them (输出敏感词).
+	OutputDenyWords []string `json:"output_deny_words"`
+	// MaxTokensPerDay is the daily token budget (prompt + completion); 0 is
+	// unlimited (预算限制).
+	MaxTokensPerDay int64 `json:"max_tokens_per_day"`
+}
+
+// ParseGuardrailPolicy decodes tenant.guardrail_policy; empty or invalid
+// yields the zero value (platform defaults).
+func ParseGuardrailPolicy(raw json.RawMessage) GuardrailPolicy {
+	var p GuardrailPolicy
+	if len(raw) > 0 {
+		if err := json.Unmarshal(raw, &p); err != nil {
+			plog.Warnf("invalid tenant guardrail_policy ignored: %v", err)
+		}
+	}
+	return p
 }
 
 // ParseRateLimit decodes tenant.rate_policy; an empty or invalid policy

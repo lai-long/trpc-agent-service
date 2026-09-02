@@ -35,6 +35,14 @@ func rateLimitedAttr(msg OutboundMessage) otelmetric.AddOption {
 	)
 }
 
+// e2eAttr tags the end-to-end latency histogram (channel + tenant).
+func e2eAttr(msg OutboundMessage) otelmetric.RecordOption {
+	return otelmetric.WithAttributes(
+		attribute.String("channel", msg.Channel),
+		attribute.String("tenant_id", msg.TenantID),
+	)
+}
+
 // Sender consumes the outbound stream as part of consumer group "senders" and
 // dispatches each message to the Send of its Channel.
 //
@@ -59,6 +67,9 @@ type Sender struct {
 	SendQPS   float64
 	SendBurst int
 	SendWait  time.Duration
+	// SendPolicyFor, when set, overrides the bucket shape per tenant
+	// (tenant.rate_policy send_qps/send_burst).
+	SendPolicyFor func(ctx context.Context, tenantID string) (qps float64, burst int, ok bool)
 
 	InStream string // stream to consume; empty means storage.StreamOutbound
 }
@@ -163,8 +174,14 @@ func (s *Sender) handle(ctx context.Context, m storage.Message) {
 	// exhaustion the message is re-queued (new entry, original acked) rather
 	// than dropped: the copy retries when the bucket has refilled.
 	if s.Limiter != nil {
+		qps, burst := s.sendQPS(), s.sendBurst()
+		if s.SendPolicyFor != nil && msg.TenantID != "" {
+			if q, b, ok := s.SendPolicyFor(ctx, msg.TenantID); ok && q > 0 && b > 0 {
+				qps, burst = q, b
+			}
+		}
 		scope := "send:" + msg.Channel + ":" + msg.TenantID
-		ok, err := s.Limiter.WaitAllow(ctx, scope, s.sendQPS(), s.sendBurst(), s.sendWait())
+		ok, err := s.Limiter.WaitAllow(ctx, scope, qps, burst, s.sendWait())
 		if err != nil {
 			plog.Warnf("sender %s rate limit check %s: %v", s.Name, m.ID, err)
 			return // Redis hiccup: leave pending, retry later
@@ -189,6 +206,12 @@ func (s *Sender) handle(ctx context.Context, m storage.Message) {
 		return
 	}
 	metrics.OutboundTotal.Add(ctx, 1, sendAttr(msg, "ok"))
+	// End-to-end latency: callback arrival → reply landed on the IM (design
+	// 5.2.4 端到端 P95; ReceivedAt rides the outbound message).
+	if !msg.ReceivedAt.IsZero() {
+		metrics.EndToEndDuration.Record(ctx,
+			float64(time.Since(msg.ReceivedAt).Milliseconds()), e2eAttr(msg))
+	}
 	if s.Sent != nil && msg.MsgID != "" {
 		if err := s.Sent.MarkSent(ctx, msg.Channel, msg.MsgID, ""); err != nil {
 			plog.Warnf("sender %s mark sent %s: %v", s.Name, m.ID, err)

@@ -88,6 +88,11 @@ type OutboundMessage struct {
 	// markdown support (e.g. WeChat KF) downgrade via RenderPlain (design
 	// 5.3.2 通道级渲染降级: 卡片 → markdown → 纯文本).
 	TextType string
+
+	// ReceivedAt is the inbound callback's arrival time, carried through so
+	// the sender can record the end-to-end latency (design 5.2.4: 端到端
+	// P95 回调→回复落 IM).
+	ReceivedAt time.Time
 }
 
 // RenderPlain strips common markdown syntax for channels that render plain

@@ -20,6 +20,10 @@ CREATE TABLE tenant (
     model_config   jsonb,
     tool_policy    jsonb,
     audit_policy   jsonb,
+    -- Guardrail policy (design 4.3 治理): input user allowlist, input/output
+    -- deny words, daily token budget, e.g.
+    -- {"input_allow_users":["u1"],"input_deny_words":["..."],"max_tokens_per_day":1000000}.
+    guardrail_policy jsonb,
     -- Traffic admission policy for the gateway's per-tenant token bucket
     -- (design 5.1.4), e.g. {"qps": 50, "burst": 100}; empty means the
     -- platform default.

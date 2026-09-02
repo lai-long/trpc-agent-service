@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 	plog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/metrics"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/storage"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 )
 
 // auditLogger is the audit sink used by the guardrail (*storage.Auditor
@@ -41,8 +43,8 @@ type InputChecker func(ctx context.Context, msg channels.InboundMessage) (reason
 // to send.
 type OutputChecker func(ctx context.Context, msg channels.InboundMessage, reply string) string
 
-// DefaultBlockedWords is the demo input denylist. Tenant-level lists arrive
-// with tenant.tool_policy once the Admin API lands.
+// DefaultBlockedWords is the platform input denylist baseline; a tenant's
+// guardrail_policy.input_deny_words replaces it for that tenant's messages.
 var DefaultBlockedWords = []string{"赌博", "毒品", "枪支"}
 
 // degradedReply answers the user when the model keeps failing after its
@@ -50,9 +52,18 @@ var DefaultBlockedWords = []string{"赌博", "毒品", "枪支"}
 // immediately instead of riding the Stream redelivery path.
 const degradedReply = "服务繁忙，请稍后再试。"
 
+// BudgetGate tracks per-tenant daily token budgets (design 4.3 预算限制):
+// Allow pre-checks the accumulated usage, Record accounts the actual tokens
+// after the run. *storage.Budget satisfies it.
+type BudgetGate interface {
+	Allow(ctx context.Context, tenantID string, maxPerDay int64) (bool, error)
+	Record(ctx context.Context, tenantID string, tokens int64)
+}
+
 // Guarded wraps a Processor with the guardrail chain (design 4.3):
 //
-//	approval answer → input checks → inner processor → output checks
+//	recall → approval answer → input checks (allowlist/denylist) → budget gate
+//	→ inner processor → budget accounting → output checks (redact/denylist)
 //	→ approval confirmation composition
 //
 // The guardrail owns message-level auditing: routine messages get an async
@@ -63,8 +74,16 @@ type Guarded struct {
 	Inner    Processor
 	Approver *Approver   // nil disables tool-approval handling
 	Auditor  auditLogger // nil disables auditing
-	Input    []InputChecker
-	Output   []OutputChecker
+	// Input/Output are the platform baseline checks; tenant policies
+	// (guardrail_policy) layer on top per message via PolicyFor.
+	Input  []InputChecker
+	Output []OutputChecker
+	// PolicyFor resolves a tenant's guardrail policy; nil means platform
+	// defaults only.
+	PolicyFor func(ctx context.Context, tenantID string) (tenant.GuardrailPolicy, error)
+	// Budget, when set, enforces the tenant's daily token budget
+	// (guardrail_policy.max_tokens_per_day).
+	Budget BudgetGate
 	// StateMark, when set, persists a session-state marker for recall events
 	// (design 5.3.2 撤回: session.state 打标记，不回删 session_event).
 	StateMark func(ctx context.Context, msg channels.InboundMessage, key string, value []byte) error
@@ -105,8 +124,17 @@ func (g *Guarded) Process(ctx context.Context, msg channels.InboundMessage) (cha
 		}
 	}
 
-	// 2. Input checks.
-	for _, check := range g.Input {
+	// 2. Tenant policy resolution (guardrail_policy): failures degrade to the
+	//    platform baseline with a warning.
+	policy := g.policyFor(ctx, msg.TenantID)
+
+	// 3. Input checks: the platform baseline, or the tenant's deny-word list
+	//    when it replaces the baseline (guardrail_policy.input_deny_words).
+	inputCheckers := g.Input
+	if len(policy.InputDenyWords) > 0 {
+		inputCheckers = []InputChecker{SensitiveWordInput(policy.InputDenyWords)}
+	}
+	for _, check := range inputCheckers {
 		reason, denied := check(ctx, msg)
 		if denied {
 			span.SetAttributes(attribute.String("decision", "deny"))
@@ -117,8 +145,30 @@ func (g *Guarded) Process(ctx context.Context, msg channels.InboundMessage) (cha
 			return out, nil
 		}
 	}
+	if len(policy.InputAllowUsers) > 0 && !slices.Contains(policy.InputAllowUsers, msg.UserID) {
+		span.SetAttributes(attribute.String("decision", "deny"))
+		plog.Warnf("user %s not in tenant %s allowlist", msg.UserID, msg.TenantID)
+		g.syncAudit(msg, auditDecision{decision: "deny", errorType: "user_not_allowed"})
+		out := replyShell(msg)
+		out.Text = "抱歉，您没有权限使用该服务。"
+		return out, nil
+	}
 
-	// 3. Inner processing (Runner or echo fallback). Routine allow audit,
+	// 4. Budget gate (预算限制): deny when the tenant's daily token usage is
+	//    already over budget; the run's actual tokens are recorded below.
+	if g.Budget != nil && policy.MaxTokensPerDay > 0 && msg.TenantID != "" {
+		ok, err := g.Budget.Allow(ctx, msg.TenantID, policy.MaxTokensPerDay)
+		if err != nil {
+			plog.Warnf("budget check failed (fail open, tenant=%s): %v", msg.TenantID, err)
+		} else if !ok {
+			span.SetAttributes(attribute.String("decision", "deny"))
+			g.syncAudit(msg, auditDecision{decision: "deny", errorType: "budget_exceeded"})
+			out := replyShell(msg)
+			out.Text = "今日用量已达上限，请明日再试。"
+			return out, nil
+		}
+	}
+	// 5. Inner processing (Runner or echo fallback). Routine allow audit,
 	//    async lane; process errors ride the same event as error_type.
 	started := time.Now()
 	out, err := g.Inner.Process(ctx, msg)
@@ -162,10 +212,26 @@ func (g *Guarded) Process(ctx context.Context, msg channels.InboundMessage) (cha
 		return out, nil
 	}
 	g.asyncAudit(msg, out, started, nil)
+	// Budget accounting with the run's actual tokens (预算限制).
+	if g.Budget != nil && msg.TenantID != "" {
+		g.Budget.Record(ctx, msg.TenantID, int64(out.PromptTokens+out.CompletionTokens))
+	}
 
-	// 4. Output checks (desensitization).
+	// 6. Output checks: platform desensitization, then the tenant's output
+	//    denylist (输出敏感词) — a hit replaces the reply and audits a deny.
 	for _, check := range g.Output {
 		out.Text = check(ctx, msg, out.Text)
+	}
+	if len(policy.OutputDenyWords) > 0 {
+		for _, w := range policy.OutputDenyWords {
+			if w != "" && strings.Contains(out.Text, w) {
+				span.SetAttributes(attribute.String("decision", "deny"))
+				plog.Warnf("output deny word %q hit (session=%s)", w, msg.SessionKey)
+				g.syncAudit(msg, auditDecision{decision: "deny", errorType: "sensitive_output"})
+				out.Text = "抱歉，回复包含受限内容，已被拦截。"
+				return out, nil
+			}
+		}
 	}
 
 	// 5. A dangerous call was intercepted during the run: audit the decision
@@ -179,6 +245,20 @@ func (g *Guarded) Process(ctx context.Context, msg channels.InboundMessage) (cha
 	}
 	span.SetAttributes(attribute.String("decision", "allow"))
 	return out, nil
+}
+
+// policyFor resolves the tenant's guardrail policy; lookup failures and empty
+// tenant IDs degrade to the zero policy (platform baseline only).
+func (g *Guarded) policyFor(ctx context.Context, tenantID string) tenant.GuardrailPolicy {
+	if g.PolicyFor == nil || tenantID == "" {
+		return tenant.GuardrailPolicy{}
+	}
+	p, err := g.PolicyFor(ctx, tenantID)
+	if err != nil {
+		plog.Warnf("guardrail policy lookup %s: %v", tenantID, err)
+		return tenant.GuardrailPolicy{}
+	}
+	return p
 }
 
 // SensitiveWordInput denies messages containing any of the words.

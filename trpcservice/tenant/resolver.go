@@ -147,6 +147,21 @@ func (r *Resolver) AppByID(ctx context.Context, appID string) (AgentApp, Tenant,
 	return app, t, nil
 }
 
+// TenantByID looks up one tenant from the cached snapshot, for policy
+// lookups off the routing path (guardrail policies, send pacing overrides).
+func (r *Resolver) TenantByID(ctx context.Context, tenantID string) (Tenant, error) {
+	if err := r.refresh(ctx); err != nil {
+		return Tenant{}, err
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	t, ok := r.tenants[tenantID]
+	if !ok {
+		return Tenant{}, fmt.Errorf("%w: tenant %s", ErrInactive, tenantID)
+	}
+	return t, nil
+}
+
 // WatchInvalidations subscribes to the invalidation channel until ctx is
 // canceled; each notification drops the cache so a publish/rollback takes
 // effect within seconds instead of at TTL expiry.

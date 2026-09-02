@@ -38,6 +38,14 @@ groups:
         annotations:
           summary: "worker process p95 {{ $value }}ms exceeds the 15s budget"
 
+      # End-to-end p95 (callback → reply landed on IM) beyond the 15s goal.
+      - alert: EndToEndSlow
+        expr: histogram_quantile(0.95, rate(im_end_to_end_duration_bucket[5m])) > 15000
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: "end-to-end p95 {{ $value }}ms exceeds the 15s goal"
+
       # Processing error rate above 1% (design 5.2.4).
       - alert: ProcessErrorRateHigh
         expr: |

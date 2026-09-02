@@ -1,0 +1,39 @@
+# Admin API: tenant/app/binding management, migrations, audit query.
+# Internal network only (design 5.4): ClusterIP, no Ingress; mTLS via
+# TRPC_ADMIN_TLS_* when your org issues client certs.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: trpc-admin
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: trpc-admin}
+  template:
+    metadata:
+      labels: {app: trpc-admin}
+    spec:
+      containers:
+        - name: admin
+          image: trpc-agent-service:latest
+          args: ["admin"]
+          envFrom:
+            - configMapRef: {name: trpc-service-config}
+            - secretRef: {name: trpc-service-infra}
+          env:
+            - {name: TRPC_ADMIN_TOKEN, valueFrom: {secretKeyRef: {name: trpc-admin-token, key: token}}}
+          ports:
+            - {containerPort: 8081, name: http}
+          resources:
+            requests: {cpu: "250m", memory: "256Mi"}
+            limits: {cpu: "1", memory: "2Gi"}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: trpc-admin
+spec:
+  type: ClusterIP # never exposed externally
+  selector: {app: trpc-admin}
+  ports:
+    - {port: 8081, targetPort: http}

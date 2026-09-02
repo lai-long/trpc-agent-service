@@ -55,6 +55,7 @@ func (EchoProcessor) Process(_ context.Context, msg channels.InboundMessage) (ch
 		Text:       "echo: " + msg.Text,
 		TenantID:   msg.TenantID,
 		TraceID:    msg.TraceID,
+		ReceivedAt: msg.ReceivedAt,
 	}, nil
 }
 

@@ -171,3 +171,65 @@ func TestSenderRateLimitedRequeues(t *testing.T) {
 	}
 	t.Fatal("rate-limited message vanished from the stream")
 }
+
+// A tenant send override (rate_policy send_qps/send_burst) replaces the
+// platform default bucket shape (design 5.3.2 按 {channel}:{tenant} 限速).
+func TestSenderTenantRateOverride(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	rdb, err := storage.NewRedis(ctx, "localhost:6380")
+	if err != nil {
+		t.Skipf("redis unavailable (%v), skipping integration test", err)
+	}
+	t.Cleanup(func() { _ = rdb.Close() })
+
+	stream := storage.NewStream(rdb)
+	outbound := "test:rl-tenant:out:" + t.Name()
+	t.Cleanup(func() { rdb.Del(context.Background(), outbound) })
+	t.Cleanup(func() {
+		rdb.Del(context.Background(), "ratelimit:send:counting:t-fast", "ratelimit:send:counting:t-slow")
+	})
+	if err := stream.EnsureGroup(ctx, outbound, "senders"); err != nil {
+		t.Fatal(err)
+	}
+
+	ch := &countingChannel{}
+	sender := &channels.Sender{
+		Stream: stream, Channels: map[string]channels.Channel{"counting": ch},
+		Name: "test-rl-tenant", InStream: outbound,
+		// Platform default is slow (1 token / 100s); the tenant override is fast.
+		Limiter: storage.NewLimiter(rdb), SendQPS: 0.01, SendBurst: 1, SendWait: 300 * time.Millisecond,
+		SendPolicyFor: func(_ context.Context, tenantID string) (float64, int, bool) {
+			if tenantID == "t-fast" {
+				return 100, 10, true
+			}
+			return 0, 0, false
+		},
+	}
+	go func() { _ = sender.Run(ctx) }()
+
+	mk := func(id, tenant string) []byte {
+		payload, _ := json.Marshal(channels.OutboundMessage{
+			Channel: "counting", MsgID: id, SessionKey: "dm:counting:u1",
+			UserID: "u1", Text: "hi", TenantID: tenant,
+		})
+		return payload
+	}
+	// Two sends each: t-fast's override lets both through quickly; t-slow's
+	// second one waits for the default bucket and gets re-queued.
+	for _, m := range [][2]string{{"fast-a", "t-fast"}, {"fast-b", "t-fast"}, {"slow-a", "t-slow"}, {"slow-b", "t-slow"}} {
+		if _, err := stream.Add(ctx, outbound, mk(m[0], m[1])); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if ch.Calls() >= 3 { // fast-a, fast-b, slow-a
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("want 3 sends (override tenant not throttled), got %d", ch.Calls())
+}

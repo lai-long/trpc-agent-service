@@ -258,6 +258,17 @@ func serve(role string) error {
 			SendQPS:   parseFloat(cfg.SendRateQPS, 20),
 			SendBurst: parseInt(cfg.SendRateBurst, 40),
 		}
+		// Per-tenant send pacing override (tenant.rate_policy send_qps/burst).
+		if resolver != nil {
+			sender.SendPolicyFor = func(ctx context.Context, tenantID string) (float64, int, bool) {
+				t, err := resolver.TenantByID(ctx, tenantID)
+				if err != nil {
+					return 0, 0, false
+				}
+				rl := tenant.ParseRateLimit(t.RatePolicy)
+				return rl.SendQPS, rl.SendBurst, rl.SendQPS > 0 && rl.SendBurst > 0
+			}
+		}
 		g.Go(func() error { return sender.Run(gctx) })
 	}
 
@@ -522,13 +533,26 @@ func buildProcessor(ctx context.Context, cfg config.Config, rdb *redis.Client, a
 		}
 	}
 	wrap := func(inner agent.Processor) agent.Processor {
-		return &agent.Guarded{
+		g := &agent.Guarded{
 			Inner:    inner,
 			Approver: approver,
 			Auditor:  auditor,
 			Input:    []agent.InputChecker{agent.SensitiveWordInput(agent.DefaultBlockedWords)},
 			Output:   []agent.OutputChecker{agent.RedactOutput()},
+			Budget:   storage.NewBudget(rdb),
 		}
+		// Tenant guardrail policies (guardrail_policy) resolve through the
+		// resolver's cached snapshot.
+		if resolver != nil {
+			g.PolicyFor = func(ctx context.Context, tenantID string) (tenant.GuardrailPolicy, error) {
+				t, err := resolver.TenantByID(ctx, tenantID)
+				if err != nil {
+					return tenant.GuardrailPolicy{}, err
+				}
+				return tenant.ParseGuardrailPolicy(t.GuardrailPolicy), nil
+			}
+		}
+		return g
 	}
 
 	if len(sessByType) == 0 {

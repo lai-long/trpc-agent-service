@@ -85,12 +85,13 @@ func (a *AdminAPI) auth(next http.HandlerFunc) http.HandlerFunc {
 
 func (a *AdminAPI) createTenant(w http.ResponseWriter, r *http.Request) {
 	var in struct {
-		Name          string          `json:"name"`
-		ModelConfig   json.RawMessage `json:"model_config"`
-		ToolPolicy    json.RawMessage `json:"tool_policy"`
-		AuditPolicy   json.RawMessage `json:"audit_policy"`
-		RatePolicy    json.RawMessage `json:"rate_policy"`
-		StorageConfig json.RawMessage `json:"storage_config"`
+		Name            string          `json:"name"`
+		ModelConfig     json.RawMessage `json:"model_config"`
+		ToolPolicy      json.RawMessage `json:"tool_policy"`
+		AuditPolicy     json.RawMessage `json:"audit_policy"`
+		GuardrailPolicy json.RawMessage `json:"guardrail_policy"`
+		RatePolicy      json.RawMessage `json:"rate_policy"`
+		StorageConfig   json.RawMessage `json:"storage_config"`
 	}
 	if !decodeBody(w, r, &in) {
 		return
@@ -101,10 +102,10 @@ func (a *AdminAPI) createTenant(w http.ResponseWriter, r *http.Request) {
 	}
 	var id string
 	err := a.pool.QueryRow(r.Context(),
-		`INSERT INTO tenant (name, model_config, tool_policy, audit_policy, rate_policy, storage_config)
-		 VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
+		`INSERT INTO tenant (name, model_config, tool_policy, audit_policy, guardrail_policy, rate_policy, storage_config)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
 		in.Name, rawOrNil(in.ModelConfig), rawOrNil(in.ToolPolicy),
-		rawOrNil(in.AuditPolicy), rawOrNil(in.RatePolicy), rawOrNil(in.StorageConfig)).Scan(&id)
+		rawOrNil(in.AuditPolicy), rawOrNil(in.GuardrailPolicy), rawOrNil(in.RatePolicy), rawOrNil(in.StorageConfig)).Scan(&id)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -139,14 +140,14 @@ func (a *AdminAPI) listTenants(w http.ResponseWriter, r *http.Request) {
 
 func (a *AdminAPI) getTenant(w http.ResponseWriter, r *http.Request) {
 	var (
-		name, status                                     string
-		modelCfg, toolPol, auditPol, ratePol, storageCfg []byte
-		createdAt, updatedAt                             time.Time
+		name, status                                               string
+		modelCfg, toolPol, auditPol, guardPol, ratePol, storageCfg []byte
+		createdAt, updatedAt                                       time.Time
 	)
 	err := a.pool.QueryRow(r.Context(),
-		`SELECT name, status, model_config, tool_policy, audit_policy, rate_policy, storage_config, created_at, updated_at
+		`SELECT name, status, model_config, tool_policy, audit_policy, guardrail_policy, rate_policy, storage_config, created_at, updated_at
 		 FROM tenant WHERE id = $1`, r.PathValue("id"),
-	).Scan(&name, &status, &modelCfg, &toolPol, &auditPol, &ratePol, &storageCfg, &createdAt, &updatedAt)
+	).Scan(&name, &status, &modelCfg, &toolPol, &auditPol, &guardPol, &ratePol, &storageCfg, &createdAt, &updatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		writeError(w, http.StatusNotFound, "tenant not found")
 		return
@@ -158,7 +159,7 @@ func (a *AdminAPI) getTenant(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"id": r.PathValue("id"), "name": name, "status": status,
 		"model_config": jsonOrNull(modelCfg), "tool_policy": jsonOrNull(toolPol),
-		"audit_policy": jsonOrNull(auditPol), "rate_policy": jsonOrNull(ratePol),
+		"audit_policy": jsonOrNull(auditPol), "guardrail_policy": jsonOrNull(guardPol), "rate_policy": jsonOrNull(ratePol),
 		"storage_config": jsonOrNull(storageCfg),
 		"created_at":     createdAt, "updated_at": updatedAt,
 	})
@@ -166,13 +167,14 @@ func (a *AdminAPI) getTenant(w http.ResponseWriter, r *http.Request) {
 
 func (a *AdminAPI) updateTenant(w http.ResponseWriter, r *http.Request) {
 	var in struct {
-		Name          *string         `json:"name"`
-		Status        *string         `json:"status"`
-		ModelConfig   json.RawMessage `json:"model_config"`
-		ToolPolicy    json.RawMessage `json:"tool_policy"`
-		AuditPolicy   json.RawMessage `json:"audit_policy"`
-		RatePolicy    json.RawMessage `json:"rate_policy"`
-		StorageConfig json.RawMessage `json:"storage_config"`
+		Name            *string         `json:"name"`
+		Status          *string         `json:"status"`
+		ModelConfig     json.RawMessage `json:"model_config"`
+		ToolPolicy      json.RawMessage `json:"tool_policy"`
+		AuditPolicy     json.RawMessage `json:"audit_policy"`
+		GuardrailPolicy json.RawMessage `json:"guardrail_policy"`
+		RatePolicy      json.RawMessage `json:"rate_policy"`
+		StorageConfig   json.RawMessage `json:"storage_config"`
 	}
 	if !decodeBody(w, r, &in) {
 		return
@@ -196,6 +198,9 @@ func (a *AdminAPI) updateTenant(w http.ResponseWriter, r *http.Request) {
 	}
 	if in.AuditPolicy != nil {
 		add("audit_policy = $%d", []byte(in.AuditPolicy))
+	}
+	if in.GuardrailPolicy != nil {
+		add("guardrail_policy = $%d", []byte(in.GuardrailPolicy))
 	}
 	if in.RatePolicy != nil {
 		add("rate_policy = $%d", []byte(in.RatePolicy))

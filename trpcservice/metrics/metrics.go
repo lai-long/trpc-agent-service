@@ -49,6 +49,9 @@ var (
 	OutboundTotal otelmetric.Int64Counter
 	// TokensTotal counts LLM token usage by kind (prompt / completion).
 	TokensTotal otelmetric.Int64Counter
+	// EndToEndDuration is the full message latency: IM callback arrival to the
+	// reply landing on the IM (design 5.2.4 延迟 row; the 15s P95 budget).
+	EndToEndDuration otelmetric.Float64Histogram
 	// GatewayRejectedTotal counts callbacks rejected before enqueue, by reason
 	// (rate_limited / backpressure): the noisy-neighbor and overload defenses
 	// of design 5.1.4 firing.
@@ -78,6 +81,10 @@ func init() {
 		panic(err)
 	}
 	if TokensTotal, err = meter.Int64Counter("llm_tokens_total"); err != nil {
+		panic(err)
+	}
+	if EndToEndDuration, err = meter.Float64Histogram("im_end_to_end_duration",
+		otelmetric.WithUnit("ms")); err != nil {
 		panic(err)
 	}
 	if GatewayRejectedTotal, err = meter.Int64Counter("gateway_rejected_total"); err != nil {

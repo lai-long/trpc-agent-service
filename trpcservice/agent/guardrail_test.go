@@ -13,6 +13,7 @@ import (
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/storage"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tool"
 )
 
@@ -316,5 +317,129 @@ func TestGuardedRecall(t *testing.T) {
 	}
 	if n := len(aud.asyncDecisions()); n != 0 {
 		t.Fatalf("recall must not get a routine allow event, got %d", n)
+	}
+}
+
+// fakeBudget is a BudgetGate stub.
+type fakeBudget struct {
+	allowed  bool
+	recorded map[string]int64
+}
+
+func (f *fakeBudget) Allow(context.Context, string, int64) (bool, error) { return f.allowed, nil }
+func (f *fakeBudget) Record(_ context.Context, tenantID string, tokens int64) {
+	f.recorded[tenantID] += tokens
+}
+
+// policyStub returns one fixed policy.
+func policyStub(p tenant.GuardrailPolicy) func(context.Context, string) (tenant.GuardrailPolicy, error) {
+	return func(context.Context, string) (tenant.GuardrailPolicy, error) { return p, nil }
+}
+
+func TestGuardedUserAllowlist(t *testing.T) {
+	aud := &fakeAuditor{}
+	g := &Guarded{
+		Inner:   EchoProcessor{},
+		Auditor: aud,
+		PolicyFor: policyStub(tenant.GuardrailPolicy{
+			InputAllowUsers: []string{"vip-user"},
+		}),
+	}
+	// A user outside the allowlist is denied before the model runs.
+	out, err := g.Process(context.Background(), testMsg("hello"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.Text, "权限") {
+		t.Fatalf("want permission denial, got %q", out.Text)
+	}
+	evs := aud.syncDecisions()
+	if len(evs) != 1 || evs[0].Decision != "deny" || evs[0].ErrorType != "user_not_allowed" {
+		t.Fatalf("want sync deny/user_not_allowed, got %+v", evs)
+	}
+
+	// The allowed user passes.
+	msg := testMsg("hello")
+	msg.UserID = "vip-user"
+	if _, err := g.Process(context.Background(), msg); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(aud.asyncDecisions()); n != 1 {
+		t.Fatalf("allowed user must get the allow event, got %d", n)
+	}
+}
+
+func TestGuardedTenantDenyWordsReplaceBaseline(t *testing.T) {
+	aud := &fakeAuditor{}
+	g := &Guarded{
+		Inner:   EchoProcessor{},
+		Auditor: aud,
+		// Baseline blocks 赌博; the tenant list replaces it with 芒果.
+		Input:     []InputChecker{SensitiveWordInput(DefaultBlockedWords)},
+		PolicyFor: policyStub(tenant.GuardrailPolicy{InputDenyWords: []string{"芒果"}}),
+	}
+	if _, err := g.Process(context.Background(), testMsg("来赌博吧")); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(aud.syncDecisions()); n != 0 {
+		t.Fatal("baseline word must NOT fire when the tenant overrides the list")
+	}
+	out, err := g.Process(context.Background(), testMsg("想吃芒果"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.Text, "受限内容") {
+		t.Fatalf("tenant deny word must block, got %q", out.Text)
+	}
+}
+
+func TestGuardedOutputDenyWords(t *testing.T) {
+	aud := &fakeAuditor{}
+	g := &Guarded{
+		Inner:     EchoProcessor{},
+		Auditor:   aud,
+		PolicyFor: policyStub(tenant.GuardrailPolicy{OutputDenyWords: []string{"内部"}}),
+	}
+	out, err := g.Process(context.Background(), testMsg("这是内部消息"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.Text, "受限内容") {
+		t.Fatalf("output deny word must replace the reply, got %q", out.Text)
+	}
+	evs := aud.syncDecisions()
+	if len(evs) != 1 || evs[0].ErrorType != "sensitive_output" {
+		t.Fatalf("want sync deny/sensitive_output, got %+v", evs)
+	}
+}
+
+func TestGuardedBudgetGate(t *testing.T) {
+	aud := &fakeAuditor{}
+	fb := &fakeBudget{allowed: false, recorded: map[string]int64{}}
+	g := &Guarded{
+		Inner:     usageProcessor{},
+		Auditor:   aud,
+		Budget:    fb,
+		PolicyFor: policyStub(tenant.GuardrailPolicy{MaxTokensPerDay: 1000}),
+	}
+	out, err := g.Process(context.Background(), testMsg("hello"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.Text, "上限") {
+		t.Fatalf("want budget denial, got %q", out.Text)
+	}
+	evs := aud.syncDecisions()
+	if len(evs) != 1 || evs[0].ErrorType != "budget_exceeded" {
+		t.Fatalf("want sync deny/budget_exceeded, got %+v", evs)
+	}
+
+	// Under budget: the run proceeds and tokens are recorded.
+	fb.allowed = true
+	if _, err := g.Process(context.Background(), testMsg("hello")); err != nil {
+		t.Fatal(err)
+	}
+	if fb.recorded["t1"] != 1500 {
+		t.Fatalf("want 1500 tokens recorded for t1, got %v", fb.recorded)
 	}
 }
