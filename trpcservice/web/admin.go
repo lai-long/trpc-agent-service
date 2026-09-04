@@ -21,9 +21,9 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 )
 
-// AdminAPI serves the management endpoints of design 5.4: tenant/app CRUD,
+// AdminAPI serves the management endpoints: tenant/app CRUD,
 // publish/rollback with atomic switching, channel binding management,
-// storage-migration control (5.2.6) and audit queries. It is intended for
+// storage-migration control and audit queries. It is intended for
 // internal networks only; authentication is a bearer token
 // (TRPC_ADMIN_TOKEN) — empty means dev mode (no auth).
 type AdminAPI struct {
@@ -41,7 +41,7 @@ type AdminAPI struct {
 	// ModelHosts is the platform-level allowlist of model endpoint hosts
 	// (config.Config.ModelHostAllowlist). Tenant and app configs may only
 	// point their runner at these hosts: conversation content flows to the
-	// model endpoint, so the choice is platform policy (design 5.4). Nil
+	// model endpoint, so the choice is platform policy. Nil
 	// falls back to agent.DefaultModelHosts.
 	ModelHosts []string
 }
@@ -243,8 +243,8 @@ func (a *AdminAPI) updateTenant(w http.ResponseWriter, r *http.Request) {
 		add("rate_policy = $%d", []byte(in.RatePolicy))
 	}
 	if in.StorageConfig != nil {
-		// storage_config changes must go through the migration flow (design
-		// 5.2.6); live switching is rejected here.
+		// storage_config changes must go through the migration flow;
+		// live switching is rejected here.
 		writeError(w, http.StatusConflict,
 			"storage_config cannot be changed directly; use the migration flow")
 		return
@@ -341,7 +341,7 @@ func (a *AdminAPI) listApps(w http.ResponseWriter, r *http.Request) {
 }
 
 // updateApp edits a draft's config; published versions are immutable
-// snapshots so rollback stays a pure status switch (design 5.2.3).
+// snapshots so rollback stays a pure status switch.
 func (a *AdminAPI) updateApp(w http.ResponseWriter, r *http.Request) {
 	var in struct {
 		Config json.RawMessage `json:"config"`
@@ -375,7 +375,7 @@ func (a *AdminAPI) updateApp(w http.ResponseWriter, r *http.Request) {
 
 // publishApp atomically switches the (tenant, name) published version: the
 // previously published version leaves published status and the target takes
-// it, guarded by the partial unique index (design 5.1.3).
+// it, guarded by the partial unique index.
 func (a *AdminAPI) publishApp(w http.ResponseWriter, r *http.Request) {
 	before := a.rowJSON(r.Context(), "agent_app", "id", r.PathValue("id"))
 	tenantID, err := a.publish(r.Context(), r.PathValue("id"))
@@ -474,7 +474,7 @@ func (a *AdminAPI) publish(ctx context.Context, appID string) (string, error) {
 	if status == "published" {
 		return "", errConflict("app version is already published")
 	}
-	// The allowlist applies at publish time too (design 5.4): a draft stored
+	// The allowlist applies at publish time too: a draft stored
 	// before a policy change must not become the serving version, and a
 	// rollback to such a version is blocked by the same gate.
 	if err := agent.ValidateAppConfig(config, a.ModelHosts); err != nil {
@@ -518,20 +518,32 @@ func (a *AdminAPI) createBinding(w http.ResponseWriter, r *http.Request) {
 	if !decodeBody(w, r, &in) {
 		return
 	}
-	if in.Channel == "" || in.WebhookPath == "" {
-		writeError(w, http.StatusBadRequest, "channel and webhook_path are required")
+	if in.Channel == "" {
+		writeError(w, http.StatusBadRequest, "channel is required")
 		return
 	}
-	var id, tenantID string
+	var id, tenantID, webhookPath string
 	// Only a published app is bindable: binding a draft would route traffic
-	// around the gray-release flow (design 5.2.3).
+	// around the gray-release flow.
+	//
+	// An empty webhook_path is filled with the canonical binding-scoped
+	// callback path /callback/{channel}/{binding_id} (design 5.3.1): the id
+	// is generated in the same statement that writes the row, so the path
+	// the dispatcher resolves is self-consistent — the caller cannot know a
+	// DB-generated id up front, which made the binding-scoped path
+	// unreachable through this API.
 	err := a.pool.QueryRow(r.Context(),
-		`INSERT INTO channel_binding (tenant_id, channel, app_id, webhook_path, token_ref, aeskey_ref, config)
-		 SELECT tenant_id, $2, id, $3, $4, $5, $6 FROM agent_app WHERE id = $1 AND status = 'published'
-		 RETURNING id, tenant_id`,
+		`WITH new_id AS (SELECT gen_random_uuid()::text AS id)
+		 INSERT INTO channel_binding (id, tenant_id, channel, app_id, webhook_path, token_ref, aeskey_ref, config)
+		 SELECT n.id::uuid, a.tenant_id, $2::varchar, a.id,
+		        COALESCE(NULLIF($3::varchar, ''), '/callback/' || $2::varchar || '/' || n.id),
+		        $4, $5, $6
+		 FROM agent_app a CROSS JOIN new_id n
+		 WHERE a.id = $1::uuid AND a.status = 'published'
+		 RETURNING id::text, tenant_id::text, webhook_path`,
 		r.PathValue("id"), in.Channel, in.WebhookPath,
 		nullStr(in.TokenRef), nullStr(in.AESKeyRef), rawOrNil(in.Config),
-	).Scan(&id, &tenantID)
+	).Scan(&id, &tenantID, &webhookPath)
 	if errors.Is(err, pgx.ErrNoRows) {
 		writeError(w, http.StatusNotFound, "app not found or not published")
 		return
@@ -545,10 +557,10 @@ func (a *AdminAPI) createBinding(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.afterWrite(r, "create_binding", tenantID, nil, map[string]any{
-		"id": id, "channel": in.Channel, "webhook_path": in.WebhookPath,
+		"id": id, "channel": in.Channel, "webhook_path": webhookPath,
 		"token_ref": in.TokenRef, "aeskey_ref": in.AESKeyRef, "config": in.Config,
 	})
-	writeJSON(w, http.StatusCreated, map[string]any{"id": id})
+	writeJSON(w, http.StatusCreated, map[string]any{"id": id, "webhook_path": webhookPath})
 }
 
 func (a *AdminAPI) listBindings(w http.ResponseWriter, r *http.Request) {
@@ -648,7 +660,7 @@ func (a *AdminAPI) addKnowledgeDocument(w http.ResponseWriter, r *http.Request) 
 }
 
 // ---------------------------------------------------------------------------
-// Storage migrations (design 5.2.6)
+// Storage migrations
 // ---------------------------------------------------------------------------
 
 // createMigration starts a backend migration for one tenant. The row appears
@@ -807,10 +819,9 @@ func (a *AdminAPI) queryAudit(w http.ResponseWriter, r *http.Request) {
 // helpers
 // ---------------------------------------------------------------------------
 
-// afterWrite audits the write operation (operator + before/after content,
-// design 5.4 变更审计) and broadcasts config invalidation (design 5.2.3:
-// workers drop their cache within seconds; TTL is the fallback when the
-// notification is lost).
+// afterWrite audits the write operation (operator + before/after content)
+// and broadcasts config invalidation: workers drop their cache within
+// seconds; TTL is the fallback when the notification is lost.
 func (a *AdminAPI) afterWrite(r *http.Request, op, tenantID string, before, after any) {
 	if a.rdb != nil {
 		if err := tenant.PublishInvalidation(r.Context(), a.rdb); err != nil {

@@ -53,7 +53,7 @@ func doJSON(t *testing.T, mux *http.ServeMux, method, path, body string) (int, m
 }
 
 // TestAdminModelAllowlist enforces the platform model-endpoint allowlist on
-// every config write path (design 5.4). The API is built with a nil pool: the
+// every config write path. The API is built with a nil pool: the
 // allowlist check precedes any query, so a rejected request proves the gate
 // without needing PG. publishApp applies the same validator inside its
 // transaction; the agent-side ValidateAppConfig unit tests cover that branch,
@@ -139,7 +139,7 @@ func TestAdminLifecycle(t *testing.T) {
 		t.Fatalf("tool_policy round trip failed: %v", out["tool_policy"])
 	}
 
-	// storage_config is migration-flow only (risk 9): direct change rejected.
+	// storage_config is migration-flow only: direct change rejected.
 	code, _ = doJSON(t, mux, http.MethodPatch, "/admin/tenants/"+tenantID,
 		`{"storage_config":{"session":{"type":"pg"}}}`)
 	if code != http.StatusConflict {
@@ -220,6 +220,18 @@ func TestAdminLifecycle(t *testing.T) {
 		t.Fatalf("create binding: %d %v", code, out)
 	}
 	bindingID, _ = out["id"].(string)
+	// Empty webhook_path: the canonical binding-scoped callback path is
+	// derived from the DB-generated id in the same statement, so the route
+	// the dispatcher resolves is self-consistent (design 5.3.1).
+	code, out = doJSON(t, mux, http.MethodPost, "/admin/apps/"+appV1+"/bindings",
+		`{"channel":"wecom","token_ref":"wecom-token"}`)
+	if code != http.StatusCreated {
+		t.Fatalf("create auto-path binding: %d %v", code, out)
+	}
+	autoID, _ := out["id"].(string)
+	if got, _ := out["webhook_path"].(string); got != "/callback/wecom/"+autoID {
+		t.Fatalf("auto webhook_path = %q, want /callback/wecom/%s", got, autoID)
+	}
 	// Duplicate webhook_path is rejected by the unique constraint.
 	code, _ = doJSON(t, mux, http.MethodPost, "/admin/apps/"+appV1+"/bindings",
 		`{"channel":"mock","webhook_path":"/wecom/admin-test"}`)
@@ -227,7 +239,7 @@ func TestAdminLifecycle(t *testing.T) {
 		t.Fatalf("duplicate webhook_path must be 409, got %d", code)
 	}
 	list := doJSONList(t, mux, "/admin/apps/"+appV1+"/bindings")
-	if len(list) != 1 || list[0]["webhook_path"] != "/wecom/admin-test" {
+	if len(list) != 2 || list[0]["webhook_path"] != "/wecom/admin-test" {
 		t.Fatalf("list bindings: %+v", list)
 	}
 	if list[0]["token_ref"] != "wecom-token" {
@@ -386,9 +398,8 @@ func TestAdminAuthAndAuditQuery(t *testing.T) {
 	}
 }
 
-// A write operation must be audited with its before/after content (design 5.4
-// 变更审计): creating a tenant leaves an audit row whose detail carries the
-// creation payload.
+// A write operation must be audited with its before/after content: creating a
+// tenant leaves an audit row whose detail carries the creation payload.
 func TestAdminAuditDetail(t *testing.T) {
 	ctx := context.Background()
 	pool := testenv.PG(t)
@@ -456,7 +467,7 @@ func TestAdminAuditDetail(t *testing.T) {
 }
 
 // Storage-migration endpoints: create validates the backend pair and the
-// one-active-per-tenant constraint; get reports the phase (design 5.2.6).
+// one-active-per-tenant constraint; get reports the phase.
 func TestAdminStorageMigration(t *testing.T) {
 	mux, pool := adminTestAPI(t)
 	ctx := context.Background()
