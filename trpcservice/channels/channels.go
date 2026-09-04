@@ -155,6 +155,9 @@ func SplitText(s string, n int) []string {
 		for cut > 0 && (s[cut]&0xC0) == 0x80 { // don't split inside a UTF-8 sequence
 			cut--
 		}
+		if cut == 0 {
+			cut = n // invalid UTF-8: split mid-rune rather than loop forever
+		}
 		out = append(out, s[:cut])
 		s = s[cut:]
 	}
