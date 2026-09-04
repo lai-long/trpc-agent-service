@@ -39,6 +39,17 @@ const (
 	MetadataAppID    = "app_id"
 )
 
+// knowledgeFilter scopes one agent's knowledge search to a tenant/app pair.
+//
+// Both keys are always present: the framework reads an empty filter as "no
+// predicate", so omitting it for want of a resolved tenant would search the
+// whole shared table and answer from every tenant's documents. The empty pair
+// matches nothing instead — admin ingestion always files a document under a
+// real tenant and app, so no row satisfies an empty tenant_id.
+func knowledgeFilter(tenantID, appID string) map[string]any {
+	return map[string]any{MetadataTenantID: tenantID, MetadataAppID: appID}
+}
+
 // DocSource is an inline single-document source for admin ingestion: the
 // document comes from the request body instead of a file or URL.
 type DocSource struct {

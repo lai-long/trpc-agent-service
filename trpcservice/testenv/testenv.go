@@ -1,18 +1,22 @@
-// Package testenv gates the integration tests' infrastructure dependencies
-// through environment variables: CI services and dev shells set them
-// explicitly, so every skip message names the variable that enables the
-// test, and a CI run with skips > 0 fails the build instead of silently
-// shrugging past the platform's core paths.
+// Package testenv holds what the integration tests share: the infrastructure
+// dependencies are gated through environment variables — CI services and dev
+// shells set them explicitly, so every skip message names the variable that
+// enables the test, and a CI run with skips > 0 fails the build instead of
+// silently shrugging past the platform's core paths.
 package testenv
 
 import (
 	"context"
+	"io"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
+
+	plog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
 )
 
 // RedisAddr is the test Redis address (TRPC_TEST_REDIS_ADDR); the default
@@ -68,4 +72,41 @@ func PG(t *testing.T) *pgxpool.Pool {
 	}
 	t.Cleanup(pool.Close)
 	return pool
+}
+
+// CaptureLogs redirects the service logger into a pipe at the given level and
+// returns a function yielding everything written to it. plog builds its core
+// against os.Stderr when Init runs, so the swap has to precede the Init;
+// stopping restores os.Stderr and rebuilds the logger at the package default
+// (info, console) so later tests are unaffected. The stop is idempotent and
+// also registered as a cleanup: a test that fails before calling it must not
+// leave the pipe installed as the process stderr.
+func CaptureLogs(t *testing.T, level string) func() string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := os.Stderr
+	os.Stderr = w
+	plog.Init(level, false)
+
+	var (
+		once sync.Once
+		out  string
+	)
+	stop := func() string {
+		once.Do(func() {
+			plog.Sync()
+			os.Stderr = old
+			plog.Init("info", true)
+			_ = w.Close()
+			b, _ := io.ReadAll(r)
+			_ = r.Close()
+			out = string(b)
+		})
+		return out
+	}
+	t.Cleanup(func() { stop() })
+	return stop
 }

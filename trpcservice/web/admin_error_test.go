@@ -10,17 +10,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/agent"
-	plog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/storage"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/testenv"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/web"
@@ -562,43 +558,6 @@ func TestAdminDeadPool(t *testing.T) {
 	}
 }
 
-// captureLogs redirects the service logger into a pipe and returns a function
-// yielding everything written to it. plog builds its core against os.Stderr
-// when Init runs, so the swap has to precede the Init; stopping restores
-// os.Stderr and rebuilds the logger at the package's default (info, console)
-// so later tests are unaffected. Idempotent, and always run at cleanup: a test
-// that fails before calling stop must not leave the pipe as the process
-// stderr.
-func captureLogs(t *testing.T) func() string {
-	t.Helper()
-	r, w, err := os.Pipe()
-	if err != nil {
-		t.Fatal(err)
-	}
-	old := os.Stderr
-	os.Stderr = w
-	plog.Init("error", false)
-
-	var (
-		once sync.Once
-		out  string
-	)
-	stop := func() string {
-		once.Do(func() {
-			plog.Sync()
-			os.Stderr = old
-			plog.Init("info", true)
-			_ = w.Close()
-			b, _ := io.ReadAll(r)
-			_ = r.Close()
-			out = string(b)
-		})
-		return out
-	}
-	t.Cleanup(func() { stop() })
-	return stop
-}
-
 // A failure that came from the database must answer with the operation that
 // failed and nothing else. pgx and pgconn text names tables, columns and
 // constraints, quotes the statement and its SQLSTATE, and on a connection
@@ -607,7 +566,7 @@ func captureLogs(t *testing.T) func() string {
 // operator still gets the whole error, from the log.
 func TestAdminInternalErrorHidesDriverText(t *testing.T) {
 	mux, _ := adminTestAPI(t)
-	stop := captureLogs(t)
+	stop := testenv.CaptureLogs(t, "error")
 
 	// Each of these makes the id column's uuid cast fail, so the handler
 	// answers from its driver-error branch with a real Postgres error behind

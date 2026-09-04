@@ -315,9 +315,15 @@ func (a *Assembler) processorFor(ctx context.Context, appID string) (Processor, 
 func (a *Assembler) resolveApp(ctx context.Context, appID string) (tenant.AgentApp, tenant.Tenant, error) {
 	if appID == "" {
 		if a.cfg.Apps != nil && a.cfg.DefaultApp != "" {
-			if app, t, err := a.cfg.Apps.AppByID(ctx, a.cfg.DefaultApp); err == nil {
+			app, t, err := a.cfg.Apps.AppByID(ctx, a.cfg.DefaultApp)
+			if err == nil {
 				return app, t, nil
 			}
+			// Never take the tenant-less fallback silently: the app below runs
+			// with no tenant policies at all, so the reason has to be in the
+			// log next to the message it served.
+			plog.Warnf("default app %s unresolved (%v), serving without tenant policies",
+				a.cfg.DefaultApp, err)
 		}
 		return tenant.AgentApp{ID: a.cfg.DefaultApp, Name: "default"}, tenant.Tenant{}, nil
 	}
@@ -362,12 +368,8 @@ func (a *Assembler) assemble(ctx context.Context, app tenant.AgentApp, t tenant.
 	sess := a.sessionServiceFor(t)
 
 	// Knowledge isolation: the shared pgvector base is filtered down to this
-	// tenant/app pair. Without a resolved tenant (env-only fallback) the
-	// filter stays empty — that path is single-tenant dev only.
-	var filter map[string]any
-	if t.ID != "" {
-		filter = map[string]any{MetadataTenantID: t.ID, MetadataAppID: app.ID}
-	}
+	// tenant/app pair.
+	filter := knowledgeFilter(t.ID, app.ID)
 	return NewRunnerProcessor(RunnerConfig{
 		AppName:         app.ID,
 		BaseURL:         spec.BaseURL,

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -13,6 +14,7 @@ import (
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/storage"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/testenv"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tool"
 )
 
@@ -189,6 +191,51 @@ func TestAssemblerDefaultAppFallback(t *testing.T) {
 	}
 	if _, ok := a.cache["a1"]; !ok || p == nil {
 		t.Fatalf("default app a1 should be assembled and cached, cache=%v", a.cache)
+	}
+}
+
+// The tenant-less fallback is deliberate, but it may not be quiet: the app it
+// builds runs with no tenant tool policy, no rate limit, no budget and no
+// guardrail policy, so an operator has to be able to see that a message took
+// that path and why.
+func TestAssemblerTenantlessFallbackIsLogged(t *testing.T) {
+	stop := testenv.CaptureLogs(t, "warn")
+
+	// A provider that cannot resolve the default app (unknown row, disabled
+	// tenant, a snapshot that failed to load) is what sends resolveApp down
+	// the fallback.
+	a := testAssembler(&fakeApps{
+		apps:    map[string]tenant.AgentApp{},
+		tenants: map[string]tenant.Tenant{},
+	}, fakeSecrets{values: map[string]string{"env-key": "sk"}})
+	defer func() { _ = a.Close() }()
+
+	if _, err := a.processorFor(context.Background(), ""); err != nil {
+		t.Fatalf("the env-only fallback must still serve: %v", err)
+	}
+	logged := stop()
+	if !strings.Contains(logged, "default app a1 unresolved") ||
+		!strings.Contains(logged, "serving without tenant policies") {
+		t.Fatalf("the fallback must name the app and the consequence, got %q", logged)
+	}
+}
+
+// A missing knowledge filter is not a neutral value: the framework reads an
+// empty filter as "no predicate" and searches the shared pgvector table, so an
+// app with no resolved tenant would answer from every tenant's documents. The
+// empty pair matches nothing instead.
+func TestKnowledgeFilterIsNeverAbsent(t *testing.T) {
+	scoped := knowledgeFilter("t1", "a1")
+	if scoped[MetadataTenantID] != "t1" || scoped[MetadataAppID] != "a1" {
+		t.Fatalf("a resolved tenant must scope the search, got %v", scoped)
+	}
+
+	unscoped := knowledgeFilter("", "a1")
+	if len(unscoped) != 2 {
+		t.Fatalf("want both keys even without a tenant, got %v", unscoped)
+	}
+	if v, ok := unscoped[MetadataTenantID]; !ok || v != "" {
+		t.Fatalf("an unresolved tenant must still yield a tenant_id predicate, got %v", unscoped)
 	}
 }
 
