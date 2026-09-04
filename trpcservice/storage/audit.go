@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -54,11 +55,19 @@ const (
 // critical decisions (deny / review) are written synchronously — they must
 // not be lost, even at the cost of milliseconds of latency.
 type Auditor struct {
-	pool    *pgxpool.Pool
-	ch      chan AuditEvent
-	cancel  context.CancelFunc
-	done    chan struct{}
+	pool   *pgxpool.Pool
+	ctx    context.Context // cancelled by Close; built once in NewAuditor, so it needs no lock
+	cancel context.CancelFunc
+	ch     chan AuditEvent
+	done   chan struct{}
+
 	dropped atomic.Uint64 // events lost to a sustained queue overload
+
+	// lifecycle hands the flush loop to whichever of Start and Close gets
+	// there first, and to nobody afterwards. Both are safe from any
+	// goroutine: cancel is written once at construction and done is closed
+	// by exactly one of the two.
+	lifecycle sync.Once
 }
 
 // Dropped returns how many events were lost to a sustained queue overload
@@ -67,66 +76,74 @@ func (a *Auditor) Dropped() uint64 { return a.dropped.Load() }
 
 // NewAuditor creates an Auditor on an established pool.
 func NewAuditor(pool *pgxpool.Pool) *Auditor {
+	ctx, cancel := context.WithCancel(context.Background())
 	return &Auditor{
-		pool: pool,
-		ch:   make(chan AuditEvent, auditQueueSize),
-		done: make(chan struct{}),
+		pool:   pool,
+		ctx:    ctx,
+		cancel: cancel,
+		ch:     make(chan AuditEvent, auditQueueSize),
+		done:   make(chan struct{}),
 	}
 }
 
-// Start runs the background flush loop until Close.
+// Start runs the background flush loop until Close. It is idempotent, and a
+// Start after Close does nothing: a second loop would take events off the same
+// queue from under the first, outlive the Close that was supposed to stop it,
+// and after a restart cycle close a.done a second time — panicking in the one
+// process that owns the audit trail.
 func (a *Auditor) Start() {
-	ctx, cancel := context.WithCancel(context.Background())
-	a.cancel = cancel
-	go func() {
-		defer close(a.done)
-		ticker := time.NewTicker(auditFlushInterval)
-		defer ticker.Stop()
-		buf := make([]AuditEvent, 0, auditBatchSize)
-		for {
-			select {
-			case ev := <-a.ch:
-				buf = append(buf, ev)
-				if len(buf) >= auditBatchSize {
-					a.flush(buf)
-					buf = buf[:0]
-				}
-			case <-ticker.C:
-				if len(buf) > 0 {
-					a.flush(buf)
-					buf = buf[:0]
-				}
-			case <-ctx.Done():
-				// Graceful shutdown: drain whatever is still queued before
-				// exiting. Stopping on the buffer alone would lose the burst
-				// that arrived right before Close.
-				for {
-					select {
-					case ev := <-a.ch:
-						buf = append(buf, ev)
-						if len(buf) >= auditBatchSize {
-							a.flush(buf)
-							buf = buf[:0]
-						}
-					default:
-						a.flush(buf)
-						return
-					}
-				}
-			}
-		}
-	}()
+	a.lifecycle.Do(func() { go a.loop() })
 }
 
 // Close stops the flush loop and waits for it to drain what is still queued.
-// It is safe to call before Start (or twice): an Auditor that never started
-// has no loop to stop.
+// It is safe to call before Start (or twice).
 func (a *Auditor) Close() {
-	if a.cancel == nil {
-		return
-	}
 	a.cancel()
+	// Never started, so the loop that would close done does not exist: close
+	// it here. Taking the Once is also what keeps a later Start from
+	// resurrecting a loop nobody is left to stop.
+	a.lifecycle.Do(func() { close(a.done) })
 	<-a.done
+}
+
+// loop batches the queue into audit_log until the context is cancelled.
+func (a *Auditor) loop() {
+	defer close(a.done)
+	ticker := time.NewTicker(auditFlushInterval)
+	defer ticker.Stop()
+	buf := make([]AuditEvent, 0, auditBatchSize)
+	for {
+		select {
+		case ev := <-a.ch:
+			buf = append(buf, ev)
+			if len(buf) >= auditBatchSize {
+				a.flush(buf)
+				buf = buf[:0]
+			}
+		case <-ticker.C:
+			if len(buf) > 0 {
+				a.flush(buf)
+				buf = buf[:0]
+			}
+		case <-a.ctx.Done():
+			// Graceful shutdown: drain whatever is still queued before
+			// exiting. Stopping on the buffer alone would lose the burst
+			// that arrived right before Close.
+			for {
+				select {
+				case ev := <-a.ch:
+					buf = append(buf, ev)
+					if len(buf) >= auditBatchSize {
+						a.flush(buf)
+						buf = buf[:0]
+					}
+				default:
+					a.flush(buf)
+					return
+				}
+			}
+		}
+	}
 }
 
 // LogAsync buffers a routine event.
