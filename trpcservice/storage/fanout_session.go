@@ -10,10 +10,10 @@ import (
 )
 
 // FanoutSessionService dual-writes two session backends during a storage
-// migration (design 5.2.6 双写): reads and summary queries go to the primary
-// (the authoritative side of the current phase); writes go to both, with
-// secondary failures logged rather than propagated — the backfill plus the
-// consistency check re-cover a missed secondary write before the read switch.
+// migration: reads and summary queries go to the primary (the authoritative
+// side); writes go to both, with secondary failures logged rather than
+// propagated — a later backfill and consistency check re-cover a missed
+// secondary write before reads switch.
 type FanoutSessionService struct {
 	Primary   session.Service // authoritative reads
 	Secondary session.Service // best-effort shadow writes
@@ -100,7 +100,7 @@ func (f *FanoutSessionService) GetSessionSummaryText(ctx context.Context, sess *
 func (f *FanoutSessionService) Close() error { return nil }
 
 // shadow logs a secondary write failure; the backfill and the pre-switch
-// consistency check are the compensation path (design 5.2.6 双写半边失败).
+// consistency check are the compensation path.
 func (f *FanoutSessionService) shadow(op string, err error) {
 	if err != nil {
 		plog.Warnf("migration shadow write %s failed (consistency check will catch it): %v", op, err)

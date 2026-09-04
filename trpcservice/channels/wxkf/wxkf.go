@@ -1,19 +1,19 @@
-// Package wxkf implements the WeChat KF (微信客服) Channel adapter.
+// Package wxkf implements the WeChat KF channel adapter.
 //
 // Inbound: the IM platform posts AES-encrypted JSON callbacks
 // ({"encrypt": "..."}); the adapter verifies the msg_signature and decrypts
 // via wxbizmsgcrypt (vendored at ./wxbizmsgcrypt — same algorithm family as
 // WeCom, different envelope format), normalizes the message and hands it to
 // the Handler. GET callbacks carry the URL-verification challenge (echostr).
-// Unlike WeCom there is no 5-second reply window; the async chain (design
-// 决策一) is shared unchanged.
+// Unlike WeCom there is no 5-second reply window; the async chain is shared
+// unchanged.
 //
 // Outbound: replies go through the customer-service send_msg API — the only
 // reply path, allowed only within 48 hours of the user's last message; window
-// violations surface as ordinary send errors for the sender to retry
-// (design 5.3.1). The access_token (exchanged with the KF-specific secret, not
-// the WeCom corpsecret) is cached in process and refreshed on expiry. Texts
-// longer than the platform limit are split into sequential segments (5.3.2).
+// violations surface as ordinary send errors for the sender to retry. The
+// access_token (exchanged with the KF-specific secret, not the WeCom
+// corpsecret) is cached in process and refreshed on expiry. Texts longer than
+// the platform limit are split into sequential segments.
 package wxkf
 
 import (
@@ -44,7 +44,7 @@ const callbackPath = "/wxkf/callback"
 // for tests.
 const defaultAPIBase = "https://qyapi.weixin.qq.com"
 
-// maxTextBytes is the platform limit for one text message (design 5.3.2);
+// maxTextBytes is the platform limit for one text message;
 // longer replies are split into sequential segments.
 const maxTextBytes = 2048
 
@@ -58,8 +58,8 @@ const maxCryptCacheEntries = 32
 // Config holds the WeChat KF channel configuration. Secret material is
 // carried as references and resolved through the SecretResolver, never logged.
 type Config struct {
-	CorpID    string // 企业 ID (corpid); the KF account lives under this corp
-	KfAccount string // 客服账号 (open_kfid)
+	CorpID    string // corp ID; the KF account lives under this corp
+	KfAccount string // KF account (open_kfid)
 	TokenRef  string // callback token secret ref
 	AESKeyRef string // EncodingAESKey secret ref
 	SecretRef string // KF secret secret ref (for access_token; NOT the corpsecret)
@@ -74,7 +74,7 @@ type Channel struct {
 
 	// crypts caches one WXBizMsgCrypt per credential set
 	// (corp|tokenRef|aesKeyRef): multi-tenant callbacks arrive with
-	// per-binding refs (design 5.3.1) and each verification needs the
+	// per-binding refs and each verification needs the
 	// matching crypt. Ref resolution rides the process-level cached
 	// resolver, so rotation propagates within the cache TTL.
 	cryptMu sync.Mutex
@@ -155,7 +155,7 @@ func (c *Channel) Name() string { return "wxkf" }
 
 // RegisterRoutes implements channels.Channel: GET verifies the callback URL,
 // POST receives encrypted messages. The path is the env-configured
-// single-binding default (design 5.3.1); tenant bindings are served through
+// single-binding default; tenant bindings are served through
 // CallbackHandler at /callback/{channel}/{binding_id}.
 func (c *Channel) RegisterRoutes(mux *http.ServeMux, h channels.Handler) {
 	handler, err := c.CallbackHandler(h, channels.BindingCredentials{
@@ -252,7 +252,7 @@ func (c *Channel) receive(w http.ResponseWriter, r *http.Request, crypt *wxbizms
 	}
 	// Only text messages enter the pipeline; events (enter_session, ...) and
 	// media messages (image/voice/file/link/miniprogram) are acked and skipped
-	// (media handling is a 5.3.2 follow-up). Text without a msgid cannot be
+	// (media handling is a follow-up). Text without a msgid cannot be
 	// deduplicated — skip it too.
 	if cm.MsgType != "text" || cm.MsgID == "" {
 		plog.Infof("wxkf skip msgtype=%s msgid=%s (non-text/event or missing msgid)", cm.MsgType, cm.MsgID)
@@ -278,7 +278,7 @@ func (c *Channel) receive(w http.ResponseWriter, r *http.Request, crypt *wxbizms
 			return
 		}
 		// 5xx makes the platform redeliver; the gateway rolls the dedup key
-		// back first so that retry is not swallowed (design 5.1.4).
+		// back first so that retry is not swallowed.
 		plog.Errorf("wxkf handle msg %s: %v", cm.MsgID, err)
 		http.Error(w, "handle error", http.StatusInternalServerError)
 		return
@@ -313,8 +313,7 @@ func writeSuccess(w http.ResponseWriter) {
 // Send implements channels.Channel: KF is direct-chat only, so every reply
 // goes to kf/send_msg. Long texts are split into sequential segments within
 // this one call, so concurrent senders cannot interleave segments of the same
-// reply (design 5.3.2). KF renders plain text only — markdown replies are
-// downgraded (通道级渲染降级).
+// reply. KF renders plain text only — markdown replies are downgraded.
 func (c *Channel) Send(ctx context.Context, msg channels.OutboundMessage) error {
 	if msg.TextType == channels.TextTypeMarkdown {
 		msg.Text = channels.RenderPlain(msg.Text)
@@ -399,7 +398,7 @@ func (c *Channel) postMessage(ctx context.Context, token string, msg channels.Ou
 // sendMsgID builds the msgid send_msg requires. It must be STABLE across
 // retries: the platform dedups send_msg by msgid, so a retry after "request
 // sent but response lost" is absorbed by WeChat instead of double-delivering
-// to the user (review P1-7). Only the segment index varies, distinguishing
+// to the user. Only the segment index varies, distinguishing
 // the pieces of one split reply.
 func sendMsgID(msg channels.OutboundMessage, seg int) string {
 	return fmt.Sprintf("%s-%d", msg.MsgID, seg)

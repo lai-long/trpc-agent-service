@@ -127,7 +127,7 @@ func TestBindingDispatcher(t *testing.T) {
 }
 
 // Binding config may override the crypt receiver id: two tenants on one
-// channel can belong to different IM corps (design 5.3.1).
+// channel can belong to different IM corps.
 func TestBindingCorpIDOverride(t *testing.T) {
 	ch := &fakeBindingChannel{}
 	bindings := fakeBindings{
@@ -155,10 +155,9 @@ func TestBindingCorpIDOverride(t *testing.T) {
 	}
 }
 
-// Two tenants on one channel (design 5.3.1 多租户接入, review P1-5/6 acceptance):
-// both bindings share the mock adapter and one gateway, yet each callback is
-// routed to its own tenant/app/binding. Redis-gated: the tail of the pipeline
-// (dedup + stream) is the real one.
+// Two tenants on one channel share the mock adapter and one gateway, yet each
+// callback is routed to its own tenant/app/binding. Redis-gated: the tail of
+// the pipeline (dedup + stream) is the real one.
 func TestTwoTenantCallbackRouting(t *testing.T) {
 	ctx := context.Background()
 	rdb := testenv.Redis(t)

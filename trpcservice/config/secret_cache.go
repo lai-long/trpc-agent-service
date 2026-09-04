@@ -6,11 +6,9 @@ import (
 	"time"
 )
 
-// CachedResolver wraps a SecretResolver with a short-TTL in-process cache
-// (design 决策三: 进程内缓存且禁止打日志; 风险 6: KMS 短 TTL 缓存扛短暂故障).
-// A backend failure serves the last known value — rotation moves to a new
-// ref, so staleness within the TTL is safe (rotation windows use parallel
-// refs, per the design).
+// CachedResolver wraps a SecretResolver with a short-TTL in-process cache.
+// Secret values must never enter logs. A backend failure serves the last
+// known value; rotation uses a new ref, so staleness within the TTL is safe.
 type CachedResolver struct {
 	inner SecretResolver
 	ttl   time.Duration
@@ -44,7 +42,7 @@ func (c *CachedResolver) Resolve(ctx context.Context, ref string) (string, error
 	v, err := c.inner.Resolve(ctx, ref)
 	if err != nil {
 		if ok {
-			// Backend down: serve the stale value (design 5.2.2 KMS 故障).
+			// Backend down: serve the stale value.
 			return entry.value, nil
 		}
 		return "", err

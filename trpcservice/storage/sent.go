@@ -12,7 +12,7 @@ import (
 // calling the IM API and marks after a successful send, so a redelivery after
 // "sent but not acked" cannot push the same reply to the user twice. The
 // binding dimension keeps two tenants' replies apart — msg_id uniqueness is
-// guaranteed by the IM per corp/app only (design 5.1.4).
+// guaranteed by the IM per corp/app only.
 type SentMarker struct {
 	rdb *redis.Client
 }

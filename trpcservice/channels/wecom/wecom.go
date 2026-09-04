@@ -1,14 +1,14 @@
-// Package wecom implements the WeCom (企业微信) Channel adapter.
+// Package wecom implements the WeCom channel adapter.
 //
 // Inbound: the IM platform posts AES-encrypted XML callbacks; the adapter
 // verifies the signature and decrypts via wxbizmsgcrypt (vendored at
 // ./wxbizmsgcrypt), normalizes the message and hands it to the Handler, which
-// acks within the 5-second window (sync ack + async consume, design 决策一).
+// acks within the 5-second window (sync ack + async consume).
 //
 // Outbound: replies go through the app message/send API (direct chats) or
 // appchat/send (group chats), with the access_token cached in process and
 // refreshed on expiry. Texts longer than the platform limit are split into
-// sequential segments (design 5.3.2).
+// sequential segments.
 package wecom
 
 import (
@@ -40,7 +40,7 @@ const callbackPath = "/wecom/callback"
 // defaultAPIBase is the WeCom API endpoint; overridable for tests.
 const defaultAPIBase = "https://qyapi.weixin.qq.com"
 
-// maxTextBytes is the platform limit for one text message (design 5.3.2);
+// maxTextBytes is the platform limit for one text message;
 // longer replies are split into sequential segments.
 const maxTextBytes = 2048
 
@@ -54,13 +54,13 @@ const maxCryptCacheEntries = 32
 // Config holds the WeCom channel configuration. Secret material is carried
 // as references and resolved through the SecretResolver, never logged.
 type Config struct {
-	CorpID    string // 企业 ID (corpid)
-	AgentID   int    // 应用 ID (agentid)
+	CorpID    string // corp ID
+	AgentID   int    // agent ID
 	TokenRef  string // callback token secret ref
 	AESKeyRef string // EncodingAESKey secret ref
 	SecretRef string // corpsecret secret ref (for access_token)
 	APIBase   string // default https://qyapi.weixin.qq.com
-	// Media stores fetched media_id content (design 5.3.2); nil degrades
+	// Media stores fetched media_id content; nil degrades
 	// media messages to a placeholder text.
 	Media channels.MediaStore
 }
@@ -70,13 +70,13 @@ type Channel struct {
 	cfg    Config
 	secret config.SecretResolver
 	client *http.Client
-	// media is the artifact store for inbound media_id fetches (design
-	// 5.3.2); nil degrades media messages to a placeholder text.
+	// media is the artifact store for inbound media_id fetches; nil degrades
+	// media messages to a placeholder text.
 	media channels.MediaStore
 
 	// crypts caches one WXBizMsgCrypt per credential set
 	// (corp|tokenRef|aesKeyRef): multi-tenant callbacks arrive with
-	// per-binding refs (design 5.3.1) and each verification needs the
+	// per-binding refs and each verification needs the
 	// matching crypt. Ref resolution rides the process-level cached
 	// resolver, so rotation propagates within the cache TTL.
 	cryptMu sync.Mutex
@@ -146,6 +146,8 @@ func (c *Channel) cryptFor(corpID, tokenRef, aesKeyRef string) (*wxbizmsgcrypt.W
 		return crypt, nil
 	}
 	if len(c.crypts) >= maxCryptCacheEntries {
+		// Rotations accumulate value-keyed entries; a wholesale reset bounds
+		// the map without correctness impact (the next call rebuilds).
 		c.crypts = map[string]*wxbizmsgcrypt.WXBizMsgCrypt{}
 	}
 	crypt := wxbizmsgcrypt.NewWXBizMsgCrypt(token, aesKey, corpID, wxbizmsgcrypt.XmlType)
@@ -158,7 +160,7 @@ func (c *Channel) Name() string { return "wecom" }
 
 // RegisterRoutes implements channels.Channel: GET verifies the callback URL,
 // POST receives encrypted messages. The path is the env-configured
-// single-binding default (design 5.3.1); tenant bindings are served through
+// single-binding default; tenant bindings are served through
 // CallbackHandler at /callback/{channel}/{binding_id}.
 func (c *Channel) RegisterRoutes(mux *http.ServeMux, h channels.Handler) {
 	handler, err := c.CallbackHandler(h, channels.BindingCredentials{
@@ -242,7 +244,7 @@ func (c *Channel) receive(w http.ResponseWriter, r *http.Request, crypt *wxbizms
 	case cm.MsgType == "text" && cm.MsgID != "":
 		// normal text path below
 	case cm.MsgType == "event" && cm.Event == "revoke" && cm.MsgID != "":
-		// Message recalled (design 5.3.2): the MsgId is the RECALLED message's
+		// Message recalled: the MsgId is the RECALLED message's
 		// id, so the recall gets its own dedup namespace; the guardrail audits
 		// it and marks the session state instead of running the model.
 		msg := c.baseMessage(r, &cm)
@@ -299,7 +301,7 @@ func (c *Channel) hand(ctx context.Context, w http.ResponseWriter, h channels.Ha
 			return
 		}
 		// 5xx makes the platform redeliver; the gateway rolls the dedup key
-		// back first so that retry is not swallowed (design 5.1.4).
+		// back first so that retry is not swallowed.
 		plog.Errorf("wecom handle msg %s: %v", msgID, err)
 		http.Error(w, "handle error", http.StatusInternalServerError)
 		return
@@ -307,10 +309,9 @@ func (c *Channel) hand(ctx context.Context, w http.ResponseWriter, h channels.Ha
 	writeSuccess(w)
 }
 
-// receiveMedia fetches the media_id into artifact storage (design 5.3.2:
-// 图片/文件消息只下发 media_id) and normalizes a media message; when the
-// fetch or the store is unavailable, a placeholder text goes through so the
-// agent can still acknowledge the message.
+// receiveMedia fetches the media_id into artifact storage and normalizes a
+// media message; when the fetch or the store is unavailable, a placeholder
+// text goes through so the agent can still acknowledge the message.
 func (c *Channel) receiveMedia(r *http.Request, w http.ResponseWriter, h channels.Handler, cm *callbackMessage) {
 	msg := c.baseMessage(r, cm)
 	msg.Type = channels.TypeMedia
@@ -407,12 +408,11 @@ func writeSuccess(w http.ResponseWriter) {
 // Send implements channels.Channel: direct chats go to message/send, group
 // chats to appchat/send. Long texts are split into sequential segments within
 // this one call, so concurrent senders cannot interleave segments of the same
-// reply (design 5.3.2).
+// reply.
 // Send delivers the reply. The WeCom message/send API accepts no caller
 // idempotency key, so the platform cannot dedup a retried send (unlike the
 // wxkf send_msg msgid): duplicate suppression relies on the sender's sent:
-// marker window, and a crash inside that window can surface a duplicate
-// (design 5.2.2 at-least-once boundary).
+// marker window, and a crash inside that window can surface a duplicate.
 func (c *Channel) Send(ctx context.Context, msg channels.OutboundMessage) error {
 	segments := splitText(msg.Text, maxTextBytes)
 	for i, seg := range segments {

@@ -17,7 +17,7 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 )
 
-// Migrator executes tenant backend migrations (design 5.2.6), one row of
+// Migrator executes tenant backend migrations, one row of
 // storage_migration at a time:
 //
 //	dual_write → backfilling → observing → done
@@ -34,9 +34,8 @@ type Migrator struct {
 	rdb      *redis.Client // enumerate + publish invalidation on read switch
 	backends map[string]session.Service
 
-	// ObserveWindow is how long dual write continues after the read switch
-	// (design: 24h). Interval is the tick cadence; BatchSize caps sessions
-	// copied per tick.
+	// ObserveWindow is how long dual write continues after the read switch.
+	// Interval is the tick cadence; BatchSize caps sessions copied per tick.
 	ObserveWindow time.Duration
 	Interval      time.Duration
 	BatchSize     int
@@ -80,7 +79,7 @@ func (m *Migrator) Run(ctx context.Context) {
 }
 
 // Tick advances every active migration one step, inside one transaction that
-// claims the rows with FOR UPDATE SKIP LOCKED (design 5.2.6): replicas of the
+// claims the rows with FOR UPDATE SKIP LOCKED: replicas of the
 // worker role run the same Migrator, so each tick must claim a disjoint set
 // instead of two replicas double-advancing one migration (double backfill
 // batches, read switches racing the consistency check). The phase/progress
@@ -186,8 +185,8 @@ func (m *Migrator) backfill(ctx context.Context, tx pgx.Tx, mig migrationRow) er
 		return m.setPhase(ctx, tx, mig.ID, tenant.PhaseBackfilling, mig.Progress)
 	}
 
-	// Everything copied: consistency check gates the read switch (design
-	// 5.2.6 读切换质检口径: per-session event counts must match).
+	// Everything copied: consistency check gates the read switch;
+	// per-session event counts must match.
 	mismatches, err := m.checkConsistency(ctx, mig, src, dst)
 	if err != nil {
 		return err
@@ -384,8 +383,8 @@ func (m *Migrator) writeSessionToPG(ctx context.Context, tenantID string, sess *
 	return tx.Commit(ctx)
 }
 
-// checkConsistency compares per-session event counts between the backends
-// (design: 计数全量比对). Returns the mismatching session keys.
+// checkConsistency compares per-session event counts between the backends.
+// Returns the mismatching session keys.
 func (m *Migrator) checkConsistency(ctx context.Context, mig migrationRow, src, dst session.Service) ([]string, error) {
 	keys, err := m.enumerateAll(ctx, mig)
 	if err != nil {
@@ -409,7 +408,7 @@ func (m *Migrator) checkConsistency(ctx context.Context, mig migrationRow, src, 
 }
 
 // enumerateAll lists every session of the tenant (no batching): consistency
-// comparison is全量 per design.
+// comparison is full.
 func (m *Migrator) enumerateAll(ctx context.Context, mig migrationRow) ([]session.Key, error) {
 	var all []session.Key
 	cursor := ""

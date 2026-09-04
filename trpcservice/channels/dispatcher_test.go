@@ -105,8 +105,7 @@ func waitFor(t *testing.T, cond func() bool) {
 	t.Fatal("condition not met within 5s")
 }
 
-// An exhausted send bucket re-queues the message instead of dropping it
-// (design 5.3.2: 超限在 Stream 内排队不丢弃).
+// An exhausted send bucket re-queues the message instead of dropping it.
 func TestSenderRateLimitedRequeues(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -172,7 +171,7 @@ func TestSenderRateLimitedRequeues(t *testing.T) {
 }
 
 // A tenant send override (rate_policy send_qps/send_burst) replaces the
-// platform default bucket shape (design 5.3.2 按 {channel}:{tenant} 限速).
+// platform default bucket shape.
 func TestSenderTenantRateOverride(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -231,7 +230,7 @@ func TestSenderTenantRateOverride(t *testing.T) {
 }
 
 // A wedged sender's pending reply is taken over and delivered by the reaper
-// (XAUTOCLAIM), symmetric with the worker's crash recovery (design 5.2.2).
+// (XAUTOCLAIM), symmetric with the worker's crash recovery.
 func TestSenderReapsOrphanedPending(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

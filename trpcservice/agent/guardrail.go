@@ -48,11 +48,11 @@ type OutputChecker func(ctx context.Context, msg channels.InboundMessage, reply 
 var DefaultBlockedWords = []string{"赌博", "毒品", "枪支"}
 
 // degradedReply answers the user when the model keeps failing after its
-// retry (design 5.2.2 模型超时 row): the message is acked and answered
-// immediately instead of riding the Stream redelivery path.
+// retry: the message is acked and answered immediately instead of riding the
+// Stream redelivery path.
 const degradedReply = "服务繁忙，请稍后再试。"
 
-// BudgetGate tracks per-tenant daily token budgets (design 4.3 预算限制):
+// BudgetGate tracks per-tenant daily token budgets:
 // Allow pre-checks the accumulated usage, Record accounts the actual tokens
 // after the run. *storage.Budget satisfies it.
 type BudgetGate interface {
@@ -60,7 +60,7 @@ type BudgetGate interface {
 	Record(ctx context.Context, tenantID string, tokens int64)
 }
 
-// Guarded wraps a Processor with the guardrail chain (design 4.3):
+// Guarded wraps a Processor with the guardrail chain:
 //
 //	recall → approval answer → input checks (allowlist/denylist) → budget gate
 //	→ inner processor → budget accounting → output checks (redact/denylist)
@@ -84,15 +84,13 @@ type Guarded struct {
 	// Budget, when set, enforces the tenant's daily token budget
 	// (guardrail_policy.max_tokens_per_day).
 	Budget BudgetGate
-	// StateMark, when set, persists a session-state marker for recall events
-	// (design 5.3.2 撤回: session.state 打标记，不回删 session_event).
+	// StateMark, when set, persists a session-state marker for recall events.
 	StateMark func(ctx context.Context, msg channels.InboundMessage, key string, value []byte) error
 }
 
 // Process implements Processor.
 func (g *Guarded) Process(ctx context.Context, msg channels.InboundMessage) (channels.OutboundMessage, error) {
-	// The guardrail is a distinct link in the trace chain (design 6.1:
-	// 单条 trace 串联 … → Guardrail → …, 覆盖率 100%).
+	// The guardrail is a distinct link in the trace chain.
 	ctx, span := tracer.Start(ctx, "guardrail.process")
 	defer span.End()
 	span.SetAttributes(
@@ -101,7 +99,7 @@ func (g *Guarded) Process(ctx context.Context, msg channels.InboundMessage) (cha
 		attribute.String("session_key", msg.SessionKey),
 	)
 
-	// 0. Recall events never reach the model (design 5.3.2 撤回): audit the
+	// 0. Recall events never reach the model: audit the
 	//    recall, mark the session state (the event journal stays append-only),
 	//    and produce an empty reply — the worker acks without an outbound hop.
 	if msg.Type == channels.TypeRecall {
@@ -158,7 +156,7 @@ func (g *Guarded) Process(ctx context.Context, msg channels.InboundMessage) (cha
 		return out, nil
 	}
 
-	// 4. Budget gate (预算限制): deny when the tenant's daily token usage is
+	// 4. Budget gate: deny when the tenant's daily token usage is
 	//    already over budget; the run's actual tokens are recorded below.
 	if g.Budget != nil && policy.MaxTokensPerDay > 0 && msg.TenantID != "" {
 		ok, err := g.Budget.Allow(ctx, msg.TenantID, policy.MaxTokensPerDay)
@@ -188,7 +186,7 @@ func (g *Guarded) Process(ctx context.Context, msg channels.InboundMessage) (cha
 		var mErr *ModelError
 		if !errors.As(err, &mErr) {
 			// Infrastructure failure (session store, queue, ...): leave the
-			// message pending for Stream redelivery (design 5.2.2).
+			// message pending for Stream redelivery.
 			span.SetAttributes(attribute.String("decision", "error"))
 			span.RecordError(err)
 			g.asyncAudit(msg, out, started, err)
@@ -197,7 +195,7 @@ func (g *Guarded) Process(ctx context.Context, msg channels.InboundMessage) (cha
 		// Model failure (deadline hit, retried once by the runner already):
 		// degrade to a busy reply so the user gets an immediate answer
 		// instead of waiting minutes for a redelivery that will likely fail
-		// the same way (design 5.2.2: 仍失败回复「服务繁忙请稍后再试」并记审计).
+		// the same way.
 		if signaled {
 			// A dangerous call was intercepted before the failure: the
 			// pending approval is real, so the confirmation notice (not the
@@ -215,13 +213,13 @@ func (g *Guarded) Process(ctx context.Context, msg channels.InboundMessage) (cha
 		out.Text = degradedReply
 		return out, nil
 	}
-	// Budget accounting with the run's actual tokens (预算限制).
+	// Budget accounting with the run's actual tokens.
 	if g.Budget != nil && msg.TenantID != "" {
 		g.Budget.Record(ctx, msg.TenantID, int64(out.PromptTokens+out.CompletionTokens))
 	}
 
 	// 6. Output checks: platform desensitization, then the tenant's output
-	//    denylist (输出敏感词) — a hit replaces the reply and audits a deny.
+	//    denylist — a hit replaces the reply and audits a deny.
 	for _, check := range g.Output {
 		out.Text = check(ctx, msg, out.Text)
 	}
@@ -249,8 +247,8 @@ func (g *Guarded) Process(ctx context.Context, msg channels.InboundMessage) (cha
 	// Terminal allow audit — deliberately last: it used to run before the
 	// output checks and the approval-signal handling, leaving one message
 	// with an allow row AND a deny/review row in audit_log, which corrupted
-	// the interception-rate accounting (review P1-11). Exactly one terminal
-	// audit per message, from here or from the branches above.
+	// the interception-rate accounting. Exactly one terminal audit per message,
+	// from here or from the branches above.
 	span.SetAttributes(attribute.String("decision", "allow"))
 	g.asyncAudit(msg, out, started, nil)
 	return out, nil
@@ -286,9 +284,9 @@ func SensitiveWordInput(words []string) InputChecker {
 // ID card numbers and email addresses are masked before a reply leaves the
 // platform.
 var redactRules = []*regexp.Regexp{
-	regexp.MustCompile(`1[3-9]\d{9}`),             // 手机号
-	regexp.MustCompile(`\d{17}[\dXx]`),            // 身份证号
-	regexp.MustCompile(`[\w.+-]+@[\w-]+\.[\w.]+`), // 邮箱
+	regexp.MustCompile(`1[3-9]\d{9}`),             // phone number
+	regexp.MustCompile(`\d{17}[\dXx]`),            // ID card number
+	regexp.MustCompile(`[\w.+-]+@[\w-]+\.[\w.]+`), // email address
 }
 
 // RedactOutput masks sensitive patterns (phone / ID card / email) in replies.
@@ -356,9 +354,9 @@ func signalReply(sig Signal) string {
 }
 
 // asyncAudit records the routine (allow) decision for a processed message,
-// off the request path, with the run's token usage and cost attached (design
-// 5.1.3 audit fields). Messages that bypassed tenant routing (dev fallback)
-// are filed under the zero UUID.
+// off the request path, with the run's token usage and cost attached.
+// Messages that bypassed tenant routing (dev fallback) are filed under the
+// zero UUID.
 func (g *Guarded) asyncAudit(msg channels.InboundMessage, out channels.OutboundMessage, started time.Time, processErr error) {
 	if g.Auditor == nil {
 		return

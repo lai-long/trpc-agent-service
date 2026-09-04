@@ -62,7 +62,7 @@ func TestCachedResolverServesStaleOnOutage(t *testing.T) {
 		t.Fatal(err)
 	}
 	time.Sleep(30 * time.Millisecond)
-	// Past TTL, backend down: the stale value rides through (风险 6).
+	// Past TTL, backend down: the stale value rides through.
 	v, err := r.Resolve(ctx, "ref")
 	if err != nil || v != "s3cret" {
 		t.Fatalf("stale value must serve through an outage: %v %q", err, v)

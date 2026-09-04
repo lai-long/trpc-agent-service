@@ -202,7 +202,7 @@ func TestGuardedModelErrorDegradesToBusyReply(t *testing.T) {
 
 func TestGuardedInfraErrorPropagates(t *testing.T) {
 	// Non-model failures keep the message pending for redelivery: the error
-	// propagates to the worker, which does not ack (design 5.2.2).
+	// propagates to the worker, which does not ack.
 	aud := &fakeAuditor{}
 	g := &Guarded{
 		Inner:   failProcessor{err: errors.New("pg down")},
@@ -374,7 +374,7 @@ func TestGuardedTenantDenyWordsReplaceBaseline(t *testing.T) {
 	g := &Guarded{
 		Inner:   EchoProcessor{},
 		Auditor: aud,
-		// Baseline blocks 赌博; the tenant list replaces it with 芒果.
+		// Baseline blocks the platform word; the tenant list replaces it with a custom word.
 		Input:     []InputChecker{SensitiveWordInput(DefaultBlockedWords)},
 		PolicyFor: policyStub(tenant.GuardrailPolicy{InputDenyWords: []string{"芒果"}}),
 	}
@@ -446,9 +446,8 @@ func TestGuardedBudgetGate(t *testing.T) {
 
 // Exactly one terminal audit per message: the allow audit used to run before
 // the output checks, so a denied reply left an allow row AND a deny row in
-// audit_log and the interception-rate accounting double-counted (review
-// P1-11). The deny case must carry exactly one sync deny row and no async
-// allow row.
+// audit_log and the interception-rate accounting double-counted. The deny
+// case must carry exactly one sync deny row and no async allow row.
 func TestGuardedOutputDenySingleAudit(t *testing.T) {
 	aud := &fakeAuditor{}
 	g := &Guarded{

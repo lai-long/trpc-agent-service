@@ -42,9 +42,9 @@ return allowed
 `)
 
 // Limiter is a Redis-backed token bucket shared by all platform nodes, so the
-// limit holds cluster-wide (design 5.1.4: 防单租户灌量撑满全局队列). Scope
-// convention: "tenant:{tenant_id}" for gateway admission,
-// "send:{channel}:{tenant_id}" for outbound IM pacing (5.3.2).
+// limit holds cluster-wide rate state and stops one tenant from flooding the
+// global queue. Scope convention: "tenant:{tenant_id}" for gateway admission,
+// "send:{channel}:{tenant_id}" for outbound IM pacing.
 type Limiter struct {
 	rdb *redis.Client
 }
@@ -72,8 +72,7 @@ func (l *Limiter) Allow(ctx context.Context, scope string, rate float64, burst i
 
 // WaitAllow spins on Allow until a token is granted, maxWait elapses, or ctx
 // is canceled. Reports whether a token was granted. Senders use it to pace
-// outbound IM calls without dropping the message (design 5.3.2: 超限在
-// Stream 内排队不丢弃).
+// outbound IM calls without dropping the message.
 func (l *Limiter) WaitAllow(ctx context.Context, scope string, rate float64, burst int, maxWait time.Duration) (bool, error) {
 	deadline := time.Now().Add(maxWait)
 	for {

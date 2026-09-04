@@ -51,9 +51,9 @@ func e2eAttr(msg OutboundMessage) otelmetric.RecordOption {
 // before Ack redelivers the message, but the sent: key blocks a duplicate
 // push to the user. Failures stay pending for retry.
 //
-// Sends are paced per {channel, tenant} token bucket (design 5.3.2, IM
-// proactive-send rate limits): when the bucket is exhausted the message is
-// re-queued instead of dropped, so rate limiting delays but never loses.
+// Sends are paced per {channel, tenant} token bucket: when the bucket is
+// exhausted the message is re-queued instead of dropped, so rate limiting
+// delays but never loses.
 type Sender struct {
 	Stream   *storage.Stream
 	Sent     *storage.SentMarker // nil disables outbound idempotency
@@ -169,7 +169,7 @@ func (s *Sender) Run(ctx context.Context) error {
 
 // reap takes over pending messages idle longer than maxIdle and resends them.
 // A message that keeps failing past maxAttempts is dead-lettered so it cannot
-// loop forever (mirrors the worker's reaper, design 5.2.2).
+// loop forever.
 func (s *Sender) reap(ctx context.Context) {
 	if err := s.Stream.EnsureGroup(ctx, s.inStream(), "senders"); err != nil {
 		plog.Warnf("sender %s ensure group before reap: %v", s.Name, err)
@@ -239,11 +239,11 @@ func (s *Sender) handle(ctx context.Context, m storage.Message) {
 		return
 	}
 
-	// Pace the send on the {channel, tenant} bucket (design 5.3.2). On
+	// Pace the send on the {channel, tenant} bucket. On
 	// exhaustion the message is left pending for the reaper's takeover: a
 	// re-queue under a new stream ID reset the attempts counter and the
 	// maxAttempts dead-letter could never fire, so sustained rate limiting
-	// re-queued forever (review P1-8). The bucket refills in milliseconds;
+	// re-queued forever. The bucket refills in milliseconds;
 	// the reaper's maxIdle is the outer bound of the delay.
 	if s.Limiter != nil {
 		qps, burst := s.sendQPS(), s.sendBurst()
@@ -274,8 +274,8 @@ func (s *Sender) handle(ctx context.Context, m storage.Message) {
 		return
 	}
 	metrics.OutboundTotal.Add(ctx, 1, sendAttr(msg, "ok"))
-	// End-to-end latency: callback arrival → reply landed on the IM (design
-	// 5.2.4 端到端 P95; ReceivedAt rides the outbound message).
+	// End-to-end latency: callback arrival → reply landed on the IM;
+	// ReceivedAt rides the outbound message.
 	if !msg.ReceivedAt.IsZero() {
 		metrics.EndToEndDuration.Record(ctx,
 			float64(time.Since(msg.ReceivedAt).Milliseconds()), e2eAttr(msg))
@@ -285,8 +285,7 @@ func (s *Sender) handle(ctx context.Context, m storage.Message) {
 			// The user already has the reply, but the marker that suppresses
 			// the duplicate did not stick: no Ack. The reaper redelivers, the
 			// IsSent check above (or, for wxkf, the platform's msgid dedup)
-			// absorbs the retry instead of the user receiving it twice
-			// (review P1-7).
+			// absorbs the retry instead of the user receiving it twice.
 			plog.Errorf("sender %s mark sent %s: %v — leaving pending for redelivery", s.Name, m.ID, err)
 			return
 		}

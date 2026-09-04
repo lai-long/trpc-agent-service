@@ -10,10 +10,9 @@ import (
 	plog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
 )
 
-// Archiver implements the monthly archival of design 5.1.3: session_event and
+// Archiver implements monthly archival: session_event and
 // audit_log rows older than the retention window are moved to the same-shaped
-// archive tables, keeping the hot tables small (5.2.1 estimates 43GB/day of
-// events without it).
+// archive tables, keeping the hot tables small.
 //
 // Copy-then-delete runs per batch inside one transaction, so a crash
 // mid-batch leaves the rows in both tables (idempotent re-run) and never
@@ -21,7 +20,7 @@ import (
 type Archiver struct {
 	pool *pgxpool.Pool
 
-	// Retention is how long rows stay in the hot tables (design 6.2: one
+	// Retention is how long rows stay in the hot tables (about one
 	// month online). Interval is how often the sweep runs; BatchSize caps one
 	// transaction; BatchPause paces consecutive batches.
 	Retention  time.Duration
@@ -96,7 +95,7 @@ func (a *Archiver) ArchiveOnce(ctx context.Context) (events, audits int64, err e
 
 // archiveTable moves one batch at a time: SELECT the oldest ids, copy them
 // into the archive (idempotent on re-run), delete them from the source — all
-// in one transaction per batch (design 5.1.3: 限流 DELETE 分批搬运).
+// in one transaction per batch, with rate-limited batched deletes.
 func (a *Archiver) archiveTable(ctx context.Context, src, dst string, cutoff time.Time) (int64, error) {
 	var total int64
 	for {

@@ -43,7 +43,7 @@ func (c *Channel) Name() string { return "mock" }
 
 // RegisterRoutes implements channels.Channel.
 // POST /mock/callback simulates the IM webhook callback (dev only: the mock
-// is an unauthenticated injector, see config.MockChannel).
+// is an unauthenticated injector).
 func (c *Channel) RegisterRoutes(mux *http.ServeMux, h channels.Handler) {
 	handler, err := c.CallbackHandler(h, channels.BindingCredentials{})
 	if err != nil {

@@ -12,7 +12,7 @@ import (
 )
 
 // Budget tracks per-tenant daily token consumption in Redis
-// (budget:{tenant}:{yyyymmdd}, design 4.3 预算限制). The counter lives 48h —
+// (budget:{tenant}:{yyyymmdd}). The counter lives 48h —
 // it is read before the run (deny when already over) and incremented with the
 // actual usage after. One day of slack is enough for a budget gate; the
 // audit_log carries the row-level truth for billing reconciliation.

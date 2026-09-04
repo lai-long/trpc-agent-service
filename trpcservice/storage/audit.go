@@ -29,7 +29,7 @@ type AuditEvent struct {
 	CompletionTokens int
 	TraceID          string
 	// Detail carries the before/after payload of admin write operations
-	// ({"before": ..., "after": ...}, design 5.4 变更审计); empty means NULL.
+	// ({"before": ..., "after": ...}, change audit); empty means NULL.
 	Detail    json.RawMessage
 	CreatedAt time.Time
 }

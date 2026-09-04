@@ -41,7 +41,7 @@ const (
 )
 
 // PGMemoryService implements the framework memory.Service over the
-// memory_item table (design 5.1.3):
+// memory_item table:
 //
 //   - two levels: app_id set = app-private, NULL = tenant-shared; reads merge
 //     both levels, writes default to app-private;
@@ -51,8 +51,7 @@ const (
 //     to every worker (no local cache);
 //   - search is keyword ILIKE by default; with an embedder configured it is
 //     semantic recall: embedding candidates from memory_embedding (pgvector
-//     cosine distance), content read back from memory_item by join
-//     (design 5.1.3: 向量召回候选 → 按 embedding_id 回表读 content). Vectors
+//     cosine distance), content read back from memory_item by join. Vectors
 //     are produced asynchronously after each write, so semantic recall lags
 //     writes by seconds (eventual consistency); any vector-path failure
 //     falls back to ILIKE.
@@ -254,7 +253,7 @@ func (s *PGMemoryService) UpdateMemory(ctx context.Context, memoryKey memory.Key
 		return err
 	}
 	// The tenant predicate matches the read paths: without it, isolation
-	// would rest on "the UUID is unguessable" alone (review P1-10).
+	// would rest on "the UUID is unguessable" alone.
 	tenantID, err := s.tenants.resolve(ctx, memoryKey.AppName)
 	if err != nil {
 		return err
@@ -391,8 +390,7 @@ func (s *PGMemoryService) enqueueEmbeddingForApp(ctx context.Context, appID, mem
 }
 
 // embedLoop drains the embedding queue until Close; on stop it empties
-// whatever is still queued before exiting (same shutdown discipline as the
-// auditor).
+// whatever is still queued before exiting.
 func (s *PGMemoryService) embedLoop() {
 	defer s.wg.Done()
 	for {

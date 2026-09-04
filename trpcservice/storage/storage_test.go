@@ -11,8 +11,8 @@ import (
 )
 
 // The integration tests need the real services from compose (docker compose
-// up -d, or the CI services); they gate on TRPC_TEST_* variables (review
-// P0-4) and skip with the variable named when unreachable.
+// up -d, or the CI services); they gate on TRPC_TEST_* variables and skip
+// with the variable named when unreachable.
 var (
 	testRedisAddr = testenv.RedisAddr()
 	testPGDSN     = testenv.PGDSN()

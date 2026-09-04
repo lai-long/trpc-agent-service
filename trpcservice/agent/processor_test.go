@@ -169,8 +169,8 @@ func TestRunnerProcessorEmptyResponseIsModelError(t *testing.T) {
 	}
 }
 
-// Drain/shutdown cancellation is infrastructure, not a model failure (review
-// P1-12): Process returns the raw cancel error instead of a ModelError, so
+// Drain/shutdown cancellation is infrastructure, not a model failure:
+// Process returns the raw cancel error instead of a ModelError, so
 // the guardrail does not degrade into a busy reply and the worker leaves the
 // message pending for a surviving replica.
 func TestRunnerProcessorCancelReturnsRawError(t *testing.T) {
@@ -194,7 +194,7 @@ func TestRunnerProcessorCancelReturnsRawError(t *testing.T) {
 }
 
 // The backoff sleeps ~2^attempt scaled with jitter and aborts on a canceled
-// context (review P1-13).
+// context.
 func TestRetryBackoff(t *testing.T) {
 	start := time.Now()
 	if err := retryBackoff(context.Background(), 1); err != nil {

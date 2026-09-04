@@ -46,7 +46,7 @@ func TestSentMarker(t *testing.T) {
 }
 
 // The sent key carries the binding dimension: two tenants' replies with the
-// same inbound msg_id must not suppress each other (review P1-6).
+// same inbound msg_id must not suppress each other.
 func TestSentMarkerBindingScope(t *testing.T) {
 	rdb := redisOrSkip(t)
 	ctx := context.Background()

@@ -17,7 +17,7 @@ type BindingLookup interface {
 }
 
 // BindingDispatcher serves the multi-tenant callback paths
-// /callback/{channel}/{binding_id} (design 5.3.1 多租户接入): one stable route
+// /callback/{channel}/{binding_id}: one stable route
 // pattern, many bindings. The dispatcher resolves the binding row, hands the
 // request to the owning adapter together with the binding's credential
 // references, and the adapter verifies the callback with those keys before any

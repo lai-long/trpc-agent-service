@@ -12,9 +12,9 @@ import (
 // Tool wraps a framework tool with platform metadata.
 type Tool struct {
 	Tool ttool.Tool // the framework tool
-	// Dangerous marks tools whose execution requires in-band user approval
-	// (design 5.3.3): the guardrail intercepts the call and only releases it
-	// after the user confirms in the same conversation.
+	// Dangerous marks tools whose execution requires in-band user approval:
+	// the guardrail intercepts the call and only releases it after the user
+	// confirms in the same conversation.
 	Dangerous bool
 }
 

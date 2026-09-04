@@ -82,7 +82,7 @@ func TestBeforeToolPendsDangerousCall(t *testing.T) {
 		t.Fatalf("want non-fresh created signal for re-attempt, got %+v", sig)
 	}
 
-	// A DIFFERENT dangerous call while one is pending conflicts (rule 5).
+	// A DIFFERENT dangerous call while one is pending conflicts.
 	res, err = ap.BeforeTool(invocationCtx(sessionKey, "u1"), toolArgs("c3", "op_b", `{"x":"2"}`))
 	if err != nil || res == nil {
 		t.Fatalf("conflicting call must be blocked, got res=%v err=%v", res, err)
@@ -243,8 +243,8 @@ func TestApprovalSignalFreshSurvivesRehit(t *testing.T) {
 
 // Approval keys are scoped by (app_id, session_key): the same IM user on two
 // tenants carries the same channel:user session key, and tenant B must neither
-// see nor consume tenant A's pending dangerous call (review P1-6, design
-// 5.3.3). This is the cross-tenant confirmation exploit, regression-tested.
+// see nor consume tenant A's pending dangerous call. This is the cross-tenant
+// confirmation exploit, regression-tested.
 func TestApprovalCrossAppIsolation(t *testing.T) {
 	ap, rdb := approverForTest(t)
 	ctx := context.Background()

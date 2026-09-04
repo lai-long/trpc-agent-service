@@ -25,8 +25,8 @@ const (
 	StreamMaxLen = 100000
 
 	// BackpressureThreshold is the queue length at which the gateway stops
-	// accepting new messages (80% of the cap, design 5.1.4): the IM is told to
-	// retry later, which is the boundary of the no-loss guarantee.
+	// accepting new messages: the IM is told to retry later, which is the
+	// boundary of the no-loss guarantee.
 	BackpressureThreshold = StreamMaxLen * 80 / 100
 
 	// payloadField is the field name of the payload inside a Stream entry.
@@ -75,8 +75,7 @@ func (s *Stream) Len(ctx context.Context, stream string) (int64, error) {
 }
 
 // Pending reports a consumer group's backlog: how many messages sit pending
-// and how long the oldest has been waiting (design 5.2.4 队列指标:
-// pending 数、最老 pending 停留时长). A missing group reports zeros.
+// and how long the oldest has been waiting. A missing group reports zeros.
 func (s *Stream) Pending(ctx context.Context, stream, group string) (count int64, oldestIdle time.Duration, err error) {
 	summary, err := s.rdb.XPending(ctx, stream, group).Result()
 	if err != nil {

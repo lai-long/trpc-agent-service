@@ -40,10 +40,9 @@ type Tenant struct {
 	Status          string
 }
 
-// RateLimit is the tenant's gateway admission quota (design 5.1.4): qps is
-// the token refill rate, burst the bucket capacity. Zero values inherit the
-// platform default. SendQPS/SendBurst override the outbound pacing for this
-// tenant's sends (design 5.3.2).
+// RateLimit is the tenant's gateway admission quota: qps is the token refill
+// rate, burst the bucket capacity. Zero values inherit the platform default.
+// SendQPS/SendBurst override the outbound pacing for this tenant's sends.
 type RateLimit struct {
 	QPS       float64 `json:"qps"`
 	Burst     int     `json:"burst"`
@@ -51,19 +50,19 @@ type RateLimit struct {
 	SendBurst int     `json:"send_burst"`
 }
 
-// GuardrailPolicy is the tenant's governance config (design 4.3 治理):
-// input user allowlist and deny words, output deny words, and the daily
-// token budget. Empty fields inherit the platform defaults.
+// GuardrailPolicy is the tenant's governance config: input user allowlist and
+// deny words, output deny words, and the daily token budget. Empty fields
+// inherit the platform defaults.
 type GuardrailPolicy struct {
 	// InputAllowUsers, when non-empty, restricts the agent to these IM user
-	// IDs (IM 用户权限校验).
+	// IDs.
 	InputAllowUsers []string `json:"input_allow_users"`
 	// InputDenyWords replaces the platform input denylist when non-empty.
 	InputDenyWords []string `json:"input_deny_words"`
-	// OutputDenyWords blocks replies containing any of them (输出敏感词).
+	// OutputDenyWords blocks replies containing any of them.
 	OutputDenyWords []string `json:"output_deny_words"`
 	// MaxTokensPerDay is the daily token budget (prompt + completion); 0 is
-	// unlimited (预算限制).
+	// unlimited.
 	MaxTokensPerDay int64 `json:"max_tokens_per_day"`
 }
 
@@ -91,9 +90,9 @@ func ParseRateLimit(raw json.RawMessage) RateLimit {
 	return rl
 }
 
-// Migration is one active storage_migration row (design 5.2.6): a tenant's
-// backend switch in flight. Terminal phases (done/failed/aborted) are not
-// loaded into the resolver snapshot.
+// Migration is one active storage_migration row: a tenant's backend switch
+// in flight. Terminal phases (done/failed/aborted) are not loaded into the
+// resolver snapshot.
 type Migration struct {
 	ID          string
 	TenantID    string
@@ -103,7 +102,7 @@ type Migration struct {
 	Phase       string // dual_write / backfilling / observing
 }
 
-// Migration phases (design 5.2.6 四步).
+// Migration phases.
 const (
 	// PhaseDualWrite: writes fan out to both backends, reads stay on From.
 	PhaseDualWrite = "dual_write"

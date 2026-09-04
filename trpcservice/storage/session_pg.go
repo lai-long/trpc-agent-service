@@ -20,7 +20,7 @@ import (
 
 // PGSessionService implements the framework session.Service over the
 // platform's session / session_event / summary tables — the "event append +
-// state snapshot" two-layer store of design decision 2:
+// state snapshot" two-layer store:
 //
 //   - session_event is append-only; the UNIQUE (session_id, event_seq)
 //     constraint keeps events ordered and is the last-resort duplicate
@@ -33,8 +33,7 @@ import (
 //     stream is the source of truth a crashed session can be replayed from.
 //   - summary compresses old events: GetSession replays only the events
 //     after covered_event_id and exposes the summary under
-//     Session.Summaries, so long sessions no longer do a full replay
-//     (design 5.1.3 重放与摘要机制).
+//     Session.Summaries, so long sessions no longer do a full replay.
 //   - App/user-scoped state (app:/user: prefixes) is not supported by this
 //     backend: the platform's agent definitions don't use those scopes.
 //
@@ -392,8 +391,8 @@ func (s *PGSessionService) CreateSessionSummary(ctx context.Context, sess *sessi
 	return s.summarize(ctx, key, filterKey, force)
 }
 
-// EnqueueSummaryJob implements session.Service: summarization is asynchronous
-// (design 5.1.3: 摘要由框架 Summarizer 在事件数超阈值时异步生成). The job
+// EnqueueSummaryJob implements session.Service: summarization is asynchronous.
+// The job
 // carries only the session key; the worker reloads the session from PG, so a
 // job survives the enqueueing worker's request context.
 func (s *PGSessionService) EnqueueSummaryJob(_ context.Context, sess *session.Session, filterKey string, force bool) error {
@@ -566,8 +565,8 @@ func (s *PGSessionService) Close() error {
 // The insert uses ON CONFLICT DO NOTHING with one bounded re-select instead
 // of a bare INSERT: two concurrent first messages of the same new session
 // (lock TTL expiry, two replicas) used to race past the SELECT and one of
-// them died on the unique constraint, aborting its whole event transaction
-// (review P1-9). With the conflict path, the loser re-locks the winner's row
+// them died on the unique constraint, aborting its whole event transaction.
+// With the conflict path, the loser re-locks the winner's row
 // and proceeds.
 func (s *PGSessionService) ensureSession(ctx context.Context, tx pgx.Tx, key session.Key, stateJSON []byte) (string, error) {
 	for attempt := 0; attempt < 3; attempt++ {

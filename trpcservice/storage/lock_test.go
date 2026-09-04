@@ -106,7 +106,7 @@ func TestLockExpiresOnCrash(t *testing.T) {
 
 // The lock key carries the app dimension (lock:sess:{app}:{session}): two
 // tenants' users can carry the same channel:user session key, and one
-// tenant's long run must never queue the other's messages (review P1-6).
+// tenant's long run must never queue the other's messages.
 func TestLockAppScopeIsolation(t *testing.T) {
 	rdb := redisOrSkip(t)
 	ctx := context.Background()

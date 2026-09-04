@@ -17,7 +17,7 @@ const DedupTTL = 24 * time.Hour
 // no matter which gateway instance receives them. The binding dimension keeps
 // two tenants' callbacks apart: msg_id uniqueness is guaranteed by the IM per
 // corp/app only, so the same numeric ID can legitimately arrive on two
-// bindings of one channel (design 5.1.4).
+// bindings of one channel.
 type Deduper struct {
 	rdb *redis.Client
 }
@@ -43,7 +43,7 @@ func (d *Deduper) Check(ctx context.Context, channel, binding, msgID string) (bo
 //
 // It is the undo path for failures after Check (e.g. a failed enqueue): the
 // dedup key only exists to absorb the IM's own redeliveries, and those
-// redeliveries are exactly our retry mechanism (design 5.2.2). Leaving the
+// redeliveries are exactly our retry mechanism. Leaving the
 // key behind would drop every retry for the whole 24h TTL — the message is
 // silently lost instead of delayed.
 func (d *Deduper) Forget(ctx context.Context, channel, binding, msgID string) error {

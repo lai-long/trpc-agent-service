@@ -89,7 +89,7 @@ func TestDeduperForget(t *testing.T) {
 
 // The dedup key carries the binding dimension: msg_id uniqueness is
 // guaranteed by the IM per corp/app only, so the same numeric ID can
-// legitimately arrive on two bindings of one channel (review P1-6).
+// legitimately arrive on two bindings of one channel.
 func TestDeduperBindingScope(t *testing.T) {
 	rdb := redisOrSkip(t)
 	ctx := context.Background()

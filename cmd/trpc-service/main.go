@@ -73,7 +73,7 @@ func main() {
 	fmt.Fprintf(os.Stderr, "usage: %s serve [all|gateway|worker|admin]\n", os.Args[0])
 }
 
-// serve runs one deployment role (design 5.2.5): "all" packs everything into
+// serve runs one deployment role: "all" packs everything into
 // one process (local/demo); "gateway" serves IM callbacks and outbound
 // delivery; "worker" consumes the inbound stream and runs agents; "admin"
 // serves the Admin API and housekeeping (archival). Roles share the Redis
@@ -91,7 +91,7 @@ func serve(role string) error {
 	defer stop()
 
 	// Config validation before any dependency probe: an unauthenticated Admin
-	// API can repoint a tenant's model endpoint (design 5.4), so a missing
+	// API can repoint a tenant's model endpoint, so a missing
 	// token has to refuse the role rather than degrade into an
 	// unauthenticated listener. Deliberately ahead of Redis/PG — otherwise an
 	// infra outage would decide whether the gate runs.
@@ -101,7 +101,7 @@ func serve(role string) error {
 		}
 	}
 
-	// One secret resolver per process (design 决策三): file backend for local
+	// One secret resolver per process: file backend for local
 	// dev, KMS sidecar when configured, always behind the short-TTL cache.
 	secrets := buildSecretResolver(ctx, cfg)
 
@@ -140,7 +140,7 @@ func serve(role string) error {
 	auditor, resolver, pgPool, pgCleanup := startPGConsumers(ctx, cfg)
 	defer pgCleanup()
 	// Every role watches config invalidations (publish/rollback/migration
-	// read-switch broadcast by the admin role, design 5.2.3); the TTL remains
+	// read-switch broadcast by the admin role); the TTL remains
 	// the fallback when a notification is lost.
 	if resolver != nil {
 		resolver.WatchInvalidations(ctx, rdb)
@@ -239,7 +239,7 @@ func serve(role string) error {
 			channelSet[kf.Name()] = kf
 		}
 
-		// Multi-tenant callback paths (design 5.3.1 多租户接入):
+		// Multi-tenant callback paths:
 		// /callback/{channel}/{binding_id} dispatches to the owning adapter
 		// with the binding's own credential references, so each tenant's
 		// webhook verifies under its own token/AES key. Bindings created
@@ -314,7 +314,7 @@ func serve(role string) error {
 		}
 		g.Go(func() error { return worker.Run(gctx) })
 
-		// Storage migration executor (design 5.2.6): advances active
+		// Storage migration executor: advances active
 		// migrations through backfilling → read switch → observation → done.
 		if pgPool != nil && len(sessByType) > 0 {
 			migrator := storage.NewMigrator(pgPool, rdb, sessByType,
@@ -358,7 +358,7 @@ func serve(role string) error {
 
 			// The admin API always gets its own listener (TRPC_ADMIN_ADDR):
 			// the gateway listener faces the IM platforms (public), the admin
-			// listener must not (design 5.4 仅内网可达; mTLS optional). In
+			// listener must not (mTLS optional). In
 			// all-in-one mode this moves the admin API off :8080 too.
 			adminMux := http.NewServeMux()
 			adminMux.Handle("GET /metrics", metricsHandler)
@@ -392,7 +392,7 @@ func serve(role string) error {
 			adminAPI.RegisterRoutes(adminMux)
 			plog.Infof("admin API enabled (/admin/...)")
 
-			// Monthly-ish archival (design 5.1.3): move old session_event /
+			// Monthly-ish archival: move old session_event /
 			// audit_log rows to the archive tables so the hot tables stay small.
 			archiver := storage.NewArchiver(pgPool,
 				parseDuration(cfg.ArchiveRetention, 30*24*time.Hour),
@@ -401,13 +401,13 @@ func serve(role string) error {
 		}
 	}
 
-	// Queue depth / pending gauges feeding the alerts of design 5.2.4.
+	// Queue depth / pending gauges feeding the alerts.
 	metrics.StartStreamCollector(gctx, stream, 15*time.Second)
 
 	return g.Wait()
 }
 
-// checkAdminToken enforces design 5.4 (the Admin API is internal only): an
+// checkAdminToken enforces that the Admin API is internal only: an
 // unset TRPC_ADMIN_TOKEN is a fatal misconfiguration rather than a dev-mode
 // warning, because the API can repoint a tenant's model endpoint and rewrite
 // its policies. Local development opts out with the explicit
@@ -484,7 +484,7 @@ func startWecom(cfg config.Config, media channels.MediaStore, secrets config.Sec
 	return wc
 }
 
-// startWxkf builds the WeChat KF channel from env config (design 5.3.1 通道二);
+// startWxkf builds the WeChat KF channel from env config;
 // same degradation rule as startWecom.
 func startWxkf(cfg config.Config, secrets config.SecretResolver) *wxkf.Channel {
 	if cfg.WxkfCorpID == "" || cfg.WxkfKfAccount == "" {
@@ -507,7 +507,7 @@ func startWxkf(cfg config.Config, secrets config.SecretResolver) *wxkf.Channel {
 }
 
 // buildSessionServices builds one session service per supported backend
-// (design 5.1.1 受控菜单) plus the platform default selection. WithEnableTracing
+// plus the platform default selection. WithEnableTracing
 // is required beyond observability: with tracing disabled, the redis session
 // service's startSpan falls back to the caller's active span and its defer
 // span.End() would end OUR worker span prematurely (framework quirk).
@@ -538,8 +538,8 @@ func buildSessionServices(ctx context.Context, cfg config.Config, pgPool *pgxpoo
 	return byType, def, nil
 }
 
-// buildArtifact builds the S3-compatible artifact store (design: Artifact =
-// S3, MinIO locally); unreachable endpoints degrade to nil with a warning.
+// buildArtifact builds the S3-compatible artifact store (MinIO locally);
+// unreachable endpoints degrade to nil with a warning.
 func buildArtifact(cfg config.Config, secrets config.SecretResolver) artifact.Service {
 	if cfg.S3Endpoint == "" {
 		return nil
@@ -666,8 +666,8 @@ func buildProcessor(ctx context.Context, cfg config.Config, rdb *redis.Client, a
 	plog.Infof("per-app runner assembler ready (model default=%s, timeout=%s, session backends=%v)",
 		cfg.ModelName, timeout, slices.Sorted(maps.Keys(sessByType)))
 	guarded := wrap(assembler).(*agent.Guarded)
-	// Recall events mark the session state on the tenant's session backend
-	// (design 5.3.2); the marker is best-effort and never blocks the ack.
+	// Recall events mark the session state on the tenant's session backend;
+	// the marker is best-effort and never blocks the ack.
 	guarded.StateMark = func(ctx context.Context, msg channels.InboundMessage, key string, value []byte) error {
 		svc, err := assembler.SessionServiceFor(ctx, msg.AppID)
 		if err != nil {
@@ -728,8 +728,8 @@ func parseDuration(s string, def time.Duration) time.Duration {
 	return v
 }
 
-// adminTLSConfig builds the mTLS config for the split admin listener (design
-// 5.4: 管理端鉴权 mTLS 或 SSO token 二选一). Nil when the three envs are not
+// adminTLSConfig builds the mTLS config for the split admin listener (mTLS or
+// SSO token required). Nil when the three envs are not
 // all set; set means TLS + verified client certificates.
 func adminTLSConfig(cfg config.Config) (*tls.Config, error) {
 	if cfg.AdminTLSCert == "" || cfg.AdminTLSKey == "" || cfg.AdminTLSClientCA == "" {
@@ -755,7 +755,7 @@ func adminTLSConfig(cfg config.Config) (*tls.Config, error) {
 	}, nil
 }
 
-// buildSecretResolver builds the secret backend (design 决策三): the file
+// buildSecretResolver builds the secret backend: the file
 // resolver for local development, the KMS sidecar when TRPC_SECRET_RESOLVER=kms
 // (its bearer token bootstraps from the file resolver), and in both cases the
 // short-TTL cache that absorbs a KMS blip.

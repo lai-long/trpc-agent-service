@@ -48,8 +48,8 @@ func TestMockChannelDefaultsOff(t *testing.T) {
 }
 
 // TestAdminAddrDefaultsLoopback pins the secure default: the Admin API is
-// internal only (design 5.4), so reaching it beyond the host takes an
-// explicit TRPC_ADMIN_ADDR.
+// internal only, so reaching it beyond the host takes an explicit
+// TRPC_ADMIN_ADDR.
 func TestAdminAddrDefaultsLoopback(t *testing.T) {
 	os.Unsetenv("TRPC_ADMIN_ADDR")
 	if got := Load().AdminAddr; got != "127.0.0.1:8081" {

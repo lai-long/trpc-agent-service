@@ -18,8 +18,8 @@ import (
 
 // AdminTokenDevInsecure is the only accepted way to run the Admin API
 // without a real bearer token: an empty value refuses to start, so local
-// development must state the intent (design 5.4: the Admin API is internal
-// only and must never be reachable unauthenticated by accident).
+// development must state the intent. The Admin API is internal only and
+// must never be reachable unauthenticated by accident.
 const AdminTokenDevInsecure = "dev-insecure"
 
 // Config aggregates the service's own configuration.
@@ -27,9 +27,8 @@ type Config struct {
 	HTTPAddr string // TRPC_HTTP_ADDR: Gateway/HTTP listen address
 	// AdminAddr is the Admin API listen address in split-role deployments
 	// (serve admin); all-in-one shares the gateway listener. Bound to
-	// loopback by default: the Admin API is internal only (design 5.4) and a
-	// deployment that needs it reachable beyond the host must say so
-	// explicitly (deploy/k8s sets :8081 for the cluster-internal Service).
+	// loopback by default: the Admin API is internal only and a deployment
+	// must opt in explicitly to expose it beyond the host.
 	AdminAddr string // TRPC_ADMIN_ADDR
 	// WorkerAddr is the worker role's metrics listener in split-role
 	// deployments (serve worker); each role needs its own address on a
@@ -44,14 +43,14 @@ type Config struct {
 	ModelBaseURL string // TRPC_MODEL_BASE_URL: OpenAI-compatible endpoint (DeepSeek default)
 	// ModelBaseURLAllow is the platform-level allowlist of model endpoint
 	// hosts (comma-separated, exact host match) that tenant and app configs
-	// may point at. Everything a user says travels to that endpoint, so it is
-	// platform policy, not tenant policy (design 5.4). Empty means "the host
-	// of ModelBaseURL only".
+	// may point at. All user messages travel to that endpoint, so it is
+	// platform policy, not tenant policy. Empty means "the host of
+	// ModelBaseURL only".
 	ModelBaseURLAllow string // TRPC_MODEL_BASE_URL_ALLOW
 	ModelName         string // TRPC_MODEL_NAME: model name, e.g. deepseek-v4-flash (cheapest)
 	ModelAPIKeyRef    string // TRPC_MODEL_APIKEY_REF: secret ref (NOT the key itself) resolved via SecretResolver
-	// ModelTimeout bounds one model run (design 5.2.2: 60s deadline, retry
-	// once, then a busy reply). Go duration syntax.
+	// ModelTimeout bounds one model run: 60s deadline, retry once, then a
+	// busy reply. Go duration syntax.
 	ModelTimeout string // TRPC_MODEL_TIMEOUT
 	// ModelPrices maps model name to USD per 1M tokens for cost accounting
 	// (audit_log.cost), JSON: {"deepseek-v4-flash":[0.1,0.4]}. Empty means
@@ -59,7 +58,7 @@ type Config struct {
 	ModelPrices string // TRPC_MODEL_PRICES
 
 	// SessionBackend selects the session store: "redis" (default, hot data)
-	// or "postgres" (event journal + snapshot in the 5.1.3 tables).
+	// or "postgres" (event journal + snapshot).
 	SessionBackend string // TRPC_SESSION_BACKEND
 	// AppName is the fallback runner app name for messages the Gateway could
 	// not route (tenant routing disabled, e.g. PG down at startup). Routed
@@ -77,7 +76,7 @@ type Config struct {
 	WecomSecretRef string // TRPC_WECOM_SECRET_REF: corpsecret secret ref
 	WecomAPIBase   string // TRPC_WECOM_API_BASE: default https://qyapi.weixin.qq.com
 
-	// WeChat KF (微信客服) channel: enabled when both are set. Same secret-ref
+	// WeChat KF channel: enabled when both are set. Same secret-ref
 	// discipline; the KF secret is independent of the WeCom corpsecret.
 	WxkfCorpID    string // TRPC_WXKF_CORP_ID
 	WxkfKfAccount string // TRPC_WXKF_KF_ACCOUNT: open_kfid
@@ -88,7 +87,7 @@ type Config struct {
 
 	// MockChannel enables the built-in mock channel (demo/dev). It is off by
 	// default: the mock callback is an unauthenticated message injector, so
-	// a deployment must opt in explicitly (design 5.4 仅内网可达).
+	// a deployment must opt in explicitly (internal network only).
 	MockChannel string // TRPC_MOCK_CHANNEL: "true" to enable (dev only)
 
 	// AdminToken guards the Admin API (Authorization: Bearer). An unset token
@@ -97,45 +96,45 @@ type Config struct {
 	// opts out with the explicit AdminTokenDevInsecure sentinel.
 	AdminToken string // TRPC_ADMIN_TOKEN
 
-	// Admin mTLS (split admin role only, design 5.4): when all three are set,
-	// the admin listener serves TLS and requires client certificates signed
-	// by the given CA.
+	// Admin mTLS (split admin role only): when all three are set, the admin
+	// listener serves TLS and requires client certificates signed by the
+	// given CA.
 	AdminTLSCert     string // TRPC_ADMIN_TLS_CERT
 	AdminTLSKey      string // TRPC_ADMIN_TLS_KEY
 	AdminTLSClientCA string // TRPC_ADMIN_TLS_CLIENT_CA
 
-	// SecretResolverType selects the secret backend (design 决策三): "file"
-	// (local dev, default) or "kms" (KMS sidecar / Vault agent at
-	// TRPC_KMS_ENDPOINT). The KMS bearer token is itself a secret, resolved
-	// from TRPC_KMS_TOKEN_REF through the file resolver. Every backend is
-	// wrapped in the short-TTL process cache (TRPC_SECRET_CACHE_TTL).
+	// SecretResolverType selects the secret backend: "file" (local dev,
+	// default) or "kms" (KMS sidecar / Vault agent at TRPC_KMS_ENDPOINT). The
+	// KMS bearer token is itself a secret, resolved from TRPC_KMS_TOKEN_REF
+	// through the file resolver. Every backend is wrapped in the short-TTL
+	// process cache (TRPC_SECRET_CACHE_TTL).
 	SecretResolverType string // TRPC_SECRET_RESOLVER
 	KMSEndpoint        string // TRPC_KMS_ENDPOINT
 	KMSTokenRef        string // TRPC_KMS_TOKEN_REF
 	SecretCacheTTL     string // TRPC_SECRET_CACHE_TTL
 
 	// GatewayRateQPS / GatewayRateBurst are the platform default for the
-	// per-tenant admission token bucket (design 5.1.4); tenant.rate_policy
-	// overrides per tenant.
+	// per-tenant admission token bucket; tenant.rate_policy overrides per
+	// tenant.
 	GatewayRateQPS   string // TRPC_GATEWAY_RATE_QPS
 	GatewayRateBurst string // TRPC_GATEWAY_RATE_BURST
 
 	// SendRateQPS / SendRateBurst pace outbound IM sends per
-	// {channel, tenant} (design 5.3.2, IM proactive-send rate limits).
+	// {channel, tenant} (IM proactive-send rate limits).
 	SendRateQPS   string // TRPC_SEND_RATE_QPS
 	SendRateBurst string // TRPC_SEND_RATE_BURST
 
 	// SummaryEventThreshold is the number of uncovered events that triggers
 	// session summarization (PG session backend only). ArchiveRetention is
 	// how long session_event/audit_log rows stay in the hot tables before the
-	// archive sweep moves them (design 5.1.3); ArchiveInterval is the sweep
-	// cadence. Go duration syntax for the two intervals.
+	// archive sweep moves them; ArchiveInterval is the sweep cadence. Go
+	// duration syntax for the two intervals.
 	SummaryEventThreshold string // TRPC_SUMMARY_EVENT_THRESHOLD
 	ArchiveRetention      string // TRPC_ARCHIVE_RETENTION
 	ArchiveInterval       string // TRPC_ARCHIVE_INTERVAL
 
 	// MigrationObserve is the dual-write observation window after a migration
-	// read switch (design 5.2.6, default 24h). Go duration syntax.
+	// read switch (default 24h). Go duration syntax.
 	MigrationObserve string // TRPC_MIGRATION_OBSERVE
 
 	// Artifact S3 backend (MinIO / cloud OSS). Secret refs only; disabled when
@@ -214,7 +213,7 @@ func Load() Config {
 		SendRateBurst:    getenv("TRPC_SEND_RATE_BURST", "40"),
 
 		SummaryEventThreshold: getenv("TRPC_SUMMARY_EVENT_THRESHOLD", "20"),
-		ArchiveRetention:      getenv("TRPC_ARCHIVE_RETENTION", "720h"), // 30 days online (design 6.2)
+		ArchiveRetention:      getenv("TRPC_ARCHIVE_RETENTION", "720h"), // 30 days online
 		ArchiveInterval:       getenv("TRPC_ARCHIVE_INTERVAL", "24h"),
 		MigrationObserve:      getenv("TRPC_MIGRATION_OBSERVE", "24h"),
 
@@ -235,8 +234,8 @@ func Load() Config {
 // ModelHostAllowlist returns the hosts a tenant or app config may point its
 // model endpoint at: TRPC_MODEL_BASE_URL_ALLOW when set, otherwise the host
 // of the platform's own default endpoint. Whoever chooses that endpoint reads
-// every message the tenant's users send, so it is platform policy (design
-// 5.4) and defaults to the platform's own choice rather than to "anything".
+// every message the tenant's users send, so it is platform policy and
+// defaults to the platform's own choice rather than to "anything".
 func (c Config) ModelHostAllowlist() []string {
 	if list := strings.TrimSpace(c.ModelBaseURLAllow); list != "" {
 		var hosts []string

@@ -71,8 +71,8 @@ type Worker struct {
 	Stream    *storage.Stream
 	Lock      *storage.Lock // nil disables session locking (single-replica dev)
 	Processor Processor
-	// Processed is the execution-layer idempotency marker (design 5.1.4):
-	// redelivered messages skip reprocessing once done. Nil disables it.
+	// Processed is the execution-layer idempotency marker: redelivered
+	// messages skip reprocessing once done. Nil disables it.
 	Processed *storage.ProcessedMarker
 	Name      string // consumer name identifying pending ownership (e.g. hostname-pid)
 
@@ -94,10 +94,9 @@ type Worker struct {
 	LockTTL  time.Duration
 	LockWait time.Duration
 
-	// DrainTimeout bounds the graceful shutdown drain (design 5.2.2 进程退出
-	// 时先停止拉新消息、排空在途会话后再退出): after Run's ctx is canceled
-	// the in-flight message keeps processing until it finishes or this
-	// timeout forces cancellation.
+	// DrainTimeout bounds the graceful shutdown drain: after Run's ctx is
+	// canceled the in-flight message keeps processing until it finishes or
+	// this timeout forces cancellation.
 	DrainTimeout time.Duration
 }
 
@@ -161,8 +160,8 @@ func (w *Worker) outStream() string {
 // Every reapInterval it also takes over pending messages orphaned by crashed
 // consumers (XCLAIM semantics via XAUTOCLAIM).
 //
-// Graceful drain (design 5.2.2): on shutdown the worker stops pulling new
-// messages, and the in-flight message keeps its own process context — it
+// Graceful drain: on shutdown the worker stops pulling new messages, and the
+// in-flight message keeps its own process context — it
 // finishes (or force-cancels at DrainTimeout) before Run returns, so a
 // rolling update does not interrupt a session mid-run.
 func (w *Worker) Run(ctx context.Context) error {
@@ -228,8 +227,8 @@ func (w *Worker) handle(ctx context.Context, m storage.Message) {
 	)
 	started := time.Now()
 
-	// Execution-layer idempotency (design 5.1.4): a redelivered message whose
-	// reply already made it outbound is acked without reprocessing — the LLM
+	// Execution-layer idempotency: a redelivered message whose reply already
+	// made it outbound is acked without reprocessing — the LLM
 	// must not run twice and the journal must not get duplicate events.
 	if w.Processed != nil {
 		done, err := w.Processed.IsDone(ctx, msg.Channel, msg.BindingID, msg.MsgID)
@@ -370,7 +369,7 @@ func (w *Worker) acquireSession(ctx context.Context, m storage.Message, appID, s
 			// Leave the entry pending for the reaper instead of re-queueing a
 			// copy: the copy rode a new stream ID whose attempts counter
 			// started at zero, so a wedged session could re-queue forever
-			// and the maxAttempts dead-letter never fired (review P1-8).
+			// and the maxAttempts dead-letter never fired.
 			plog.Infof("worker %s leaves %s pending: session %s is busy, reaper takes over",
 				w.Name, m.ID, sessionKey)
 			return "", nil, false

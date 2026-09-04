@@ -11,8 +11,8 @@ import (
 	plog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
 )
 
-// Queue gauges (design 5.2.4 队列): stream length, pending count and the
-// oldest pending message's idle time, the inputs of the backlog alerts.
+// Queue gauges: stream length, pending count and the oldest pending
+// message's idle time, the inputs of the backlog alerts.
 var (
 	// StreamLength is the number of entries in a stream (XLEN).
 	StreamLength otelmetric.Int64Gauge

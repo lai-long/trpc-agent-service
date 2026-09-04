@@ -10,9 +10,9 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// Store loads the full tenant data set. The data volume is small (design
-// target ~50 tenants), so the Resolver caches a full snapshot instead of
-// querying per request.
+// Store loads the full tenant data set. The data volume is small (target
+// ~50 tenants), so the Resolver caches a full snapshot instead of querying
+// per request.
 type Store interface {
 	LoadAll(ctx context.Context) (Data, error)
 }

@@ -9,11 +9,10 @@ import (
 	"time"
 )
 
-// KMSResolver resolves secrets over HTTP from a KMS sidecar or Vault agent
-// (design 决策三: 线上用短 TTL 缓存 + 轮换期间双引用并存). Contract:
-// GET {endpoint}/v1/secrets/{ref} with a bearer token; a 200 response body
-// is the plaintext secret. Anything else is an error (the CachedResolver
-// wrapper serves staleness through short outages).
+// KMSResolver resolves secrets over HTTP from a KMS sidecar or Vault agent.
+// Contract: GET {endpoint}/v1/secrets/{ref} with a bearer token; a 200
+// response body is the plaintext secret. Anything else is an error (the
+// CachedResolver wrapper serves staleness through short outages).
 type KMSResolver struct {
 	endpoint string
 	token    string

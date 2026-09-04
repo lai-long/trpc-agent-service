@@ -63,8 +63,8 @@ func mergeModel(base ModelSpec, overrides ...ModelSpec) ModelSpec {
 func DefaultModelHosts() []string { return []string{"api.deepseek.com"} }
 
 // ValidateModelSpec rejects a model spec whose base_url falls outside the
-// platform allowlist. Tenant/app config is platform data, not user data
-// (design 5.4): a tenant that could pick an arbitrary endpoint would receive
+// platform allowlist. Tenant/app config is platform data, not user data:
+// a tenant that could pick an arbitrary endpoint would receive
 // the full conversation content — including session history replayed into
 // every run — at a host of its choosing.
 //
@@ -161,11 +161,10 @@ func parseToolPolicy(raw json.RawMessage) tool.ToolPolicy {
 	return p
 }
 
-// StorageConfig is the tenant's storage backend override (design 5.1.1 受控
-// 菜单): empty means the platform default stack. Only session has a choice
-// today (redis / postgres); unknown values fall back to the default with a
-// warning. Changes arrive only through the migration flow — a direct edit is
-// rejected by the Admin API.
+// StorageConfig is the tenant's storage backend override: empty means the
+// platform default stack. Only session has a choice today (redis / postgres);
+// unknown values fall back to the default with a warning. Changes arrive only
+// through the migration flow — a direct edit is rejected by the Admin API.
 type StorageConfig struct {
 	Session struct {
 		Type string `json:"type"` // "redis" | "postgres"
@@ -199,11 +198,10 @@ type keyError struct{ Err error }
 func (e *keyError) Error() string { return e.Err.Error() }
 func (e *keyError) Unwrap() error { return e.Err }
 
-// Assembler builds a Runner-backed Processor per agent app (design 4.3:
-// tenant-level agent registration and routing) and caches assemblies keyed by
-// app ID. An entry is rebuilt whenever the app config or the tenant's
-// model_config / tool_policy bytes change; the Resolver underneath refreshes
-// on TTL plus the Admin API's pub/sub invalidation (design 5.2.3), so a
+// Assembler builds a Runner-backed Processor per agent app and caches
+// assemblies keyed by app ID. An entry is rebuilt whenever the app config or
+// the tenant's model_config / tool_policy bytes change; the Resolver
+// underneath refreshes on TTL plus the Admin API's pub/sub invalidation, so a
 // publish/rollback propagates to workers within seconds.
 //
 // Replaced runners are not closed on eviction — an in-flight message may
@@ -238,8 +236,7 @@ type AssemblerConfig struct {
 	// routes its apps to the chosen backend; empty/unknown means the default.
 	SessionsByType map[string]session.Service
 	DefaultSession string
-	// Artifact, when set, is wired onto every per-app runner (design:
-	// Artifact = S3, tenant differentiation is a later menu item).
+	// Artifact, when set, is wired onto every per-app runner.
 	Artifact artifact.Service
 
 	// Defaults is the env model config (lowest precedence); DefaultApp is the
@@ -252,7 +249,7 @@ type AssemblerConfig struct {
 	Defaults   ModelSpec
 	ModelHosts []string
 	DefaultApp string
-	// Timeout / Retries for every per-app runner (design 5.2.2).
+	// Timeout / Retries for every per-app runner.
 	Timeout time.Duration
 	Retries int
 }
@@ -339,7 +336,7 @@ func (a *Assembler) assemble(ctx context.Context, app tenant.AgentApp, t tenant.
 		return nil, err
 	}
 	spec := mergeModel(a.cfg.Defaults, parseModelSpec(t.ModelConfig), ac.Model)
-	// Defense in depth (design 5.4): the Admin API gates every config write,
+	// Defense in depth: the Admin API gates every config write,
 	// but rows reach the store by other roads too (direct SQL, versions
 	// published before the gate existed). The platform default endpoint is
 	// the operator's own choice and skips the check; anything a tenant or
@@ -355,13 +352,13 @@ func (a *Assembler) assemble(ctx context.Context, app tenant.AgentApp, t tenant.
 	}
 
 	// Tool isolation: the platform registry is narrowed by the tenant
-	// whitelist first, then by the app's own policy (design 4.3).
+	// whitelist first, then by the app's own policy.
 	tools := a.cfg.Registry.Allowed(parseToolPolicy(t.ToolPolicy), ac.Tools)
 
-	// Session backend routing (design 5.1.1): the tenant's storage_config
-	// picks from the controlled menu; empty/unknown means the platform
-	// default. Session history does not follow the runner across backends —
-	// switching happens through the migration flow (5.2.6).
+	// Session backend routing: the tenant's storage_config picks from the
+	// controlled menu; empty/unknown means the platform default. Session
+	// history does not follow the runner across backends — switching happens
+	// through the migration flow.
 	sess := a.sessionServiceFor(t)
 
 	// Knowledge isolation: the shared pgvector base is filtered down to this
@@ -391,10 +388,10 @@ func (a *Assembler) assemble(ctx context.Context, app tenant.AgentApp, t tenant.
 }
 
 // sessionServiceFor picks the tenant's session backend from the controlled
-// menu (design 5.1.1); empty or unknown types fall back to the platform
-// default with a warning. During a migration (design 5.2.6) the choice wraps
-// in a dual-write fanout: reads follow the phase (old backend until the read
-// switch, new one while observing), writes hit both.
+// menu; empty or unknown types fall back to the platform default with a
+// warning. During a migration the choice wraps in a dual-write fanout: reads
+// follow the phase (old backend until the read switch, new one while
+// observing), writes hit both.
 func (a *Assembler) sessionServiceFor(t tenant.Tenant) session.Service {
 	mig := a.activeMigration(t.ID)
 	if mig != nil {
@@ -435,7 +432,7 @@ func (a *Assembler) activeMigration(tenantID string) *tenant.Migration {
 
 // SessionServiceFor resolves the session backend of the given app (tenant
 // routing + migration fanout), for out-of-band state writes such as the
-// recall marker (design 5.3.2).
+// recall marker.
 func (a *Assembler) SessionServiceFor(ctx context.Context, appID string) (session.Service, error) {
 	if a.cfg.Apps == nil {
 		return nil, errors.New("no app provider")

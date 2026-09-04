@@ -298,7 +298,7 @@ func TestCallbackMedia(t *testing.T) {
 	}
 }
 
-// Per-binding callbacks (design 5.3.1 多租户接入): each binding verifies under
+// Per-binding callbacks: each binding verifies under
 // its own token/AES key, so binding2's handler must reject — with a 200 ack,
 // never a 5xx retry storm — a callback encrypted for binding1, and the same
 // inner message encrypted for binding2 must come through on its own handler.

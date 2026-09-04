@@ -311,7 +311,7 @@ func TestParseStorageConfig(t *testing.T) {
 
 // During a session-backend migration the assembler must dual-write: reads
 // follow the phase (old backend until the read switch, new one while
-// observing), writes hit both (design 5.2.6).
+// observing), writes hit both.
 func TestSessionServiceFanoutDuringMigration(t *testing.T) {
 	redisSvc := sessioninmemory.NewSessionService()
 	pgSvc := sessioninmemory.NewSessionService()

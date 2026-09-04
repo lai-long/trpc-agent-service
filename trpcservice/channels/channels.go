@@ -29,7 +29,7 @@ type InboundMessage struct {
 	ChatID      string    // group chat ID; empty for direct chats
 	Text        string    // text content (media messages carry a placeholder)
 	Type        string    // Type* constants; empty means TypeText
-	MediaRef    string    // TypeMedia: artifact reference of the fetched media (design 5.3.2)
+	MediaRef    string    // TypeMedia: artifact reference of the fetched media
 	WebhookPath string    // callback path the message arrived on; routes to tenant/app
 	BindingID   string    // channel_binding row serving this callback, stamped by the Gateway; scopes the per-binding idempotency keys (done:/sent:)
 	TenantID    string    // owning tenant UUID, stamped by the Gateway
@@ -48,7 +48,7 @@ const (
 	// reference; Text is a human-readable placeholder for the model.
 	TypeMedia = "media"
 	// TypeRecall is a message-recalled event: it never reaches the LLM — the
-	// guardrail audits it and marks the session state (design 5.3.2 撤回).
+	// guardrail audits it and marks the session state.
 	TypeRecall = "recall"
 )
 
@@ -81,25 +81,22 @@ type OutboundMessage struct {
 	TraceParent string // W3C traceparent, carried through to the outbound span
 
 	// Token usage of the generating run plus the model that produced it, for
-	// audit/cost accounting (design 5.1.3 audit_log cost columns). Never sent
-	// to the IM; the sender ignores these fields.
+	// audit/cost accounting. Never sent to the IM; the sender ignores these fields.
 	PromptTokens     int
 	CompletionTokens int
 	Model            string
 
 	// TextType is the reply markup: "" or "markdown". Channels without
-	// markdown support (e.g. WeChat KF) downgrade via RenderPlain (design
-	// 5.3.2 通道级渲染降级: 卡片 → markdown → 纯文本).
+	// markdown support (e.g. WeChat KF) downgrade via RenderPlain.
 	TextType string
 
 	// ReceivedAt is the inbound callback's arrival time, carried through so
-	// the sender can record the end-to-end latency (design 5.2.4: 端到端
-	// P95 回调→回复落 IM).
+	// the sender can record the end-to-end latency.
 	ReceivedAt time.Time
 }
 
 // RenderPlain strips common markdown syntax for channels that render plain
-// text only (微信客服): bold/italic markers, heading hashes, inline code
+// text only: bold/italic markers, heading hashes, inline code
 // ticks and link targets are dropped, the visible text is kept.
 func RenderPlain(s string) string {
 	var b strings.Builder
@@ -138,8 +135,7 @@ func RenderPlain(s string) string {
 	return b.String()
 }
 
-// MediaStore persists IM media fetched by an adapter (design 5.3.2: 素材落
-// Artifact，消息体只带引用). *storage.S3ArtifactService satisfies it.
+// MediaStore persists IM media fetched by an adapter. *storage.S3ArtifactService satisfies it.
 type MediaStore interface {
 	SaveMedia(ctx context.Context, channel, msgID, filename, mimeType string, data []byte) (ref string, err error)
 }
@@ -197,7 +193,7 @@ type Channel interface {
 }
 
 // BindingCredentials carries one channel_binding row's callback verification
-// material (design 5.3.1 多租户接入). Secret material stays as references —
+// material. Secret material stays as references —
 // the adapter resolves them through its SecretResolver and never logs them.
 type BindingCredentials struct {
 	BindingID string
@@ -216,7 +212,7 @@ type BindingCredentials struct {
 // the env-configured callback path stays mounted as the single-binding
 // default for deployments that have not moved to binding rows. The hardcoded
 // one-path-per-adapter model structurally limited the platform to one tenant
-// per channel (review P1-5).
+// per channel.
 type BindingAware interface {
 	// CallbackHandler returns the HTTP handler serving one binding's
 	// callbacks: GET answers the platform's URL-registration challenge, POST
@@ -231,7 +227,7 @@ type BindingAware interface {
 // log or trace: the WeCom/KF APIs carry access_token (and the corpsecret, on
 // gettoken) in the query string, and net/http embeds the full URL in the
 // error. The field-key log redaction cannot see inside a string, so the
-// scrub happens at the source (design: 密钥零明文红线).
+// scrub happens at the source.
 func ScrubError(err error) error {
 	var ue *url.Error
 	if errors.As(err, &ue) {

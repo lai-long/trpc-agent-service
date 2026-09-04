@@ -19,8 +19,7 @@ import (
 )
 
 // DefaultApprovalTimeout is how long a user has to confirm a dangerous tool
-// call (design 5.3.3: 5 minutes, tenant-configurable once tenant policies are
-// wired).
+// call.
 const DefaultApprovalTimeout = 5 * time.Minute
 
 // approvalKeyGrace extends the Redis key TTL beyond the deadline so a late
@@ -38,7 +37,7 @@ const approvalToolTimeout = time.Minute
 // with a native TTL and readable without loading the whole session. The app
 // dimension matches the session identity (app_id, session_key): two tenants'
 // users carrying the same channel:user session key must never see — let alone
-// confirm — each other's pending dangerous calls (design 5.3.3).
+// confirm — each other's pending dangerous calls.
 type PendingApproval struct {
 	CallID    string          `json:"call_id"`
 	ToolName  string          `json:"tool_name"`
@@ -61,7 +60,7 @@ type Signal struct {
 	Fresh    bool // created only: false when a redelivery re-hit the same call
 }
 
-// Approver implements the dangerous-tool approval chain of design 5.3.3:
+// Approver implements the dangerous-tool approval chain:
 // intercept (BeforeTool) → pending record → user answer matching (Answer) →
 // release or reject. Auditing of the review/deny/review_timeout decisions is
 // left to the guardrail that owns message context; the Approver reports via
@@ -148,7 +147,7 @@ func (a *Approver) BeforeTool(ctx context.Context, args *ttool.BeforeToolArgs) (
 			})
 			return blockedResult("该操作已在等待用户确认"), nil
 		}
-		// One pending approval per session at a time (design 5.3.3 rule 5):
+		// One pending approval per session at a time:
 		// reject the new call, keep the original pending.
 		a.setSignal(scope, Signal{
 			Kind: "conflict", ToolName: args.ToolName, Pending: existing.ToolName,
@@ -176,7 +175,7 @@ func (a *Approver) BeforeTool(ctx context.Context, args *ttool.BeforeToolArgs) (
 // Answer checks whether msg is a confirmation/rejection of the session's
 // pending approval. handled=false means the message is not an answer (or no
 // approval is pending) and normal processing should continue — non-answer
-// messages never disturb a pending approval (design 5.3.3 rule 3).
+// messages never disturb a pending approval.
 //
 // The audit event for consumed answers is emitted synchronously by the caller
 // via the returned decision; Answer itself only reports what happened.
@@ -192,7 +191,7 @@ func (a *Approver) Answer(ctx context.Context, msg channels.InboundMessage) (han
 		return false, channels.OutboundMessage{}, dec, nil
 	}
 
-	// Exact match only (design 5.3.3 rule 2): an answer-shaped message either
+	// Exact match only: an answer-shaped message either
 	// closes the approval or is processed as normal chat — nothing in between.
 	text := strings.TrimSpace(msg.Text)
 	if text != answerConfirm && text != answerReject && text != answerCancel {
@@ -200,8 +199,8 @@ func (a *Approver) Answer(ctx context.Context, msg channels.InboundMessage) (han
 	}
 
 	reply := replyShell(msg)
-	// Group chats: only the original requester may confirm (design 5.3.3
-	// rule 6). The pending record is left untouched.
+	// Group chats: only the original requester may confirm. The pending record
+	// is left untouched.
 	if msg.ChatID != "" && msg.UserID != p.Requester {
 		reply.Text = "仅操作发起人可以确认或拒绝该操作。"
 		return true, reply, dec, nil
@@ -306,7 +305,7 @@ func (a *Approver) delete(ctx context.Context, scope approvalScope) error {
 }
 
 // Answer texts the user may send to close a pending approval (exact match
-// after the channel normalized the text; design 5.3.3 rule 2).
+// after the channel normalized the text).
 const (
 	answerConfirm = "确认"
 	answerReject  = "拒绝"

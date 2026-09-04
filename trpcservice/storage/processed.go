@@ -7,7 +7,7 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// ProcessedMarker is the execution-layer idempotency of design 5.1.4: the
+// ProcessedMarker is the execution-layer idempotency: the
 // worker marks a message done:{channel}:{binding}:{msg_id} (24h) after its
 // reply is enqueued. A Stream redelivery (reaper takeover after a crash, or a
 // delayed Ack) finds the marker and skips reprocessing — without it a

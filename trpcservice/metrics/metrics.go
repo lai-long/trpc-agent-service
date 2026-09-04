@@ -50,11 +50,11 @@ var (
 	// TokensTotal counts LLM token usage by kind (prompt / completion).
 	TokensTotal otelmetric.Int64Counter
 	// EndToEndDuration is the full message latency: IM callback arrival to the
-	// reply landing on the IM (design 5.2.4 延迟 row; the 15s P95 budget).
+	// reply landing on the IM (15s P95 budget).
 	EndToEndDuration otelmetric.Float64Histogram
 	// GatewayRejectedTotal counts callbacks rejected before enqueue, by reason
 	// (rate_limited / backpressure): the noisy-neighbor and overload defenses
-	// of design 5.1.4 firing.
+	// firing.
 	GatewayRejectedTotal otelmetric.Int64Counter
 	// SendRateLimitedTotal counts outbound messages re-queued because the
 	// per-{channel, tenant} send bucket was exhausted within the wait window.

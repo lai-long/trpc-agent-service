@@ -32,7 +32,7 @@ var tracer = otel.Tracer("trpc-agent-service/gateway")
 // Before enqueueing, the handler resolves tenant routing (webhook_path →
 // channel_binding → tenant + app) and stamps tenant_id / app_id onto the
 // message; unknown or inactive routes are rejected. Two admission defenses
-// follow (design 5.1.4): a per-tenant token bucket rejects a tenant flooding
+// follow: a per-tenant token bucket rejects a tenant flooding
 // the shared queue (noisy neighbor), and an XLEN backpressure check rejects
 // everyone once the queue is nearly full. Both rejections return an error so
 // the channel answers 5xx and the IM redelivers later — that redelivery is
@@ -75,7 +75,7 @@ func (h EnqueueHandler) backpressureLimit() int64 {
 
 // ErrOverloaded rejects a callback because admission control fired (tenant
 // rate limit or queue backpressure). The channel layer answers 5xx so the
-// IM redelivers later (design 5.2.2).
+// IM redelivers later.
 var ErrOverloaded = errors.New("gateway overloaded")
 
 // Handle implements channels.Handler.
@@ -132,7 +132,7 @@ func (h EnqueueHandler) Handle(ctx context.Context, msg channels.InboundMessage)
 
 	// Rollback for anything that fails from here on: the dedup key must not
 	// outlive a failed delivery attempt, or the IM redelivery that is supposed
-	// to retry the message (design 5.2.2) would be dropped as a duplicate.
+	// to retry the message would be dropped as a duplicate.
 	rollbackDedup := func() {
 		if h.Dedup == nil {
 			return

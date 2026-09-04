@@ -13,7 +13,7 @@ import (
 // the same session across worker replicas. The app dimension matches the
 // session store's (app_id, session_key) identity: two tenants' users can
 // carry the same channel:user session key, and one tenant's long run must
-// never block the other's (design 5.1.4). The (session_id, event_seq) unique
+// never block the other's. The (session_id, event_seq) unique
 // constraint remains the last-resort backstop if the lock is ever lost.
 type Lock struct {
 	rdb *redis.Client

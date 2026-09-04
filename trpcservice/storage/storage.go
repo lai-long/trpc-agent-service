@@ -55,7 +55,7 @@ func NewPG(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
 }
 
 // NewPGLazy builds a pool without pinging: connections dial on first use.
-// The gateway runs fail-closed (design 5.2.2): the tenant resolver must exist
+// The gateway runs fail-closed: the tenant resolver must exist
 // even while PG is down at startup — routing errors (5xx, the IM retries)
 // until PG returns, then the resolver recovers on its next refresh.
 func NewPGLazy(ctx context.Context, dsn string) (*pgxpool.Pool, error) {

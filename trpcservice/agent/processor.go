@@ -26,13 +26,13 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/metrics"
 )
 
-// DefaultRunTimeout bounds one model run (design 5.2.2: 60s).
+// DefaultRunTimeout bounds one model run.
 const DefaultRunTimeout = 60 * time.Second
 
 // ModelError marks a failure of the model call itself (timeout, LLM API
 // error, empty response), as opposed to a platform infrastructure failure
 // (session store, queue). The guardrail degrades a ModelError to a busy
-// reply; any other error keeps the message pending for redelivery (5.2.2).
+// reply; any other error keeps the message pending for redelivery.
 type ModelError struct{ Err error }
 
 func (e *ModelError) Error() string { return e.Err.Error() }
@@ -59,8 +59,7 @@ type RunnerConfig struct {
 	Temperature    *float64 // nil means the model default
 	SessionService session.Service
 	// Timeout bounds one run and Retries is the number of re-attempts after a
-	// failed run (design 5.2.2: 60s deadline, retry once, then degrade).
-	// Zero values default to 60s / 1.
+	// failed run. Zero values default to 60s / 1.
 	Timeout time.Duration
 	Retries int
 	// Tools and ToolCallbacks wire the platform tool registry and the
@@ -75,7 +74,7 @@ type RunnerConfig struct {
 	Knowledge       knowledge.Knowledge
 	KnowledgeFilter map[string]any
 	// ArtifactService, when set, is wired onto the runner for artifact
-	// storage (design: Artifact = S3).
+	// storage.
 	ArtifactService artifact.Service
 }
 
@@ -137,10 +136,10 @@ func newRunnerProcessor(r runner.Runner, modelName string, timeout time.Duration
 }
 
 // Process implements Processor: run with a per-run deadline, retrying a
-// failed run up to cfg.Retries times (design 5.2.2: retry once, then the
-// guardrail degrades to a busy reply). Model-side failures come back as
-// *ModelError; infrastructure failures (runner.Run itself refusing the run)
-// are returned raw so the worker leaves the message pending for redelivery.
+// failed run up to cfg.Retries times, then degrading to a busy reply on the
+// last failure. Model-side failures come back as *ModelError; infrastructure
+// failures (runner.Run itself refusing the run) are returned raw so the
+// worker leaves the message pending for redelivery.
 //
 // The event channel must be consumed until closed, otherwise framework-side
 // goroutines block and leak.
@@ -166,7 +165,7 @@ func (p *RunnerProcessor) Process(ctx context.Context, msg channels.InboundMessa
 			// Exponential backoff with jitter before the next attempt:
 			// immediate retries hit a struggling model with aligned
 			// multi-replica spikes and amplify the outage instead of riding
-			// it out (review P1-13). Canceled by the run context.
+			// it out. Canceled by the run context.
 			if err := retryBackoff(ctx, attempt); err != nil {
 				return out, ctx.Err()
 			}
@@ -195,7 +194,7 @@ func (p *RunnerProcessor) Process(ctx context.Context, msg channels.InboundMessa
 			// failure: returning it raw keeps it off the ModelError path, so
 			// the guardrail does not degrade into a busy reply and the
 			// worker does not Ack — the redelivery that a surviving replica
-			// takes over still owns this message (review P1-12).
+			// takes over still owns this message.
 			return out, ctx.Err()
 		}
 	}

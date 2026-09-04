@@ -91,7 +91,7 @@ func TestEnqueueStampsTenant(t *testing.T) {
 }
 
 // A failed enqueue must not leave the dedup key behind: the IM redelivery is
-// the retry path (design 5.2.2), and a stale key would drop every retry for
+// the retry path, and a stale key would drop every retry for
 // the full 24h TTL — the message would be lost instead of delayed.
 func TestEnqueueRollsBackDedupOnFailure(t *testing.T) {
 	ctx := context.Background()
@@ -178,7 +178,7 @@ func TestEnqueueRateLimited(t *testing.T) {
 }
 
 // With the queue at the backpressure limit the gateway rejects and rolls back
-// the dedup key: refusing beats silent MAXLEN truncation (design 5.1.4).
+// the dedup key: refusing beats silent MAXLEN truncation.
 func TestEnqueueBackpressure(t *testing.T) {
 	ctx := context.Background()
 	rdb := testenv.Redis(t)

@@ -13,10 +13,10 @@ import (
 )
 
 // InvalidationChannel is the Redis pub/sub channel carrying config
-// invalidation notifications (design 5.2.3): the Admin API publishes after
-// tenant/app/binding writes and publish/rollback; Resolvers drop their cache
-// on receipt so changes take effect in seconds. The cache TTL remains the
-// fallback when a notification is lost.
+// invalidation notifications: the Admin API publishes after tenant/app/binding
+// writes and publish/rollback; Resolvers drop their cache on receipt so
+// changes take effect in seconds. The cache TTL remains the fallback when a
+// notification is lost.
 const InvalidationChannel = "tenant:invalidate"
 
 // PublishInvalidation notifies all Resolver instances to drop their cache.
@@ -28,8 +28,8 @@ func PublishInvalidation(ctx context.Context, rdb *redis.Client) error {
 }
 
 // DefaultCacheTTL bounds how long a snapshot is served before reloading.
-// The publish/rollback pub/sub invalidation arrives with the Admin API
-// (design 5.2.3); until then this TTL is the only refresh mechanism.
+// The publish/rollback pub/sub invalidation arrives with the Admin API; until
+// then this TTL is the only refresh mechanism.
 const DefaultCacheTTL = 30 * time.Second
 
 var (
@@ -107,7 +107,7 @@ func (r *Resolver) Resolve(ctx context.Context, webhookPath string) (Route, erro
 			ErrUnknownBinding, b.ID, b.AppID)
 	}
 	// Only the published version serves traffic; drafts exist for gray
-	// release staging and must not receive callbacks (design 5.2.3).
+	// release staging and must not receive callbacks.
 	if app.Status != "published" {
 		return Route{}, fmt.Errorf("%w: app %s status %q", ErrInactive, app.ID, app.Status)
 	}
@@ -239,7 +239,7 @@ func (r *Resolver) refresh(ctx context.Context) error {
 
 // ActiveMigration returns the in-flight migration for (tenant, resource), or
 // nil. The worker's session-service routing fans writes out to both backends
-// while one is active (design 5.2.6).
+// while one is active.
 func (r *Resolver) ActiveMigration(tenantID, resource string) *Migration {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -254,9 +254,9 @@ func (r *Resolver) ActiveMigration(tenantID, resource string) *Migration {
 // BindingByID looks up one channel binding by its ID, for the callback
 // dispatcher at /callback/{channel}/{binding_id}: the path identifies the
 // binding row directly, and the adapter needs the row's credential references
-// to verify the callback (design 5.3.1). Status enforcement stays on the
-// routing path (EnqueueHandler.Resolve) which re-checks binding, tenant and
-// app before a message enters the pipeline.
+// to verify the callback. Status enforcement stays on the routing path
+// (EnqueueHandler.Resolve) which re-checks binding, tenant and app before a
+// message enters the pipeline.
 func (r *Resolver) BindingByID(ctx context.Context, id string) (ChannelBinding, error) {
 	if err := r.refresh(ctx); err != nil {
 		return ChannelBinding{}, err

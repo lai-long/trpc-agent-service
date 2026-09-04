@@ -1,6 +1,6 @@
 // Package testenv gates the integration tests' infrastructure dependencies
-// through environment variables (review P0-4): CI services and dev shells set
-// them explicitly, so every skip message names the variable that enables the
+// through environment variables: CI services and dev shells set them
+// explicitly, so every skip message names the variable that enables the
 // test, and a CI run with skips > 0 fails the build instead of silently
 // shrugging past the platform's core paths.
 package testenv

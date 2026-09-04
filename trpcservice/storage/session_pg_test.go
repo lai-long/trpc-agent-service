@@ -259,7 +259,7 @@ func (f *fakeSummarizer) Metadata() map[string]any {
 
 // The summary pipeline: summarization persists text + covered_event_id, and
 // GetSession then replays only the uncovered tail with the summary exposed
-// under Session.Summaries (design 5.1.3 重放与摘要机制).
+// under Session.Summaries.
 func TestPGSessionSummaryAndIncrementalReplay(t *testing.T) {
 	_, pool := pgSessionService(t)
 	ctx := context.Background()

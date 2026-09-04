@@ -97,7 +97,7 @@ func (emptyProcessor) Process(_ context.Context, msg channels.InboundMessage) (c
 }
 
 // An empty reply is handled-and-done: the message is acked without an
-// outbound hop (design 5.3.2 撤回 never replies).
+// outbound hop (recall events never reply).
 func TestWorkerSkipsOutboundForEmptyReply(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -149,8 +149,8 @@ func TestWorkerSkipsOutboundForEmptyReply(t *testing.T) {
 	t.Fatal("message was not acked within 5s")
 }
 
-// The done marker is the execution-layer idempotency (design 5.1.4): a
-// redelivered message is acked without reprocessing — no second LLM run, no
+// The done marker is the execution-layer idempotency: a redelivered message
+// is acked without reprocessing — no second LLM run, no
 // duplicate journal events.
 func TestWorkerSkipsProcessedMessages(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
