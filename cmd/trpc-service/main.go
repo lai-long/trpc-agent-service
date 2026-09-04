@@ -336,6 +336,7 @@ func serve(role string) error {
 			adminAPI := web.NewAdminAPI(pgPool, auditor, rdb, cfg.AdminToken)
 			adminAPI.Knowledge = kb
 			adminAPI.DefaultSessionBackend = defaultSess
+			adminAPI.ModelHosts = cfg.ModelHostAllowlist()
 
 			// The admin API always gets its own listener (TRPC_ADMIN_ADDR):
 			// the gateway listener faces the IM platforms (public), the admin
@@ -639,6 +640,7 @@ func buildProcessor(ctx context.Context, cfg config.Config, rdb *redis.Client, a
 			BaseURL:   cfg.ModelBaseURL,
 			APIKeyRef: cfg.ModelAPIKeyRef,
 		},
+		ModelHosts: cfg.ModelHostAllowlist(),
 		DefaultApp: cfg.AppName,
 		Timeout:    timeout,
 		Retries:    1,

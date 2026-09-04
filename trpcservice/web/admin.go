@@ -38,6 +38,12 @@ type AdminAPI struct {
 	// DefaultSessionBackend is the platform default session backend; a
 	// migration's from_backend is the tenant's override or this default.
 	DefaultSessionBackend string
+	// ModelHosts is the platform-level allowlist of model endpoint hosts
+	// (config.Config.ModelHostAllowlist). Tenant and app configs may only
+	// point their runner at these hosts: conversation content flows to the
+	// model endpoint, so the choice is platform policy (design 5.4). Nil
+	// falls back to agent.DefaultModelHosts.
+	ModelHosts []string
 }
 
 // NewAdminAPI creates the API. The bearer token empty means dev mode.
@@ -79,6 +85,27 @@ func (a *AdminAPI) auth(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// validateModelConfig enforces the platform model-endpoint allowlist on
+// tenant.model_config. Every write path that can set base_url goes through
+// this helper or validateAppConfig, so none of them becomes a bypass.
+func (a *AdminAPI) validateModelConfig(w http.ResponseWriter, raw json.RawMessage) bool {
+	if err := agent.ValidateModelConfig(raw, a.ModelHosts); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return false
+	}
+	return true
+}
+
+// validateAppConfig is validateModelConfig for agent_app.config, where the
+// model spec nests under "model".
+func (a *AdminAPI) validateAppConfig(w http.ResponseWriter, raw json.RawMessage) bool {
+	if err := agent.ValidateAppConfig(raw, a.ModelHosts); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return false
+	}
+	return true
+}
+
 // ---------------------------------------------------------------------------
 // Tenants
 // ---------------------------------------------------------------------------
@@ -98,6 +125,9 @@ func (a *AdminAPI) createTenant(w http.ResponseWriter, r *http.Request) {
 	}
 	if in.Name == "" {
 		writeError(w, http.StatusBadRequest, "name is required")
+		return
+	}
+	if !a.validateModelConfig(w, in.ModelConfig) {
 		return
 	}
 	var id string
@@ -195,6 +225,9 @@ func (a *AdminAPI) updateTenant(w http.ResponseWriter, r *http.Request) {
 		add("status = $%d", *in.Status)
 	}
 	if in.ModelConfig != nil {
+		if !a.validateModelConfig(w, in.ModelConfig) {
+			return
+		}
 		add("model_config = $%d", []byte(in.ModelConfig))
 	}
 	if in.ToolPolicy != nil {
@@ -251,6 +284,9 @@ func (a *AdminAPI) createApp(w http.ResponseWriter, r *http.Request) {
 	}
 	if in.Name == "" || in.AgentType == "" || len(in.Config) == 0 {
 		writeError(w, http.StatusBadRequest, "name, agent_type and config are required")
+		return
+	}
+	if !a.validateAppConfig(w, in.Config) {
 		return
 	}
 	tenantID := r.PathValue("id")
@@ -315,6 +351,9 @@ func (a *AdminAPI) updateApp(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(in.Config) == 0 {
 		writeError(w, http.StatusBadRequest, "config is required")
+		return
+	}
+	if !a.validateAppConfig(w, in.Config) {
 		return
 	}
 	before := a.rowJSON(r.Context(), "agent_app", "id", r.PathValue("app"))
@@ -422,9 +461,10 @@ func (a *AdminAPI) publish(ctx context.Context, appID string) (string, error) {
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	var tenantID, name, status string
+	var config []byte
 	err = tx.QueryRow(ctx,
-		`SELECT tenant_id, name, status FROM agent_app WHERE id = $1 FOR UPDATE`, appID).
-		Scan(&tenantID, &name, &status)
+		`SELECT tenant_id, name, status, config FROM agent_app WHERE id = $1 FOR UPDATE`, appID).
+		Scan(&tenantID, &name, &status, &config)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return "", errNotFound("app not found")
 	}
@@ -433,6 +473,12 @@ func (a *AdminAPI) publish(ctx context.Context, appID string) (string, error) {
 	}
 	if status == "published" {
 		return "", errConflict("app version is already published")
+	}
+	// The allowlist applies at publish time too (design 5.4): a draft stored
+	// before a policy change must not become the serving version, and a
+	// rollback to such a version is blocked by the same gate.
+	if err := agent.ValidateAppConfig(config, a.ModelHosts); err != nil {
+		return "", errBadRequest(err.Error())
 	}
 	if _, err := tx.Exec(ctx,
 		`UPDATE agent_app SET status = 'disabled', updated_at = now()
@@ -835,6 +881,9 @@ func (e httpError) Error() string { return e.msg }
 
 func errNotFound(msg string) error { return httpError{http.StatusNotFound, msg} }
 func errConflict(msg string) error { return httpError{http.StatusConflict, msg} }
+func errBadRequest(msg string) error {
+	return httpError{http.StatusBadRequest, msg}
+}
 
 func errStatus(err error) int {
 	var he httpError

@@ -11,7 +11,9 @@ package config
 
 import (
 	"fmt"
+	"net/url"
 	"os"
+	"strings"
 )
 
 // AdminTokenDevInsecure is the only accepted way to run the Admin API
@@ -39,9 +41,15 @@ type Config struct {
 	LogFormat  string // TRPC_LOG_FORMAT: "json" for JSON output, anything else for console
 	SecretsDir string // TRPC_SECRETS_DIR: key directory for the local file-based SecretResolver
 
-	ModelBaseURL   string // TRPC_MODEL_BASE_URL: OpenAI-compatible endpoint (DeepSeek default)
-	ModelName      string // TRPC_MODEL_NAME: model name, e.g. deepseek-v4-flash (cheapest)
-	ModelAPIKeyRef string // TRPC_MODEL_APIKEY_REF: secret ref (NOT the key itself) resolved via SecretResolver
+	ModelBaseURL string // TRPC_MODEL_BASE_URL: OpenAI-compatible endpoint (DeepSeek default)
+	// ModelBaseURLAllow is the platform-level allowlist of model endpoint
+	// hosts (comma-separated, exact host match) that tenant and app configs
+	// may point at. Everything a user says travels to that endpoint, so it is
+	// platform policy, not tenant policy (design 5.4). Empty means "the host
+	// of ModelBaseURL only".
+	ModelBaseURLAllow string // TRPC_MODEL_BASE_URL_ALLOW
+	ModelName         string // TRPC_MODEL_NAME: model name, e.g. deepseek-v4-flash (cheapest)
+	ModelAPIKeyRef    string // TRPC_MODEL_APIKEY_REF: secret ref (NOT the key itself) resolved via SecretResolver
 	// ModelTimeout bounds one model run (design 5.2.2: 60s deadline, retry
 	// once, then a busy reply). Go duration syntax.
 	ModelTimeout string // TRPC_MODEL_TIMEOUT
@@ -163,11 +171,12 @@ func Load() Config {
 		LogFormat:  getenv("TRPC_LOG_FORMAT", "console"),
 		SecretsDir: getenv("TRPC_SECRETS_DIR", "data/secrets"),
 
-		ModelBaseURL:   getenv("TRPC_MODEL_BASE_URL", "https://api.deepseek.com"),
-		ModelName:      getenv("TRPC_MODEL_NAME", "deepseek-v4-flash"),
-		ModelAPIKeyRef: getenv("TRPC_MODEL_APIKEY_REF", "deepseek-apikey"),
-		ModelTimeout:   getenv("TRPC_MODEL_TIMEOUT", "60s"),
-		ModelPrices:    getenv("TRPC_MODEL_PRICES", ""),
+		ModelBaseURL:      getenv("TRPC_MODEL_BASE_URL", "https://api.deepseek.com"),
+		ModelBaseURLAllow: getenv("TRPC_MODEL_BASE_URL_ALLOW", ""),
+		ModelName:         getenv("TRPC_MODEL_NAME", "deepseek-v4-flash"),
+		ModelAPIKeyRef:    getenv("TRPC_MODEL_APIKEY_REF", "deepseek-apikey"),
+		ModelTimeout:      getenv("TRPC_MODEL_TIMEOUT", "60s"),
+		ModelPrices:       getenv("TRPC_MODEL_PRICES", ""),
 
 		SessionBackend: getenv("TRPC_SESSION_BACKEND", "redis"),
 		AppName:        getenv("TRPC_APP_NAME", "00000000-0000-0000-0000-000000000101"),
@@ -221,6 +230,29 @@ func Load() Config {
 		EmbedderDim:     getenv("TRPC_EMBEDDER_DIMENSION", "1536"),
 		KnowledgeTable:  getenv("TRPC_KNOWLEDGE_TABLE", "knowledge_embeddings"),
 	}
+}
+
+// ModelHostAllowlist returns the hosts a tenant or app config may point its
+// model endpoint at: TRPC_MODEL_BASE_URL_ALLOW when set, otherwise the host
+// of the platform's own default endpoint. Whoever chooses that endpoint reads
+// every message the tenant's users send, so it is platform policy (design
+// 5.4) and defaults to the platform's own choice rather than to "anything".
+func (c Config) ModelHostAllowlist() []string {
+	if list := strings.TrimSpace(c.ModelBaseURLAllow); list != "" {
+		var hosts []string
+		for _, h := range strings.Split(list, ",") {
+			if h = strings.ToLower(strings.TrimSpace(h)); h != "" {
+				hosts = append(hosts, h)
+			}
+		}
+		return hosts
+	}
+	if u, err := url.Parse(c.ModelBaseURL); err == nil {
+		if h := strings.ToLower(u.Hostname()); h != "" {
+			return []string{h}
+		}
+	}
+	return nil
 }
 
 // MustEnv reads a required environment variable and returns an error if it is

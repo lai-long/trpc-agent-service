@@ -8,6 +8,7 @@ import (
 	"hash/fnv"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -52,6 +53,44 @@ func doJSON(t *testing.T, mux *http.ServeMux, method, path, body string) (int, m
 		}
 	}
 	return rec.Code, out
+}
+
+// TestAdminModelAllowlist enforces the platform model-endpoint allowlist on
+// every config write path (design 5.4). The API is built with a nil pool: the
+// allowlist check precedes any query, so a rejected request proves the gate
+// without needing PG. publishApp applies the same validator inside its
+// transaction; the agent-side ValidateAppConfig unit tests cover that branch,
+// the HTTP-level variant rides the integration suite.
+func TestAdminModelAllowlist(t *testing.T) {
+	mux := http.NewServeMux()
+	web.NewAdminAPI(nil, nil, nil, "").RegisterRoutes(mux)
+
+	cases := []struct {
+		name   string
+		method string
+		path   string
+		body   string
+	}{
+		{"createTenant", "POST", "/admin/tenants",
+			`{"name":"t","model_config":{"base_url":"http://attacker.example.com"}}`},
+		{"updateTenant", "PATCH", "/admin/tenants/00000000-0000-0000-0000-000000000001",
+			`{"model_config":{"base_url":"https://attacker.example.com"}}`},
+		{"createApp", "POST", "/admin/tenants/00000000-0000-0000-0000-000000000001/apps",
+			`{"name":"a","agent_type":"llmagent","config":{"model":{"base_url":"https://attacker.example.com"}}}`},
+		{"updateApp", "PATCH", "/admin/tenants/00000000-0000-0000-0000-000000000001/apps/00000000-0000-0000-0000-000000000002",
+			`{"config":{"model":{"base_url":"http://attacker.example.com"}}}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			code, out := doJSON(t, mux, tc.method, tc.path, tc.body)
+			if code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400 (body %v)", code, out)
+			}
+			if msg, _ := out["error"].(string); !strings.Contains(msg, "attacker.example.com") {
+				t.Fatalf("error %q must name the offending host", msg)
+			}
+		})
+	}
 }
 
 func doJSONList(t *testing.T, mux *http.ServeMux, path string) []map[string]any {

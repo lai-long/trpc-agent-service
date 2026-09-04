@@ -6,6 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
+	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -52,6 +55,78 @@ func mergeModel(base ModelSpec, overrides ...ModelSpec) ModelSpec {
 		}
 	}
 	return out
+}
+
+// DefaultModelHosts is the model-endpoint allowlist a deployment gets when it
+// configures none: the platform's own default endpoint host. Everything a user
+// says travels to the endpoint, so the fallback is as closed as the platform
+// default rather than "any host".
+func DefaultModelHosts() []string { return []string{"api.deepseek.com"} }
+
+// ValidateModelSpec rejects a model spec whose base_url falls outside the
+// platform allowlist. Tenant/app config is platform data, not user data
+// (design 5.4): a tenant that could pick an arbitrary endpoint would receive
+// the full conversation content — including session history replayed into
+// every run — at a host of its choosing.
+//
+// An empty base_url is valid: it inherits the platform default. Plain http is
+// accepted only for loopback hosts, where the traffic never leaves the host.
+func ValidateModelSpec(spec ModelSpec, allowed []string) error {
+	if spec.BaseURL == "" {
+		return nil
+	}
+	u, err := url.Parse(spec.BaseURL)
+	if err != nil || u.Hostname() == "" {
+		return fmt.Errorf("model.base_url %q is not a valid URL", spec.BaseURL)
+	}
+	host := strings.ToLower(u.Hostname())
+	if u.Scheme != "https" && !isLoopbackHost(host) {
+		return fmt.Errorf("model.base_url %q must use https (plain http is only allowed for loopback hosts)", spec.BaseURL)
+	}
+	if len(allowed) == 0 {
+		allowed = DefaultModelHosts()
+	}
+	for _, h := range allowed {
+		if host == strings.ToLower(strings.TrimSpace(h)) {
+			return nil
+		}
+	}
+	return fmt.Errorf("model.base_url host %q is not in the platform allowlist %v", host, allowed)
+}
+
+func isLoopbackHost(host string) bool {
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	return host == "localhost"
+}
+
+// ValidateModelConfig validates tenant.model_config JSON against the
+// allowlist. Invalid JSON is an error here (unlike parseModelSpec, which
+// degrades to the default with a warning) — a config that cannot be parsed
+// must never reach the store.
+func ValidateModelConfig(raw json.RawMessage, allowed []string) error {
+	if len(raw) == 0 {
+		return nil
+	}
+	var spec ModelSpec
+	if err := json.Unmarshal(raw, &spec); err != nil {
+		return fmt.Errorf("parse model_config: %w", err)
+	}
+	return ValidateModelSpec(spec, allowed)
+}
+
+// ValidateAppConfig validates agent_app.config JSON (the model spec nests
+// under "model") against the allowlist.
+func ValidateAppConfig(raw json.RawMessage, allowed []string) error {
+	if len(raw) == 0 {
+		return nil
+	}
+	ac, err := parseAppConfig(raw)
+	if err != nil {
+		return err
+	}
+	return ValidateModelSpec(ac.Model, allowed)
 }
 
 // appConfig is the parsed agent_app.config JSONB. All fields are optional;
@@ -176,7 +251,13 @@ type AssemblerConfig struct {
 
 	// Defaults is the env model config (lowest precedence); DefaultApp is the
 	// runner app name for unrouted messages (TRPC_APP_NAME, routing disabled).
+	// ModelHosts is the platform model-endpoint allowlist
+	// (config.Config.ModelHostAllowlist): a tenant/app override pointing
+	// elsewhere is refused at assembly time too — the Admin API gates the
+	// write path, this gates everything that reaches the store another way.
+	// Nil falls back to DefaultModelHosts.
 	Defaults   ModelSpec
+	ModelHosts []string
 	DefaultApp string
 	// Timeout / Retries for every per-app runner (design 5.2.2).
 	Timeout time.Duration
@@ -265,6 +346,16 @@ func (a *Assembler) assemble(ctx context.Context, app tenant.AgentApp, t tenant.
 		return nil, err
 	}
 	spec := mergeModel(a.cfg.Defaults, parseModelSpec(t.ModelConfig), ac.Model)
+	// Defense in depth (design 5.4): the Admin API gates every config write,
+	// but rows reach the store by other roads too (direct SQL, versions
+	// published before the gate existed). The platform default endpoint is
+	// the operator's own choice and skips the check; anything a tenant or
+	// app config overrode must pass.
+	if spec.BaseURL != a.cfg.Defaults.BaseURL {
+		if err := ValidateModelSpec(spec, a.cfg.ModelHosts); err != nil {
+			return nil, fmt.Errorf("app %s model endpoint rejected: %w", app.ID, err)
+		}
+	}
 	key, err := a.cfg.Secrets.Resolve(ctx, spec.APIKeyRef)
 	if err != nil {
 		return nil, &keyError{Err: fmt.Errorf("resolve model key %q: %w", spec.APIKeyRef, err)}

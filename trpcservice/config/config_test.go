@@ -57,6 +57,26 @@ func TestAdminAddrDefaultsLoopback(t *testing.T) {
 	}
 }
 
+// TestModelHostAllowlist covers the platform model-endpoint allowlist
+// derivation: an explicit env list wins (trimmed, lowercased), otherwise the
+// host of the platform's own default endpoint.
+func TestModelHostAllowlist(t *testing.T) {
+	os.Unsetenv("TRPC_MODEL_BASE_URL_ALLOW")
+	if got := Load().ModelHostAllowlist(); len(got) != 1 || got[0] != "api.deepseek.com" {
+		t.Errorf("default allowlist = %v, want [api.deepseek.com]", got)
+	}
+	t.Setenv("TRPC_MODEL_BASE_URL_ALLOW", " model.corp.internal , model2.corp.internal ,")
+	got := Load().ModelHostAllowlist()
+	if len(got) != 2 || got[0] != "model.corp.internal" || got[1] != "model2.corp.internal" {
+		t.Errorf("explicit allowlist = %v, want the trimmed hosts", got)
+	}
+	t.Setenv("TRPC_MODEL_BASE_URL", "https://selfhosted.corp.internal/v1")
+	t.Setenv("TRPC_MODEL_BASE_URL_ALLOW", "")
+	if got := Load().ModelHostAllowlist(); len(got) != 1 || got[0] != "selfhosted.corp.internal" {
+		t.Errorf("endpoint-derived allowlist = %v, want [selfhosted.corp.internal]", got)
+	}
+}
+
 func TestMustEnv(t *testing.T) {
 	t.Setenv("TRPC_TEST_REQUIRED", "v")
 	if _, err := MustEnv("TRPC_TEST_REQUIRED"); err != nil {
