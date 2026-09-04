@@ -94,7 +94,7 @@ type msgCallback struct {
 	} `json:"text"`
 }
 
-// mediaLabels names the media msgtypes for the phase-1 downgrade placeholder.
+// mediaLabels names the media msgtypes for the downgrade placeholder.
 var mediaLabels = map[string]string{
 	"image": "图片",
 	"voice": "语音",
@@ -103,8 +103,8 @@ var mediaLabels = map[string]string{
 	"mixed": "混合消息",
 }
 
-// mediaPlaceholder is the text a media message degrades to in phase 1 (no
-// inbound media download/decryption yet); unknown types fall back to their
+// mediaPlaceholder is the text a media message degrades to (no inbound
+// media download/decryption yet); unknown types fall back to their
 // raw msgtype.
 func mediaPlaceholder(msgType string) string {
 	label, ok := mediaLabels[msgType]

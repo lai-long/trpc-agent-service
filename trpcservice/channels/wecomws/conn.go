@@ -208,21 +208,23 @@ func (c *botConn) heartbeat(ctx context.Context, ws *websocket.Conn, kill func()
 			return
 		}
 		reqID, err := newReqID()
-		if err != nil {
-			c.mu.Unlock()
-			return
-		}
-		data, merr := json.Marshal(pingFrame(reqID))
-		if merr != nil {
-			c.mu.Unlock()
-			return
-		}
-		werr := c.writeLocked(ctx, data)
-		if werr == nil {
-			c.pingOut = reqID
+		if err == nil {
+			var data []byte
+			data, err = json.Marshal(pingFrame(reqID))
+			if err == nil {
+				err = c.writeLocked(ctx, data)
+				if err == nil {
+					c.pingOut = reqID
+				}
+			}
 		}
 		c.mu.Unlock()
-		if werr != nil {
+		if err != nil {
+			// Without a ping on the wire the connection is unmonitored: tear
+			// it down like the unanswered-ping path so run() reconnects.
+			plog.Warnf("wecomws bot %s: heartbeat failed (%v), closing connection", c.cfg.BotID, err)
+			kill()
+			_ = ws.CloseNow()
 			return
 		}
 	}
@@ -286,7 +288,7 @@ func (c *botConn) handleFrame(ctx context.Context, h channels.Handler, env envel
 }
 
 // handleEvent maps platform events; only the disconnect is a connection
-// event. enter_chat / template_card_event are phase-1 out of scope.
+// event. enter_chat / template_card_event are out of scope.
 func (c *botConn) handleEvent(env envelope) error {
 	var ev eventCallback
 	if len(env.Body) > 0 {

@@ -10,7 +10,7 @@
 // unlike the webhook channels there is no platform redelivery for inbound
 // frames: a failed Handle retries locally on a capped backoff inside the
 // read loop, and a crash inside that window loses the message (accepted
-// phase-1 semantics).
+// trade-off for protocol simplicity).
 package wecomws
 
 import (
@@ -18,7 +18,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"sync"
 	"time"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
@@ -38,10 +37,9 @@ type Channel struct {
 	segment        int
 	resyncInterval time.Duration
 
-	// Connection timing knobs, defaults per the implementation plan
-	// (reconnect 1s ×2 cap 60s; platform kick restarts at 5s; subscribe
-	// rejection cap 5min; inbound retry 1s ×2 cap 30s). Tests compress them
-	// directly.
+	// Connection timing knobs (reconnect 1s ×2 cap 60s; platform kick
+	// restarts at 5s; subscribe rejection cap 5min; inbound retry 1s ×2
+	// cap 30s). Tests compress them directly.
 	reconnectBase    time.Duration
 	reconnectCap     time.Duration
 	kickedBase       time.Duration
@@ -51,7 +49,6 @@ type Channel struct {
 	subscribeTimeout time.Duration
 	writeTimeout     time.Duration
 
-	mu  sync.Mutex
 	mgr *manager
 }
 
@@ -156,8 +153,6 @@ func (c *Channel) Send(ctx context.Context, msg channels.OutboundMessage) error 
 }
 
 func (c *Channel) byBinding(id string) *botConn {
-	c.mu.Lock()
-	defer c.mu.Unlock()
 	return c.mgr.byBinding(id)
 }
 
