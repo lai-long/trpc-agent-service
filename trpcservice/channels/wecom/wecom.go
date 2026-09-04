@@ -37,9 +37,12 @@ import (
 // channel serves and keyed by in the channel_binding rows.
 const ChannelName = "wecom"
 
-// callbackPath is the webhook path mounted on the platform mux; it must match
-// the channel_binding.webhook_path row for tenant routing.
-const callbackPath = "/wecom/callback"
+// CallbackPath is the webhook path mounted on the platform mux; it must match
+// the channel_binding.webhook_path row for tenant routing. Exported because
+// the Admin API validates a caller-supplied webhook_path against the routes
+// the platform actually serves: a path no handler is mounted on answers 404
+// forever while the binding row itself looks healthy.
+const CallbackPath = "/wecom/callback"
 
 // defaultAPIBase is the WeCom API endpoint; overridable for tests.
 const defaultAPIBase = "https://qyapi.weixin.qq.com"
@@ -272,7 +275,7 @@ func (c *Channel) RegisterRoutes(mux *http.ServeMux, h channels.Handler) {
 		plog.Errorf("wecom callback mount failed: %v", err)
 		return
 	}
-	mux.HandleFunc(callbackPath, handler)
+	mux.HandleFunc(CallbackPath, handler)
 }
 
 // CallbackHandler implements channels.BindingAware. A binding-scoped callback

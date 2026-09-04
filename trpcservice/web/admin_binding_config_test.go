@@ -34,6 +34,10 @@ func TestAdminCreateBindingOutboundConfig(t *testing.T) {
 	wantCode(t, code, http.StatusOK, out)
 
 	bindPath := "/admin/apps/" + appID + "/bindings"
+	// The webhook-channel cases carry no webhook_path: createBinding refuses a
+	// path no route serves, so each one is auto-filled with its own
+	// /callback/{channel}/{binding_id} and stays unique. The wecomws cases do
+	// supply one — there the path is the routing key.
 	for _, tc := range []struct {
 		name    string
 		body    string
@@ -42,47 +46,47 @@ func TestAdminCreateBindingOutboundConfig(t *testing.T) {
 	}{
 		{
 			name: "wecom full outbound identity",
-			body: `{"channel":"wecom","webhook_path":"/binding-cfg/wecom-full",` +
+			body: `{"channel":"wecom",` +
 				`"config":{"corp_id":"corpB","agent_id":2000003,"secret_ref":"secret-b"}}`,
 			want: http.StatusCreated,
 		},
 		{
 			name: "wecom empty config falls back to env identity",
-			body: `{"channel":"wecom","webhook_path":"/binding-cfg/wecom-empty","config":{}}`,
+			body: `{"channel":"wecom","config":{}}`,
 			want: http.StatusCreated,
 		},
 		{
 			name: "wecom without config",
-			body: `{"channel":"wecom","webhook_path":"/binding-cfg/wecom-none"}`,
+			body: `{"channel":"wecom"}`,
 			want: http.StatusCreated,
 		},
 		{
 			name:    "wecom unknown field",
-			body:    `{"channel":"wecom","webhook_path":"/binding-cfg/wecom-bad","config":{"secret":"plaintext"}}`,
+			body:    `{"channel":"wecom","config":{"secret":"plaintext"}}`,
 			want:    http.StatusBadRequest,
 			wantMsg: "corp_id, agent_id and secret_ref",
 		},
 		{
 			name:    "wecom wrong type",
-			body:    `{"channel":"wecom","webhook_path":"/binding-cfg/wecom-type","config":{"agent_id":"nope"}}`,
+			body:    `{"channel":"wecom","config":{"agent_id":"nope"}}`,
 			want:    http.StatusBadRequest,
 			wantMsg: "corp_id, agent_id and secret_ref",
 		},
 		{
 			name: "wxkf full outbound identity",
-			body: `{"channel":"wxkf","webhook_path":"/binding-cfg/wxkf-full",` +
+			body: `{"channel":"wxkf",` +
 				`"config":{"corp_id":"corpB","kf_account":"wkBINDING01","secret_ref":"secret-b"}}`,
 			want: http.StatusCreated,
 		},
 		{
 			name:    "wxkf unknown field",
-			body:    `{"channel":"wxkf","webhook_path":"/binding-cfg/wxkf-bad","config":{"secret":"plaintext"}}`,
+			body:    `{"channel":"wxkf","config":{"secret":"plaintext"}}`,
 			want:    http.StatusBadRequest,
 			wantMsg: "corp_id, kf_account and secret_ref",
 		},
 		{
 			name:    "wxkf wrong type",
-			body:    `{"channel":"wxkf","webhook_path":"/binding-cfg/wxkf-type","config":{"corp_id":42}}`,
+			body:    `{"channel":"wxkf","config":{"corp_id":42}}`,
 			want:    http.StatusBadRequest,
 			wantMsg: "corp_id, kf_account and secret_ref",
 		},
@@ -90,7 +94,7 @@ func TestAdminCreateBindingOutboundConfig(t *testing.T) {
 			// The gate is per-channel: a channel without an outbound
 			// identity schema keeps accepting arbitrary config.
 			name: "other channel config untouched",
-			body: `{"channel":"mock","webhook_path":"/binding-cfg/mock","config":{"anything":true}}`,
+			body: `{"channel":"mock","config":{"anything":true}}`,
 			want: http.StatusCreated,
 		},
 		{

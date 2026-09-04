@@ -349,7 +349,7 @@ func TestAdminCreateBindingValidation(t *testing.T) {
 
 	// Only a published app is bindable: a draft must 404.
 	code, out = doJSON(t, mux, http.MethodPost, "/admin/apps/"+draftID+"/bindings",
-		`{"channel":"wecom","webhook_path":"/wecom/draft"}`)
+		`{"channel":"wecom"}`)
 	wantCode(t, code, http.StatusNotFound, out)
 	if msg, _ := out["error"].(string); msg != "app not found or not published" {
 		t.Fatalf("binding a draft must 404, got %q", msg)
@@ -357,7 +357,7 @@ func TestAdminCreateBindingValidation(t *testing.T) {
 
 	// Malformed app id: the insert fails on the uuid cast.
 	code, out = doJSON(t, mux, http.MethodPost, "/admin/apps/not-a-uuid/bindings",
-		`{"channel":"wecom","webhook_path":"/wecom/x"}`)
+		`{"channel":"wecom"}`)
 	wantCode(t, code, http.StatusInternalServerError, out)
 }
 

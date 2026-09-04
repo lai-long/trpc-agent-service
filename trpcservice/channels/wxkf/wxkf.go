@@ -40,9 +40,11 @@ import (
 // channel serves and keyed by in the channel_binding rows.
 const ChannelName = "wxkf"
 
-// callbackPath is the webhook path mounted on the platform mux; it must match
-// the channel_binding.webhook_path row for tenant routing.
-const callbackPath = "/wxkf/callback"
+// CallbackPath is the webhook path mounted on the platform mux; it must match
+// the channel_binding.webhook_path row for tenant routing. Exported for the
+// Admin API's webhook_path validation, as in the wecom adapter: a path no
+// handler is mounted on answers 404 forever while the row looks healthy.
+const CallbackPath = "/wxkf/callback"
 
 // defaultAPIBase is the WeCom API endpoint the KF APIs hang under; overridable
 // for tests.
@@ -267,10 +269,10 @@ func (c *Channel) RegisterRoutes(mux *http.ServeMux, h channels.Handler) {
 		plog.Errorf("wxkf callback mount failed: %v", err)
 		return
 	}
-	mux.HandleFunc(http.MethodGet+" "+callbackPath, func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc(http.MethodGet+" "+CallbackPath, func(w http.ResponseWriter, r *http.Request) {
 		handler(w, r)
 	})
-	mux.HandleFunc(http.MethodPost+" "+callbackPath, handler)
+	mux.HandleFunc(http.MethodPost+" "+CallbackPath, handler)
 }
 
 // CallbackHandler implements channels.BindingAware. A binding-scoped callback

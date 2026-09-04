@@ -19,6 +19,15 @@ import (
 	plog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
 )
 
+// ChannelName is the channel identifier, stamped on every message this
+// channel serves and keyed by in the channel_binding rows.
+const ChannelName = "mock"
+
+// CallbackPath is the webhook path mounted on the platform mux; it must match
+// the channel_binding.webhook_path row for tenant routing. Exported for the
+// Admin API's webhook_path validation, as in the wecom adapter.
+const CallbackPath = "/mock/callback"
+
 // callbackRequest is the callback payload pushed by the simulated IM platform.
 type callbackRequest struct {
 	MsgID  string `json:"msg_id"`  // message ID, used for idempotency
@@ -39,7 +48,7 @@ func New() *Channel {
 }
 
 // Name implements channels.Channel.
-func (c *Channel) Name() string { return "mock" }
+func (c *Channel) Name() string { return ChannelName }
 
 // RegisterRoutes implements channels.Channel.
 // POST /mock/callback simulates the IM webhook callback (dev only: the mock
@@ -50,7 +59,7 @@ func (c *Channel) RegisterRoutes(mux *http.ServeMux, h channels.Handler) {
 		plog.Errorf("mock callback mount failed: %v", err)
 		return
 	}
-	mux.HandleFunc("POST /mock/callback", handler)
+	mux.HandleFunc(http.MethodPost+" "+CallbackPath, handler)
 }
 
 // CallbackHandler implements channels.BindingAware: the mock has no

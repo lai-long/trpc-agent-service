@@ -18,6 +18,7 @@ import (
 	"trpc.group/trpc-go/trpc-agent-go/knowledge"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/agent"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/channels/mock"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels/wecom"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels/wecomws"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels/wxkf"
@@ -538,6 +539,17 @@ func (a *AdminAPI) createBinding(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "channel is required")
 		return
 	}
+	// A webhook_path no route serves is a mistake the caller never finds out
+	// about: this endpoint answers 201, listBindings shows an active row, and
+	// every callback the IM posts to that path 404s at the mux. wecomws is
+	// exempt here because its path is the routing key and the switch below
+	// enforces its own contract on it.
+	if in.Channel != wecomws.ChannelName {
+		if msg := validateWebhookPath(in.Channel, in.WebhookPath); msg != "" {
+			writeError(w, http.StatusBadRequest, msg)
+			return
+		}
+	}
 	// Per-channel binding validation at create time: a config jsonb the
 	// adapter cannot parse would otherwise fail every send under this
 	// binding later (the adapters fail closed on an unreadable config
@@ -598,6 +610,41 @@ func (a *AdminAPI) createBinding(w http.ResponseWriter, r *http.Request) {
 		"token_ref": in.TokenRef, "aeskey_ref": in.AESKeyRef, "config": in.Config,
 	})
 	writeJSON(w, http.StatusCreated, map[string]any{"id": id, "webhook_path": webhookPath})
+}
+
+// legacyCallbackPaths are the routes the webhook adapters mount for their
+// env-configured single binding, and so the only caller-supplied webhook_path
+// values that reach a handler. Read off the adapters' own constants: a copy of
+// the literals here would drift from the mux the moment one of them moved.
+var legacyCallbackPaths = map[string]string{
+	mock.ChannelName:  mock.CallbackPath,
+	wecom.ChannelName: wecom.CallbackPath,
+	wxkf.ChannelName:  wxkf.CallbackPath,
+}
+
+// validateWebhookPath returns the 400 message for a webhook_path the platform
+// does not serve, or "" when the caller may keep it.
+//
+// An empty path is left alone: createBinding fills it with
+// /callback/{channel}/{binding_id} in the same statement that generates the id,
+// which is the only way that route can be self-consistent. BindingDispatcher
+// looks the last segment up as a binding id, so a segment the caller chose
+// answers "unknown binding" no matter how good it looks — and the id is
+// DB-generated, so the caller cannot know it at create time.
+func validateWebhookPath(channel, webhookPath string) string {
+	if webhookPath == "" {
+		return ""
+	}
+	legacy, mounted := legacyCallbackPaths[channel]
+	if mounted && webhookPath == legacy {
+		return ""
+	}
+	want := fmt.Sprintf("empty (auto-filled to /callback/%s/{binding_id})", channel)
+	if mounted {
+		want += " or " + legacy
+	}
+	return fmt.Sprintf("webhook_path %s is not a route this platform serves; must be %s"+
+		" — any other path 404s every callback at the mux", strconv.Quote(webhookPath), want)
 }
 
 // wecomwsPathPattern is the webhook_path shape a wecomws binding must carry:
