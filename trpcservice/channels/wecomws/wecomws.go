@@ -25,6 +25,15 @@ import (
 	plog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
 )
 
+// ChannelName is the channel identifier, stamped on every message this
+// channel serves; the sender group partition (Skip predicates) and the
+// leader-lock name are keyed on it.
+const ChannelName = "wecomws"
+
+// SenderGroup is the dedicated stream:outbound consumer group the
+// platform-wide leader runs for this channel's replies.
+const SenderGroup = "senders-ws"
+
 // Channel is the WeCom smart-bot WebSocket implementation of channels.Channel
 // (and channels.Starter): Start owns the connections and the bindings
 // reconciliation loop, Send writes replies on the connection of the
@@ -109,7 +118,7 @@ func New(secret config.SecretResolver, opts ...Option) (*Channel, error) {
 }
 
 // Name implements channels.Channel.
-func (c *Channel) Name() string { return "wecomws" }
+func (c *Channel) Name() string { return ChannelName }
 
 // RegisterRoutes implements channels.Channel: callbacks arrive on the long
 // connection, so there is no HTTP route to mount.

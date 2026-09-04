@@ -622,3 +622,33 @@ func TestDisconnectedEvent(t *testing.T) {
 	conn3 := f.waitConn(t, 3)
 	waitFor(t, func() bool { return conn3.subFrames() != nil && f.totalAcks.Load() >= 3 })
 }
+
+// TestSleep covers the ctx-aware wait shared with the leader loop: a done
+// context returns false immediately, a short wait completes with true, and
+// a cancellation mid-wait returns early.
+func TestSleep(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if Sleep(ctx, time.Hour) {
+		t.Error("Sleep on a canceled context must return false")
+	}
+
+	start := time.Now()
+	if !Sleep(context.Background(), 10*time.Millisecond) {
+		t.Error("Sleep on a live context must return true")
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("10ms sleep took %v", elapsed)
+	}
+
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	timer := time.AfterFunc(20*time.Millisecond, cancel2)
+	defer timer.Stop()
+	start = time.Now()
+	if Sleep(ctx2, 10*time.Second) {
+		t.Error("Sleep must return false when the context is canceled mid-wait")
+	}
+	if elapsed := time.Since(start); elapsed >= 5*time.Second {
+		t.Errorf("mid-wait cancellation took %v, must return early", elapsed)
+	}
+}

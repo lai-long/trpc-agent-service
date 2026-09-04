@@ -280,7 +280,7 @@ func (c *botConn) handleFrame(ctx context.Context, h channels.Handler, env envel
 		} else {
 			plog.Errorf("wecomws bot %s handle msg %s: %v (retry in %s)", c.cfg.BotID, msg.MsgID, err, wait)
 		}
-		if !sleep(ctx, wait) {
+		if !Sleep(ctx, wait) {
 			return nil
 		}
 		wait = min(wait*2, c.parent.inboundRetryCap)
@@ -430,8 +430,9 @@ func readEnvelope(ctx context.Context, ws *websocket.Conn) (envelope, error) {
 	return env, nil
 }
 
-// sleep waits for d exactly; false on ctx cancel.
-func sleep(ctx context.Context, d time.Duration) bool {
+// Sleep waits for d exactly; false on ctx cancel. Exported for the
+// wecomws-leader loop in the assembly binary, which shares the cadence.
+func Sleep(ctx context.Context, d time.Duration) bool {
 	timer := time.NewTimer(d)
 	defer timer.Stop()
 	select {
@@ -450,5 +451,5 @@ func sleepJitter(ctx context.Context, d time.Duration) bool {
 		//nolint:gosec // G404: reconnect jitter needs no cryptographic randomness
 		d += time.Duration(rand.Int64N(int64(2*jitter))) - jitter
 	}
-	return sleep(ctx, d)
+	return Sleep(ctx, d)
 }
