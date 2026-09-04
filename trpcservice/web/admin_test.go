@@ -28,7 +28,7 @@ func adminTestAPI(t *testing.T) (*http.ServeMux, *pgxpool.Pool) {
 	t.Cleanup(func() { pool.Close() })
 
 	mux := http.NewServeMux()
-	web.NewAdminAPI(pool, nil, nil, "").RegisterRoutes(mux)
+	web.NewAdminAPI(pool, nil, nil, adminTestToken).RegisterRoutes(mux)
 	return mux, pool
 }
 
@@ -41,6 +41,7 @@ func doJSON(t *testing.T, mux *http.ServeMux, method, path, body string) (int, m
 		rdr = bytes.NewReader(nil)
 	}
 	req := httptest.NewRequest(method, path, rdr)
+	req.Header.Set("Authorization", "Bearer "+adminTestToken)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 	var out map[string]any
@@ -60,7 +61,7 @@ func doJSON(t *testing.T, mux *http.ServeMux, method, path, body string) (int, m
 // the HTTP-level variant rides the integration suite.
 func TestAdminModelAllowlist(t *testing.T) {
 	mux := http.NewServeMux()
-	web.NewAdminAPI(nil, nil, nil, "").RegisterRoutes(mux)
+	web.NewAdminAPI(nil, nil, nil, adminTestToken).RegisterRoutes(mux)
 
 	cases := []struct {
 		name   string
@@ -90,9 +91,14 @@ func TestAdminModelAllowlist(t *testing.T) {
 	}
 }
 
+// adminTestToken is the bearer token the test APIs are constructed with;
+// doJSON/doJSONList present it on every request.
+const adminTestToken = "test-admin-token"
+
 func doJSONList(t *testing.T, mux *http.ServeMux, path string) []map[string]any {
 	t.Helper()
 	req := httptest.NewRequest(http.MethodGet, path, nil)
+	req.Header.Set("Authorization", "Bearer "+adminTestToken)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
@@ -297,7 +303,7 @@ func TestAdminKnowledgeIngestion(t *testing.T) {
 
 	// Disabled knowledge → 503.
 	mux := http.NewServeMux()
-	web.NewAdminAPI(pool, nil, nil, "").RegisterRoutes(mux)
+	web.NewAdminAPI(pool, nil, nil, adminTestToken).RegisterRoutes(mux)
 	code, _ := doJSON(t, mux, http.MethodPost, "/admin/apps/"+appID+"/knowledge/documents",
 		`{"name":"x","content":"y"}`)
 	if code != http.StatusServiceUnavailable {
@@ -314,7 +320,7 @@ func TestAdminKnowledgeIngestion(t *testing.T) {
 		t.Fatal(err)
 	}
 	mux2 := http.NewServeMux()
-	api := web.NewAdminAPI(pool, nil, nil, "")
+	api := web.NewAdminAPI(pool, nil, nil, adminTestToken)
 	api.Knowledge = kb
 	api.RegisterRoutes(mux2)
 
@@ -360,6 +366,17 @@ func TestAdminAuthAndAuditQuery(t *testing.T) {
 	// Cleanup is LIFO: registered first, runs last — after row deletions.
 	t.Cleanup(func() { pool.Close() })
 
+	// Auth: an empty token disables every route (runtime backstop below the
+	// startup gate) instead of serving unauthenticated.
+	noAuth := http.NewServeMux()
+	web.NewAdminAPI(pool, nil, nil, "").RegisterRoutes(noAuth)
+	req0 := httptest.NewRequest(http.MethodGet, "/admin/tenants", nil)
+	rec0 := httptest.NewRecorder()
+	noAuth.ServeHTTP(rec0, req0)
+	if rec0.Code != http.StatusServiceUnavailable {
+		t.Fatalf("empty token must 503, got %d", rec0.Code)
+	}
+
 	// Auth: with a token set, requests without it get 401.
 	mux := http.NewServeMux()
 	web.NewAdminAPI(pool, nil, nil, "secret-token").RegisterRoutes(mux)
@@ -387,7 +404,7 @@ func TestAdminAuthAndAuditQuery(t *testing.T) {
 		_, _ = pool.Exec(ctx, `DELETE FROM audit_log WHERE trace_id = 'admin-test-trace'`)
 	})
 	mux2 := http.NewServeMux()
-	web.NewAdminAPI(pool, nil, nil, "").RegisterRoutes(mux2)
+	web.NewAdminAPI(pool, nil, nil, adminTestToken).RegisterRoutes(mux2)
 	rows := doJSONList(t, mux2, "/admin/audit?trace_id=admin-test-trace")
 	if len(rows) != 1 || rows[0]["decision"] != "allow" {
 		t.Fatalf("audit query: %+v", rows)
@@ -407,7 +424,7 @@ func TestAdminAuditDetail(t *testing.T) {
 
 	auditor := storage.NewAuditor(pool)
 	mux := http.NewServeMux()
-	web.NewAdminAPI(pool, auditor, nil, "").RegisterRoutes(mux)
+	web.NewAdminAPI(pool, auditor, nil, adminTestToken).RegisterRoutes(mux)
 
 	name := fmt.Sprintf("audit-detail-%d", time.Now().UnixNano())
 	code, out := doJSON(t, mux, http.MethodPost, "/admin/tenants",

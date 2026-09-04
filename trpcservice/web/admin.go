@@ -2,6 +2,7 @@ package web
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -25,7 +26,9 @@ import (
 // publish/rollback with atomic switching, channel binding management,
 // storage-migration control and audit queries. It is intended for
 // internal networks only; authentication is a bearer token
-// (TRPC_ADMIN_TOKEN) — empty means dev mode (no auth).
+// (TRPC_ADMIN_TOKEN). An empty token is a misconfiguration that refuses
+// startup AND disables every route at runtime — the API never serves
+// unauthenticated by accident.
 type AdminAPI struct {
 	pool    *pgxpool.Pool
 	auditor *storage.Auditor // nil disables write-op auditing
@@ -46,7 +49,8 @@ type AdminAPI struct {
 	ModelHosts []string
 }
 
-// NewAdminAPI creates the API. The bearer token empty means dev mode.
+// NewAdminAPI creates the API. An empty token disables every route (auth
+// fails closed); the startup gate refuses such a deployment in production.
 func NewAdminAPI(pool *pgxpool.Pool, auditor *storage.Auditor, rdb *redis.Client, token string) *AdminAPI {
 	return &AdminAPI{pool: pool, auditor: auditor, rdb: rdb, token: token}
 }
@@ -74,10 +78,18 @@ func (a *AdminAPI) RegisterRoutes(mux *http.ServeMux) {
 	handle("GET /admin/audit", a.queryAudit)
 }
 
-// auth enforces the bearer token unless running in dev mode (token unset).
+// auth enforces the bearer token. Fail closed in both directions: a token
+// missing at construction disables every route (the startup gate should
+// already have refused the process — this is the runtime backstop), and the
+// presented header is compared in constant time.
 func (a *AdminAPI) auth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if a.token != "" && r.Header.Get("Authorization") != "Bearer "+a.token {
+		if a.token == "" {
+			writeError(w, http.StatusServiceUnavailable, "admin token not configured")
+			return
+		}
+		got := r.Header.Get("Authorization")
+		if subtle.ConstantTimeCompare([]byte(got), []byte("Bearer "+a.token)) != 1 {
 			writeError(w, http.StatusUnauthorized, "missing or invalid admin token")
 			return
 		}

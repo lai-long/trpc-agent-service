@@ -27,8 +27,17 @@ func TestCheckAdminToken(t *testing.T) {
 	if err := checkAdminToken(config.Config{}); err == nil {
 		t.Fatal("unset TRPC_ADMIN_TOKEN must refuse to serve the Admin API")
 	}
-	if err := checkAdminToken(config.Config{AdminToken: config.AdminTokenDevInsecure}); err != nil {
-		t.Fatalf("explicit dev sentinel must be accepted: %v", err)
+	if err := checkAdminToken(config.Config{
+		AdminToken: config.AdminTokenDevInsecure, AdminAddr: "127.0.0.1:8081",
+	}); err != nil {
+		t.Fatalf("explicit dev sentinel on loopback must be accepted: %v", err)
+	}
+	// The sentinel is a public constant: pairing it with an all-interfaces
+	// bind would publish an open management plane.
+	if err := checkAdminToken(config.Config{
+		AdminToken: config.AdminTokenDevInsecure, AdminAddr: ":8081",
+	}); err == nil {
+		t.Fatal("dev sentinel on an all-interfaces bind must be refused")
 	}
 	if err := checkAdminToken(config.Config{AdminToken: "s3cret"}); err != nil {
 		t.Fatalf("a real token must be accepted: %v", err)

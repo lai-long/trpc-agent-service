@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -411,7 +412,10 @@ func serve(role string) error {
 // unset TRPC_ADMIN_TOKEN is a fatal misconfiguration rather than a dev-mode
 // warning, because the API can repoint a tenant's model endpoint and rewrite
 // its policies. Local development opts out with the explicit
-// config.AdminTokenDevInsecure sentinel.
+// config.AdminTokenDevInsecure sentinel — and even then only on a loopback
+// bind: the sentinel is a public constant, not a secret, so pairing it with
+// an all-interfaces listen address would just publish an open management
+// plane.
 func checkAdminToken(cfg config.Config) error {
 	if cfg.AdminToken == "" {
 		return fmt.Errorf("TRPC_ADMIN_TOKEN must be set to serve the Admin API "+
@@ -419,10 +423,32 @@ func checkAdminToken(cfg config.Config) error {
 			config.AdminTokenDevInsecure)
 	}
 	if cfg.AdminToken == config.AdminTokenDevInsecure {
+		if !isLoopbackBind(cfg.AdminAddr) {
+			return fmt.Errorf("TRPC_ADMIN_TOKEN=%s must not serve on %q: the dev "+
+				"sentinel is accepted on loopback binds only — set a real token or "+
+				"TRPC_ADMIN_ADDR=127.0.0.1:8081",
+				config.AdminTokenDevInsecure, cfg.AdminAddr)
+		}
 		plog.Warnf("admin API unprotected (TRPC_ADMIN_TOKEN=%s) — dev mode only",
 			config.AdminTokenDevInsecure)
 	}
 	return nil
+}
+
+// isLoopbackBind reports whether the listen address is loopback-only. An
+// empty host (":8081") binds all interfaces and is not loopback.
+func isLoopbackBind(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	if host == "" {
+		return false
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	return host == "localhost"
 }
 
 // startPGConsumers connects to PG and starts the consumers that depend on it:
