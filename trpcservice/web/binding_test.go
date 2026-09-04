@@ -34,6 +34,11 @@ func (f *fakeBindingChannel) Send(_ context.Context, _ channels.OutboundMessage)
 }
 
 func (f *fakeBindingChannel) CallbackHandler(_ channels.Handler, creds channels.BindingCredentials) (http.HandlerFunc, error) {
+	if creds.TokenRef == "" {
+		// Mirrors the real adapters: binding-scoped callbacks must carry
+		// their own credential refs.
+		return nil, errors.New("binding lacks callback credentials")
+	}
 	if creds.TokenRef == "unresolvable" {
 		return nil, errors.New("resolve token")
 	}
@@ -63,6 +68,8 @@ func TestBindingDispatcher(t *testing.T) {
 			WebhookPath: "/callback/other/b2", TokenRef: "tok-b2", AESKeyRef: "aes-b2", Status: "active"},
 		"b3": {ID: "b3", TenantID: "t3", Channel: "fake", AppID: "a3",
 			WebhookPath: "/callback/fake/b3", TokenRef: "unresolvable", AESKeyRef: "aes-b3", Status: "active"},
+		"b4": {ID: "b4", TenantID: "t4", Channel: "fake", AppID: "a4",
+			WebhookPath: "/callback/fake/b4", Status: "active"},
 	}
 	d := web.BindingDispatcher{
 		Channels: map[string]channels.Channel{"fake": ch},
@@ -93,6 +100,9 @@ func TestBindingDispatcher(t *testing.T) {
 	}
 	if rec := do("fake", "b3"); rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("unresolvable credentials must 503 so the IM redelivers, got %d", rec.Code)
+	}
+	if rec := do("fake", "b4"); rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("binding without credential refs must 503, not fall back to the env keys, got %d", rec.Code)
 	}
 
 	rec := do("fake", "b1")

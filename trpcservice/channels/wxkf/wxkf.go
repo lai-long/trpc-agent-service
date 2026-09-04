@@ -51,6 +51,10 @@ const maxTextBytes = 2048
 // tokenExpiryMargin refreshes the access token ahead of its stated TTL.
 const tokenExpiryMargin = 5 * time.Minute
 
+// maxCryptCacheEntries bounds the value-keyed crypt cache against unbounded
+// growth under repeated key rotation.
+const maxCryptCacheEntries = 32
+
 // Config holds the WeChat KF channel configuration. Secret material is
 // carried as references and resolved through the SecretResolver, never logged.
 type Config struct {
@@ -107,9 +111,12 @@ func New(cfg Config, resolver config.SecretResolver) (*Channel, error) {
 	}, nil
 }
 
-// cryptFor resolves the credential set and returns its crypt, building and
-// caching it on first use. Empty refs fall back to the env-configured
-// single-binding default.
+// cryptFor resolves the credential set and returns its crypt. The cache is
+// keyed by the RESOLVED values (not the refs): rotation behind a ref
+// propagates within the secret resolver's cache TTL instead of living in a
+// ref-keyed cache until process restart. Empty refs fall back to the
+// env-configured single-binding default — the legacy path's privilege; the
+// dispatcher refuses binding-scoped callbacks with empty refs.
 func (c *Channel) cryptFor(corpID, tokenRef, aesKeyRef string) (*wxbizmsgcrypt.WXBizMsgCrypt, error) {
 	if corpID == "" {
 		corpID = c.cfg.CorpID
@@ -120,12 +127,6 @@ func (c *Channel) cryptFor(corpID, tokenRef, aesKeyRef string) (*wxbizmsgcrypt.W
 	if aesKeyRef == "" {
 		aesKeyRef = c.cfg.AESKeyRef
 	}
-	key := corpID + "|" + tokenRef + "|" + aesKeyRef
-	c.cryptMu.Lock()
-	defer c.cryptMu.Unlock()
-	if crypt, ok := c.crypts[key]; ok {
-		return crypt, nil
-	}
 	ctx := context.Background()
 	token, err := c.secret.Resolve(ctx, tokenRef)
 	if err != nil {
@@ -134,6 +135,15 @@ func (c *Channel) cryptFor(corpID, tokenRef, aesKeyRef string) (*wxbizmsgcrypt.W
 	aesKey, err := c.secret.Resolve(ctx, aesKeyRef)
 	if err != nil {
 		return nil, fmt.Errorf("wxkf: resolve aes key %q: %w", aesKeyRef, err)
+	}
+	key := corpID + "|" + token + "|" + aesKey
+	c.cryptMu.Lock()
+	defer c.cryptMu.Unlock()
+	if crypt, ok := c.crypts[key]; ok {
+		return crypt, nil
+	}
+	if len(c.crypts) >= maxCryptCacheEntries {
+		c.crypts = map[string]*wxbizmsgcrypt.WXBizMsgCrypt{}
 	}
 	crypt := wxbizmsgcrypt.NewWXBizMsgCrypt(token, aesKey, corpID, wxbizmsgcrypt.XmlType)
 	c.crypts[key] = crypt
@@ -148,7 +158,11 @@ func (c *Channel) Name() string { return "wxkf" }
 // single-binding default (design 5.3.1); tenant bindings are served through
 // CallbackHandler at /callback/{channel}/{binding_id}.
 func (c *Channel) RegisterRoutes(mux *http.ServeMux, h channels.Handler) {
-	handler, err := c.CallbackHandler(h, channels.BindingCredentials{})
+	handler, err := c.CallbackHandler(h, channels.BindingCredentials{
+		CorpID:    c.cfg.CorpID,
+		TokenRef:  c.cfg.TokenRef, // the env single-binding default, explicitly
+		AESKeyRef: c.cfg.AESKeyRef,
+	})
 	if err != nil {
 		// New already validated the env refs, so this is defensive: mount
 		// nothing and let the path 404 instead of half-serving.
@@ -161,8 +175,15 @@ func (c *Channel) RegisterRoutes(mux *http.ServeMux, h channels.Handler) {
 	mux.HandleFunc(http.MethodPost+" "+callbackPath, handler)
 }
 
-// CallbackHandler implements channels.BindingAware.
+// CallbackHandler implements channels.BindingAware. A binding-scoped callback
+// must verify under the binding's OWN credentials: empty refs are an error
+// here (the dispatcher answers 503), because falling back to the env-global
+// keys would let whoever holds them forge this tenant's callbacks. The
+// legacy env path passes its refs explicitly via RegisterRoutes.
 func (c *Channel) CallbackHandler(h channels.Handler, creds channels.BindingCredentials) (http.HandlerFunc, error) {
+	if creds.TokenRef == "" || creds.AESKeyRef == "" {
+		return nil, fmt.Errorf("wxkf: binding %s lacks callback credentials", creds.BindingID)
+	}
 	crypt, err := c.cryptFor(creds.CorpID, creds.TokenRef, creds.AESKeyRef)
 	if err != nil {
 		return nil, err

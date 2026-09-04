@@ -321,9 +321,18 @@ func TestCallbackHandlerPerBinding(t *testing.T) {
 		return channels.OutboundMessage{}, nil
 	})
 
-	h1, err := c.CallbackHandler(recording, channels.BindingCredentials{BindingID: "b1"})
+	h1, err := c.CallbackHandler(recording, channels.BindingCredentials{
+		BindingID: "b1", TokenRef: "tok", AESKeyRef: "aes",
+	})
 	if err != nil {
 		t.Fatal(err)
+	}
+
+	// A binding-scoped callback with empty refs must be refused: falling back
+	// to the env-global keys would let whoever holds them forge this
+	// tenant's callbacks.
+	if _, err := c.CallbackHandler(recording, channels.BindingCredentials{BindingID: "b0"}); err == nil {
+		t.Fatal("binding-scoped handler must refuse empty credential refs")
 	}
 	h2, err := c.CallbackHandler(recording, channels.BindingCredentials{
 		BindingID: "b2", TokenRef: "tok-b2", AESKeyRef: "aes-b2",
