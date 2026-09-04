@@ -71,3 +71,11 @@ func TestKnowledgeBaseRoundTrip(t *testing.T) {
 	}
 	t.Logf("search hit: score=%.3f text=%q", result.Score, result.Text)
 }
+
+// A knowledge base on an unreachable or malformed DSN fails at construction
+// instead of producing a half-initialized agent.
+func TestKnowledgeBaseRejectsBadDSN(t *testing.T) {
+	if _, err := agent.NewKnowledgeBase("not a valid dsn", "knowledge_test_bad", 64, fakeEmbedder{dim: 64}); err == nil {
+		t.Fatal("malformed DSN must fail NewKnowledgeBase")
+	}
+}

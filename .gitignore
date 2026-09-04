@@ -18,3 +18,4 @@ trpcservice/channels/testweb
 
 data/*
 !data/README.md
+.qoder
