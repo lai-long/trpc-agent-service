@@ -4,12 +4,17 @@
 PG / Redis / S3 / KMS 中间件（本目录不部署中间件本身，用已有的或托管服务）。
 
 ```bash
-# 构建镜像
-docker build -t trpc-agent-service:latest .
+# 构建镜像（tag 必须与三个 Deployment 清单里的 image 一致）
+docker build -t trpc-agent-service:v1 .
 
 # 平台配置 + 基础设施引用（先按环境改 config.yaml 里的占位符）
 kubectl apply -f deploy/k8s/config.yaml
 kubectl create secret generic trpc-admin-token --from-literal=token="$(openssl rand -hex 24)"
+
+# 初始化数据库 schema（空库首次部署；Job 是幂等的，表已存在时跳过）
+kubectl create configmap trpc-db-init --from-file=init.sql=deploy/db/init.sql
+kubectl apply -f deploy/k8s/db-init.yaml
+kubectl wait --for=condition=complete job/trpc-db-init --timeout=120s
 
 kubectl apply -f deploy/k8s/gateway.yaml
 kubectl apply -f deploy/k8s/worker.yaml

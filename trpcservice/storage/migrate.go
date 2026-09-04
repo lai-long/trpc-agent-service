@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 	"trpc.group/trpc-go/trpc-agent-go/event"
@@ -78,21 +79,35 @@ func (m *Migrator) Run(ctx context.Context) {
 	}
 }
 
-// Tick advances every active migration one step. Exported for tests.
+// Tick advances every active migration one step, inside one transaction that
+// claims the rows with FOR UPDATE SKIP LOCKED (design 5.2.6): replicas of the
+// worker role run the same Migrator, so each tick must claim a disjoint set
+// instead of two replicas double-advancing one migration (double backfill
+// batches, read switches racing the consistency check). The phase/progress
+// writes ride the same transaction, so a crashed tick rolls back cleanly and
+// the next claimant re-advances from the last committed state. Exported for
+// tests.
 func (m *Migrator) Tick(ctx context.Context) error {
-	rows, err := m.pool.Query(ctx,
+	tx, err := m.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin migration tick: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	rows, err := tx.Query(ctx,
 		`SELECT id, tenant_id, resource, from_backend, to_backend, phase, progress
 		 FROM storage_migration
-		 WHERE phase NOT IN ('done', 'failed', 'aborted') ORDER BY created_at`)
+		 WHERE phase NOT IN ('done', 'failed', 'aborted') ORDER BY created_at
+		 FOR UPDATE SKIP LOCKED`)
 	if err != nil {
 		return fmt.Errorf("query migrations: %w", err)
 	}
-	defer rows.Close()
 	var migs []migrationRow
 	for rows.Next() {
 		var r migrationRow
 		var progress []byte
 		if err := rows.Scan(&r.ID, &r.TenantID, &r.Resource, &r.From, &r.To, &r.Phase, &progress); err != nil {
+			rows.Close()
 			return fmt.Errorf("scan migration: %w", err)
 		}
 		if len(progress) > 0 {
@@ -100,13 +115,19 @@ func (m *Migrator) Tick(ctx context.Context) error {
 		}
 		migs = append(migs, r)
 	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("iterate migrations: %w", err)
+	}
+	rows.Close()
+
 	for _, mig := range migs {
-		if err := m.advance(ctx, mig); err != nil {
+		if err := m.advance(ctx, tx, mig); err != nil {
 			plog.Errorf("migration %s (%s) failed: %v", mig.ID, mig.Phase, err)
-			m.fail(ctx, mig, err)
+			m.fail(ctx, tx, mig, err)
 		}
 	}
-	return nil
+	return tx.Commit(ctx)
 }
 
 // migrationRow is one storage_migration row.
@@ -115,17 +136,17 @@ type migrationRow struct {
 	Progress                                migrationProgress
 }
 
-func (m *Migrator) advance(ctx context.Context, mig migrationRow) error {
+func (m *Migrator) advance(ctx context.Context, tx pgx.Tx, mig migrationRow) error {
 	switch mig.Phase {
 	case tenant.PhaseDualWrite:
 		// Dual write has been live since the row was created; start copying.
-		return m.setPhase(ctx, mig.ID, tenant.PhaseBackfilling, mig.Progress)
+		return m.setPhase(ctx, tx, mig.ID, tenant.PhaseBackfilling, mig.Progress)
 	case tenant.PhaseBackfilling:
-		return m.backfill(ctx, mig)
+		return m.backfill(ctx, tx, mig)
 	case tenant.PhaseObserving:
 		if time.Now().After(mig.Progress.ObserveUntil) {
 			plog.Infof("migration %s: observation window passed, done", mig.ID)
-			return m.setPhase(ctx, mig.ID, tenant.PhaseDone, mig.Progress)
+			return m.setPhase(ctx, tx, mig.ID, tenant.PhaseDone, mig.Progress)
 		}
 	}
 	return nil
@@ -133,7 +154,9 @@ func (m *Migrator) advance(ctx context.Context, mig migrationRow) error {
 
 // backfill copies one batch of sessions from the source backend to the
 // target; when all are copied, the consistency check gates the read switch.
-func (m *Migrator) backfill(ctx context.Context, mig migrationRow) error {
+// Session data moves on the pool (independent transactions per session);
+// only the migration row's own phase/progress rides the claim tx.
+func (m *Migrator) backfill(ctx context.Context, tx pgx.Tx, mig migrationRow) error {
 	src, dst := m.backends[mig.From], m.backends[mig.To]
 	if src == nil || dst == nil {
 		return fmt.Errorf("backend pair %s→%s not both available", mig.From, mig.To)
@@ -160,7 +183,7 @@ func (m *Migrator) backfill(ctx context.Context, mig migrationRow) error {
 
 	if int64(len(sessions)) == int64(m.BatchSize) {
 		// Probably more to come; persist progress and continue next tick.
-		return m.setPhase(ctx, mig.ID, tenant.PhaseBackfilling, mig.Progress)
+		return m.setPhase(ctx, tx, mig.ID, tenant.PhaseBackfilling, mig.Progress)
 	}
 
 	// Everything copied: consistency check gates the read switch (design
@@ -173,20 +196,27 @@ func (m *Migrator) backfill(ctx context.Context, mig migrationRow) error {
 	if len(mismatches) > 0 {
 		return fmt.Errorf("consistency check failed for %d sessions: %v", len(mismatches), mismatches)
 	}
-	return m.readSwitch(ctx, mig)
+	return m.readSwitch(ctx, tx, mig)
 }
 
 // readSwitch points the tenant's storage_config at the new backend, notifies
 // workers through the invalidation channel, and starts the observation window.
-func (m *Migrator) readSwitch(ctx context.Context, mig migrationRow) error {
-	if _, err := m.pool.Exec(ctx,
+// Both row updates ride the claim tx; the broadcast is best-effort and may
+// fire a beat before the commit — a worker that refreshes early just sees the
+// old config and waits for the TTL.
+func (m *Migrator) readSwitch(ctx context.Context, tx pgx.Tx, mig migrationRow) error {
+	backendJSON, err := json.Marshal(map[string]string{"type": mig.To})
+	if err != nil {
+		return fmt.Errorf("encode backend config: %w", err)
+	}
+	if _, err := tx.Exec(ctx,
 		`UPDATE tenant SET storage_config = jsonb_set(COALESCE(storage_config, '{}'), '{session}', $2::jsonb),
 		 updated_at = now() WHERE id = $1`,
-		mig.TenantID, fmt.Sprintf(`{"type":%q}`, mig.To)); err != nil {
+		mig.TenantID, backendJSON); err != nil {
 		return fmt.Errorf("switch storage_config: %w", err)
 	}
 	mig.Progress.ObserveUntil = time.Now().Add(m.ObserveWindow)
-	if err := m.setPhase(ctx, mig.ID, tenant.PhaseObserving, mig.Progress); err != nil {
+	if err := m.setPhase(ctx, tx, mig.ID, tenant.PhaseObserving, mig.Progress); err != nil {
 		return err
 	}
 	if err := tenant.PublishInvalidation(ctx, m.rdb); err != nil {
@@ -442,20 +472,23 @@ func (m *Migrator) tenantApps(ctx context.Context, tenantID string) ([]string, e
 	return ids, rows.Err()
 }
 
-func (m *Migrator) setPhase(ctx context.Context, id, phase string, progress migrationProgress) error {
+func (m *Migrator) setPhase(ctx context.Context, tx pgx.Tx, id, phase string, progress migrationProgress) error {
 	raw, err := json.Marshal(progress)
 	if err != nil {
 		return err
 	}
-	_, err = m.pool.Exec(ctx,
+	_, err = tx.Exec(ctx,
 		`UPDATE storage_migration SET phase = $2, progress = $3, updated_at = now() WHERE id = $1`,
 		id, phase, raw)
 	return err
 }
 
 // fail parks the migration with the error; reads stay on the old backend.
-func (m *Migrator) fail(ctx context.Context, mig migrationRow, cause error) {
-	if _, err := m.pool.Exec(ctx,
+// Runs on the claim tx so the marking commits (or rolls back) with the tick —
+// if the tx is already aborted the exec fails and the row is retried next
+// tick, the log line keeps that visible.
+func (m *Migrator) fail(ctx context.Context, tx pgx.Tx, mig migrationRow, cause error) {
+	if _, err := tx.Exec(ctx,
 		`UPDATE storage_migration SET phase = 'failed', error = $2, updated_at = now() WHERE id = $1`,
 		mig.ID, cause.Error()); err != nil {
 		plog.Errorf("migration %s: fail-marking failed: %v", mig.ID, err)
