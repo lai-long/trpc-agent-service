@@ -31,6 +31,14 @@ func NewKnowledgeBase(pgDSN, table string, dim int, emb embedder.Embedder) (*kno
 	), nil
 }
 
+// Metadata keys that scope a document to one tenant's app. The write side
+// (DocSource), the search filter (assemble) and the admin ingestion endpoint
+// all use these, so a document is always filed and found under the same pair.
+const (
+	MetadataTenantID = "tenant_id"
+	MetadataAppID    = "app_id"
+)
+
 // DocSource is an inline single-document source for admin ingestion: the
 // document comes from the request body instead of a file or URL.
 type DocSource struct {
@@ -39,18 +47,49 @@ type DocSource struct {
 	Metadata map[string]any
 }
 
-// ReadDocuments implements source.Source. The document ID is a content hash:
-// re-ingesting the same content upserts instead of duplicating.
+// ReadDocuments implements source.Source. The document ID is a content hash
+// scoped to the owning tenant and app: re-ingesting the same document upserts
+// instead of duplicating, while the same name and content under a different
+// tenant is a different document.
+//
+// The scope has to be in the ID, not just the metadata: the vector store
+// upserts with ON CONFLICT (id) DO UPDATE over every column, metadata
+// included, so an unscoped ID let one tenant's ingest silently rewrite
+// another tenant's row — content, embedding and the tenant_id that decides
+// who can still retrieve it.
 func (s *DocSource) ReadDocuments(context.Context) ([]*document.Document, error) {
 	h := fnv.New64a()
-	_, _ = h.Write([]byte(s.DocName))
-	_, _ = h.Write([]byte(s.Content))
+	for _, part := range []string{
+		metadataString(s.Metadata, MetadataTenantID),
+		metadataString(s.Metadata, MetadataAppID),
+		s.DocName,
+		s.Content,
+	} {
+		// A length prefix keeps the boundaries unambiguous: without it
+		// ("t1","a1x") and ("t1a","1x") would hash alike.
+		_, _ = h.Write([]byte(strconv.Itoa(len(part))))
+		_, _ = h.Write([]byte{0})
+		_, _ = h.Write([]byte(part))
+	}
 	return []*document.Document{{
 		ID:       strconv.FormatUint(h.Sum64(), 16),
 		Name:     s.DocName,
 		Content:  s.Content,
 		Metadata: s.Metadata,
 	}}, nil
+}
+
+// metadataString reads one metadata key as a string, tolerating the numeric
+// and nil shapes a JSON round trip can produce.
+func metadataString(md map[string]any, key string) string {
+	switch v := md[key].(type) {
+	case string:
+		return v
+	case nil:
+		return ""
+	default:
+		return fmt.Sprint(v)
+	}
 }
 
 // Name implements source.Source.

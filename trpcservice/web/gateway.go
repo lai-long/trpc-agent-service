@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -20,6 +21,10 @@ import (
 )
 
 var tracer = otel.Tracer("trpc-agent-service/gateway")
+
+// dedupRollbackTimeout bounds the detached dedup rollback. It must survive the
+// request context but not hang the handler goroutine on an unresponsive Redis.
+const dedupRollbackTimeout = 3 * time.Second
 
 // EnqueueHandler implements channels.Handler as the Gateway's inbound core
 // (sync ack + async consume): a message is written to stream:inbound and
@@ -133,10 +138,18 @@ func (h EnqueueHandler) Handle(ctx context.Context, msg channels.InboundMessage)
 	// Rollback for anything that fails from here on: the dedup key must not
 	// outlive a failed delivery attempt, or the IM redelivery that is supposed
 	// to retry the message would be dropped as a duplicate.
+	//
+	// The rollback runs on a context detached from the request: the platform
+	// drops the callback connection once its own timeout fires (WeCom gives up
+	// after ~5s), and a Forget on that cancelled context would fail, leaving
+	// the key to swallow every redelivery for its whole TTL. WithoutCancel
+	// keeps the trace values so the rollback still lands in this span's trace.
 	rollbackDedup := func() {
 		if h.Dedup == nil {
 			return
 		}
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), dedupRollbackTimeout)
+		defer cancel()
 		if err := h.Dedup.Forget(ctx, msg.Channel, msg.BindingID, msg.MsgID); err != nil {
 			plog.Warnf("dedup rollback %s/%s: %v", msg.Channel, msg.MsgID, err)
 		}

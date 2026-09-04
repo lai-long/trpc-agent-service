@@ -136,7 +136,8 @@ func TestStreamAutoClaimTakesOver(t *testing.T) {
 	}
 }
 
-// Attempts is the poison-message counter: monotonic per (stream, entry) with
+// Attempts reads the poison-message counter and IncAttempts bumps it: reading
+// must not count, and the counter is namespaced per (stream, group, entry) with
 // the shared dedup TTL bound.
 func TestStreamAttemptsCounter(t *testing.T) {
 	rdb := redisOrSkip(t)
@@ -150,16 +151,30 @@ func TestStreamAttemptsCounter(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	n, err := s.Attempts(ctx, stream, id)
-	if err != nil || n != 1 {
-		t.Fatalf("first attempt must be 1, got %d err=%v", n, err)
-	}
-	n, err = s.Attempts(ctx, stream, id)
-	if err != nil || n != 2 {
-		t.Fatalf("second attempt must be 2, got %d err=%v", n, err)
+	// A message that never failed reads 0, and reading it again must not move
+	// the counter — the reaper reads on every takeover.
+	for i := 0; i < 3; i++ {
+		if n, err := s.Attempts(ctx, stream, "workers", id); err != nil || n != 0 {
+			t.Fatalf("an uncounted message must read 0, got %d err=%v", n, err)
+		}
 	}
 
-	key := fmt.Sprintf("retry:%s:%s", stream, id)
+	if n, err := s.IncAttempts(ctx, stream, "workers", id); err != nil || n != 1 {
+		t.Fatalf("first failure must be 1, got %d err=%v", n, err)
+	}
+	if n, err := s.IncAttempts(ctx, stream, "workers", id); err != nil || n != 2 {
+		t.Fatalf("second failure must be 2, got %d err=%v", n, err)
+	}
+	if n, err := s.Attempts(ctx, stream, "workers", id); err != nil || n != 2 {
+		t.Fatalf("read must report the counted failures, got %d err=%v", n, err)
+	}
+
+	// Another group consuming the same stream keeps its own counter.
+	if n, err := s.Attempts(ctx, stream, "senders-ws", id); err != nil || n != 0 {
+		t.Fatalf("a second group must start at 0, got %d err=%v", n, err)
+	}
+
+	key := fmt.Sprintf("retry:%s:workers:%s", stream, id)
 	ttl, err := rdb.TTL(ctx, key).Result()
 	if err != nil {
 		t.Fatal(err)

@@ -158,3 +158,15 @@ func TestSplitTextRespectsRuneBoundaries(t *testing.T) {
 		t.Fatal("segments must reassemble losslessly")
 	}
 }
+
+// A non-positive limit means "no limit": without the guard n == 0 spins forever
+// on a zero-length prefix and n < 0 panics in the slice expression.
+func TestSplitTextNonPositiveLimitReturnsUnsplit(t *testing.T) {
+	s := strings.Repeat("汉", 3) + strings.Repeat("a", 10)
+	for _, n := range []int{0, -1} {
+		segs := splitText(s, n)
+		if len(segs) != 1 || segs[0] != s {
+			t.Fatalf("n=%d must return s unsplit, got %q", n, segs)
+		}
+	}
+}

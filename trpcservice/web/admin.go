@@ -718,8 +718,8 @@ func (a *AdminAPI) addKnowledgeDocument(w http.ResponseWriter, r *http.Request) 
 		DocName: in.Name,
 		Content: in.Content,
 		Metadata: map[string]any{
-			"tenant_id": tenantID,
-			"app_id":    r.PathValue("id"),
+			agent.MetadataTenantID: tenantID,
+			agent.MetadataAppID:    r.PathValue("id"),
 		},
 	}
 	if err := a.Knowledge.AddSource(r.Context(), src); err != nil {

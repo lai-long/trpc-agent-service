@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/redis/go-redis/v9"
 	tagent "trpc.group/trpc-go/trpc-agent-go/agent"
@@ -328,25 +329,30 @@ func replyShell(msg channels.InboundMessage) channels.OutboundMessage {
 	}
 }
 
+// truncate caps s at max bytes without splitting a UTF-8 sequence: these
+// summaries are embedded in IM replies, where a half rune reaches the user as
+// mojibake and some platforms reject the invalid encoding outright.
+func truncate(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	// Step back off any partial rune straddling the cut.
+	for max > 0 && !utf8.RuneStart(s[max]) {
+		max--
+	}
+	return s[:max] + "…"
+}
+
 // summarizeArgs caps the argument summary so the confirmation message stays
 // well under IM length limits.
 func summarizeArgs(args json.RawMessage) string {
-	const max = 200
-	s := string(args)
-	if len(s) > max {
-		s = s[:max] + "…"
-	}
-	return s
+	return truncate(string(args), 200)
 }
 
 func summarizeResult(result any) string {
-	const max = 500
 	data, err := json.Marshal(result)
 	if err != nil {
 		return fmt.Sprintf("%v", result)
 	}
-	if len(data) > max {
-		return string(data[:max]) + "…"
-	}
-	return string(data)
+	return truncate(string(data), 500)
 }

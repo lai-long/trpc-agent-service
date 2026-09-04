@@ -14,12 +14,21 @@ const limiterTTL = 10 * time.Minute
 
 // allowScript is an atomic token bucket: refill by elapsed time, then consume
 // one token if available. Returns 1 when the request is allowed, 0 otherwise.
+//
+// The clock comes from Redis, not the caller: the bucket key is shared by every
+// platform node, so a node skewed ahead of its peers would write a ts in their
+// future (their next refill goes negative and denies traffic that should pass)
+// and a node skewed behind would over-refill it (bypassing the limit). One
+// clock for one shared bucket. TIME is non-deterministic, which is fine under
+// the effect replication Redis 5+ uses by default.
 var allowScript = redis.NewScript(`
 local key    = KEYS[1]
 local rate   = tonumber(ARGV[1])  -- tokens per second
 local burst  = tonumber(ARGV[2])
-local now    = tonumber(ARGV[3])  -- milliseconds
-local ttl_ms = tonumber(ARGV[4])
+local ttl_ms = tonumber(ARGV[3])
+
+local t      = redis.call('TIME')
+local now    = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
 
 local data   = redis.call('HMGET', key, 'tokens', 'ts')
 local tokens = tonumber(data[1])
@@ -61,9 +70,8 @@ func (l *Limiter) Allow(ctx context.Context, scope string, rate float64, burst i
 		return true, nil // non-positive config disables the limit
 	}
 	key := "ratelimit:" + scope
-	now := time.Now().UnixMilli()
 	res, err := allowScript.Run(ctx, l.rdb, []string{key},
-		rate, burst, now, limiterTTL.Milliseconds()).Int()
+		rate, burst, limiterTTL.Milliseconds()).Int()
 	if err != nil {
 		return false, fmt.Errorf("token bucket %s: %w", key, err)
 	}

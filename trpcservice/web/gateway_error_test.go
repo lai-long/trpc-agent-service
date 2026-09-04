@@ -3,13 +3,15 @@ package web_test
 // Gateway admission and failure paths that the happy-path suite does not
 // reach: missing routing, dedup failures and duplicates, the tenant rate
 // policy override, the Redis-hiccup fail-open, dedup rollback without a
-// deduper, and the enqueue failure with backpressure disabled.
+// deduper, dedup rollback after the request context dies, and the enqueue
+// failure with backpressure disabled.
 
 import (
 	"context"
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -227,5 +229,66 @@ func TestEnqueueAddFailure(t *testing.T) {
 	}
 	if n, err := rdb.Exists(ctx, dedupKey).Result(); err != nil || n != 0 {
 		t.Fatalf("dedup key must be rolled back after a failed enqueue (n=%d err=%v)", n, err)
+	}
+}
+
+// cancelOnFirstUse cancels the request context the first time its client runs
+// a command, standing in for the platform dropping the callback connection
+// while the handler is still working.
+type cancelOnFirstUse struct {
+	cancel context.CancelFunc
+	once   sync.Once
+}
+
+func (h *cancelOnFirstUse) DialHook(next redis.DialHook) redis.DialHook { return next }
+
+func (h *cancelOnFirstUse) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		h.once.Do(h.cancel)
+		return next(ctx, cmd)
+	}
+}
+
+func (h *cancelOnFirstUse) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return next
+}
+
+// The dedup rollback must outlive the request context. The platform cancels
+// the callback once its own timeout fires (WeCom: ~5s); a Forget on that dead
+// context would fail and leave the key standing for its whole TTL, so every
+// redelivery the platform sends to retry the message would be swallowed as
+// ErrDuplicate and answered 200 — the message is lost instead of retried.
+func TestEnqueueRollsBackDedupAfterRequestCancellation(t *testing.T) {
+	dedupRdb := testenv.Redis(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// The Stream rides a second client whose first command kills the request,
+	// so the dedup Check (live client) has already written the key by the time
+	// the queue-length check fails.
+	streamRdb := redis.NewClient(&redis.Options{Addr: testenv.RedisAddr()})
+	streamRdb.AddHook(&cancelOnFirstUse{cancel: cancel})
+	t.Cleanup(func() { _ = streamRdb.Close() })
+
+	msgID := fmt.Sprintf("cancel-%d", time.Now().UnixNano())
+	dedupKey := "dedup:mock:b1:" + msgID
+	t.Cleanup(func() { _ = dedupRdb.Del(context.Background(), dedupKey) })
+
+	h := web.EnqueueHandler{
+		Stream: storage.NewStream(streamRdb), Dedup: storage.NewDeduper(dedupRdb),
+		Routes:            tenant.NewResolver(fakeStore{data: testData()}),
+		BackpressureLimit: 100,
+	}
+	if _, err := h.Handle(ctx, channels.InboundMessage{
+		Channel: "mock", MsgID: msgID, SessionKey: "dm:mock:u1", UserID: "u1",
+		Text: "hi", WebhookPath: "/mock/callback",
+	}); err == nil {
+		t.Fatal("the cancelled queue-length check must surface as an error")
+	}
+	if ctx.Err() == nil {
+		t.Fatal("the test hook must have cancelled the request context")
+	}
+	if n, err := dedupRdb.Exists(context.Background(), dedupKey).Result(); err != nil || n != 0 {
+		t.Fatalf("dedup key must be rolled back even though the request died (n=%d err=%v)", n, err)
 	}
 }

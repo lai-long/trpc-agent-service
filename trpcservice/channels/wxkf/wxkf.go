@@ -572,9 +572,11 @@ func (c *Channel) invalidateToken(corpID, secretRef string) {
 
 // splitText breaks s into segments of at most n bytes, on rune boundaries.
 // Deliberately a local copy of the WeCom rule: the two adapters evolve on
-// different platform limits and must not couple.
+// different platform limits and must not couple. A non-positive n means no
+// limit, so s comes back unsplit — without that guard n == 0 would spin forever
+// on a zero-length prefix and n < 0 would panic in the slice expression.
 func splitText(s string, n int) []string {
-	if len(s) <= n {
+	if n <= 0 || len(s) <= n {
 		return []string{s}
 	}
 	var out []string

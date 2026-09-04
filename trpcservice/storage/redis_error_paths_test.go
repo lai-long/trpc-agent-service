@@ -90,8 +90,11 @@ func TestRedisWrappersFailClosedOnRedisError(t *testing.T) {
 		if _, err := s.AutoClaim(ctx, "st", "g", "c", time.Second, 1); err == nil {
 			t.Fatal("AutoClaim must fail")
 		}
-		if _, err := s.Attempts(ctx, "st", "0-0"); err == nil {
+		if _, err := s.Attempts(ctx, "st", "g", "0-0"); err == nil {
 			t.Fatal("Attempts must fail")
+		}
+		if _, err := s.IncAttempts(ctx, "st", "g", "0-0"); err == nil {
+			t.Fatal("IncAttempts must fail")
 		}
 		if err := s.DeadLetter(ctx, "st", "g", Message{ID: "0-0", Payload: []byte("p")}); err == nil {
 			t.Fatal("DeadLetter must fail")

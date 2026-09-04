@@ -170,24 +170,56 @@ func (s *Stream) AutoClaim(ctx context.Context, stream, group, consumer string, 
 			payload, _ := xm.Values[payloadField].(string)
 			msgs = append(msgs, Message{ID: xm.ID, Payload: []byte(payload)})
 		}
-		if next == "0" || len(xms) == 0 {
+		// Redis reports the end of the sweep as "0-0"; "0" is accepted too so the
+		// loop stops on the sentinel rather than paying one extra round trip.
+		if next == "0" || next == "0-0" || len(xms) == 0 {
 			return msgs, nil
 		}
 		start = next
 	}
 }
 
-// Attempts increments the redelivery counter of a message. The Worker uses it
-// to cut off poison messages that keep failing after every takeover.
-func (s *Stream) Attempts(ctx context.Context, stream, id string) (int64, error) {
-	key := fmt.Sprintf("retry:%s:%s", stream, id)
-	n, err := s.rdb.Incr(ctx, key).Result()
+// attemptsKey namespaces the redelivery counter by consumer group. One stream
+// can be consumed by several groups (the outbound queue has one per channel
+// family), and each redelivers independently, so a counter shared across groups
+// lets one group's retries dead-letter a message another group never touched.
+func attemptsKey(stream, group, id string) string {
+	return fmt.Sprintf("retry:%s:%s:%s", stream, group, id)
+}
+
+// incAttemptsScript bumps the counter and refreshes its TTL in one round trip:
+// an INCR followed by a separate EXPIRE leaves a counter with no expiry if the
+// caller dies in between, pinning the key for as long as Redis runs.
+var incAttemptsScript = redis.NewScript(`
+local n = redis.call('INCR', KEYS[1])
+redis.call('PEXPIRE', KEYS[1], ARGV[1])
+return n
+`)
+
+// IncAttempts records one genuine delivery failure for a message. Callers count
+// only failures the message itself caused — a retry forced by a rate limit, a
+// busy session or a Redis hiccup is not the message's fault, and counting those
+// dead-letters replies that were always deliverable.
+func (s *Stream) IncAttempts(ctx context.Context, stream, group, id string) (int64, error) {
+	key := attemptsKey(stream, group, id)
+	n, err := incAttemptsScript.Run(ctx, s.rdb, []string{key}, DedupTTL.Milliseconds()).Int64()
 	if err != nil {
 		return 0, fmt.Errorf("incr %s: %w", key, err)
 	}
-	if n == 1 {
-		// Bound the counter's lifetime; the message itself resolves or dies first.
-		s.rdb.Expire(ctx, key, DedupTTL)
+	return n, nil
+}
+
+// Attempts reads how many times a message has genuinely failed for this group;
+// one that was never counted reads 0. The reaper compares it against
+// maxAttempts to decide when to stop retrying and dead-letter.
+func (s *Stream) Attempts(ctx context.Context, stream, group, id string) (int64, error) {
+	key := attemptsKey(stream, group, id)
+	n, err := s.rdb.Get(ctx, key).Int64()
+	if errors.Is(err, redis.Nil) {
+		return 0, nil // never failed: nothing counted yet
+	}
+	if err != nil {
+		return 0, fmt.Errorf("get %s: %w", key, err)
 	}
 	return n, nil
 }

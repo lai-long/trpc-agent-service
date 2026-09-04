@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -32,7 +33,6 @@ func TestWorkerTakesOverOrphanedMessage(t *testing.T) {
 	defer cancel()
 
 	rdb := testenv.Redis(t)
-	defer func() { _ = rdb.Close() }()
 
 	stream := storage.NewStream(rdb)
 	inbound := "test:reap:in:" + t.Name()
@@ -88,18 +88,22 @@ func (failProcessor) Process(context.Context, channels.InboundMessage) (channels
 	return channels.OutboundMessage{}, errors.New("always fails")
 }
 
-// A message that fails past MaxAttempts lands in stream:deadletter.
+// A message that keeps failing past MaxAttempts lands in stream:deadletter
+// instead of looping forever.
 func TestWorkerDeadLettersPoisonMessage(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// No defer Close here: testenv.Redis registers the close as a cleanup, so it
+	// runs after the Del cleanups below. Closing early made every cleanup a
+	// no-op on a dead client, and the fixed stream name then accumulated pending
+	// entries across runs — a later run could pass on an earlier run's leftovers.
 	rdb := testenv.Redis(t)
-	defer func() { _ = rdb.Close() }()
-
 	stream := storage.NewStream(rdb)
-	inbound := "test:dlq:in:" + t.Name()
-	deadletter := "test:dlq:dead:" + t.Name()
-	t.Cleanup(func() { rdb.Del(context.Background(), inbound, deadletter) })
+	uid := fmt.Sprintf("%d", time.Now().UnixNano())
+	inbound := "test:dlq:in:" + t.Name() + "-" + uid
+	outbound := "test:dlq:out:" + t.Name() + "-" + uid
+	t.Cleanup(func() { rdb.Del(context.Background(), inbound, outbound) })
 	if err := stream.EnsureGroup(ctx, inbound, "workers"); err != nil {
 		t.Fatal(err)
 	}
@@ -109,39 +113,49 @@ func TestWorkerDeadLettersPoisonMessage(t *testing.T) {
 		UserID: "u10", Text: "boom", TraceID: "trace-poison",
 	}
 	payload, _ := json.Marshal(in)
-	if _, err := stream.Add(ctx, inbound, payload); err != nil {
+	id, err := stream.Add(ctx, inbound, payload)
+	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { rdb.Del(context.Background(), "retry:"+inbound+":workers:"+id) })
 
-	worker := fastWorker(stream, failProcessor{}, inbound, "test:dlq:out:"+t.Name())
+	// MaxAttempts=1: the first failure counts it, one retry confirms it, and the
+	// next reap dead-letters it. The loop period is the 2s blocking read, so the
+	// whole path is ~4s — a tighter bound than counting four failures for the
+	// same decision.
+	worker := &agent.Worker{
+		Stream: stream, Processor: failProcessor{}, Name: "test-reaper",
+		InStream: inbound, OutStream: outbound,
+		ReapInterval: 100 * time.Millisecond, MaxIdle: time.Millisecond, MaxAttempts: 1,
+	}
 	go func() { _ = worker.Run(ctx) }()
 
-	// The platform dead-letter stream is shared; count entries matching this
-	// test's message before and after to stay robust against leftovers.
-	countDead := func() int {
+	// The dead-letter stream is shared, so match this run's entry by its unique
+	// origin stream and remove it afterwards.
+	var dlID string
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) && dlID == "" {
 		msgs, err := rdb.XRange(ctx, storage.StreamDeadletter, "-", "+").Result()
-		if err != nil {
-			return 0
-		}
-		n := 0
-		for _, m := range msgs {
-			if body, ok := m.Values["payload"].(string); ok &&
-				strings.Contains(body, "poison-1") && strings.Contains(body, inbound) {
-				n++
+		if err == nil {
+			for _, m := range msgs {
+				body, _ := m.Values["payload"].(string)
+				if strings.Contains(body, "poison-1") && strings.Contains(body, inbound) {
+					dlID = m.ID
+				}
 			}
 		}
-		return n
-	}
-	before := countDead()
-
-	deadline := time.Now().Add(8 * time.Second)
-	for time.Now().Before(deadline) {
-		if countDead() > before {
-			return
+		if dlID == "" {
+			time.Sleep(200 * time.Millisecond)
 		}
-		time.Sleep(200 * time.Millisecond)
 	}
-	t.Fatal("poison message was not dead-lettered within 8s")
+	t.Cleanup(func() {
+		if dlID != "" {
+			rdb.XDel(context.Background(), storage.StreamDeadletter, dlID)
+		}
+	})
+	if dlID == "" {
+		t.Fatal("poison message was not dead-lettered within 10s")
+	}
 }
 
 // A message for a session locked by another worker is re-queued and processed
@@ -151,7 +165,6 @@ func TestWorkerRequeuesWhenSessionLocked(t *testing.T) {
 	defer cancel()
 
 	rdb := testenv.Redis(t)
-	defer func() { _ = rdb.Close() }()
 
 	stream := storage.NewStream(rdb)
 	inbound := "test:lock:in:" + t.Name()

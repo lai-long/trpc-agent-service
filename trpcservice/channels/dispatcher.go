@@ -68,9 +68,11 @@ type Sender struct {
 	// Skip, when set, marks messages this sender must not deliver — they
 	// belong to another consumer group on the same stream. A skipped message
 	// is acked and dropped here without sending or MarkSent: it must ack,
-	// because an un-acked skip would be reaped, inflate its attempts counter
-	// and eventually dead-letter a perfectly deliverable message. It must
-	// also not consume a rate-limit token nor write the sent: marker.
+	// because an un-acked skip stays in this group's pending list forever —
+	// the reaper keeps taking it over, and since this group never records a
+	// delivery failure for it, it never reaches MaxAttempts and so never
+	// dead-letters. It must also not consume a rate-limit token nor write the
+	// sent: marker.
 	Skip func(msg OutboundMessage) bool
 
 	// Limiter paces sends per {channel}:{tenant_id}; nil disables pacing.
@@ -206,7 +208,10 @@ func (s *Sender) reap(ctx context.Context) {
 		return
 	}
 	for _, m := range msgs {
-		attempts, err := s.Stream.Attempts(ctx, s.inStream(), m.ID)
+		// Read-only: the counter tracks genuine delivery failures (recorded by
+		// handle), not takeovers. Counting takeovers dead-lettered replies that
+		// were merely paced by the rate limiter or delayed by a Redis hiccup.
+		attempts, err := s.Stream.Attempts(ctx, s.inStream(), s.group(), m.ID)
 		if err != nil {
 			plog.Warnf("sender %s count attempts %s: %v", s.Name, m.ID, err)
 			continue
@@ -223,6 +228,16 @@ func (s *Sender) reap(ctx context.Context) {
 	}
 }
 
+// countFailure records one genuine delivery failure against this group's
+// counter, which is what lets the reaper dead-letter a message the platform
+// keeps rejecting. Requeues caused by the rate limiter, an unknown-channel
+// drop or a Redis hiccup are not failures and must never come through here.
+func (s *Sender) countFailure(ctx context.Context, id string) {
+	if _, err := s.Stream.IncAttempts(ctx, s.inStream(), s.group(), id); err != nil {
+		plog.Warnf("sender %s count failure %s: %v", s.Name, id, err)
+	}
+}
+
 func (s *Sender) handle(ctx context.Context, m storage.Message) {
 	var msg OutboundMessage
 	if err := json.Unmarshal(m.Payload, &msg); err != nil {
@@ -234,10 +249,7 @@ func (s *Sender) handle(ctx context.Context, m storage.Message) {
 	// Another consumer group owns this channel (e.g. wecomws ↔ senders-ws):
 	// ack and step aside before touching the sent: marker, the rate bucket
 	// or the channel registry — and before any tracing setup, which only
-	// matters for messages this group actually delivers. The Skip-ack above
-	// all else also keeps the attempts counter (shared across groups, key
-	// carries no group) from being inflated for a message this group will
-	// never deliver.
+	// matters for messages this group actually delivers.
 	if s.Skip != nil && s.Skip(msg) {
 		metrics.OutboundTotal.Add(ctx, 1, sendAttr(msg, "skipped_other_group"))
 		_ = s.Stream.Ack(ctx, s.inStream(), s.group(), m.ID)
@@ -305,7 +317,9 @@ func (s *Sender) handle(ctx context.Context, m storage.Message) {
 	}
 
 	if err := ch.Send(ctx, msg); err != nil {
-		// No Ack: leave it pending for retry.
+		// No Ack: leave it pending for retry, counted so the reaper can
+		// dead-letter a message the platform keeps rejecting.
+		s.countFailure(ctx, m.ID)
 		metrics.OutboundTotal.Add(ctx, 1, sendAttr(msg, "error"))
 		plog.Errorf("sender %s send via %s failed: %v", s.Name, msg.Channel, err)
 		span.RecordError(err)
@@ -321,9 +335,10 @@ func (s *Sender) handle(ctx context.Context, m storage.Message) {
 	if s.Sent != nil && msg.MsgID != "" {
 		if err := s.Sent.MarkSent(ctx, msg.Channel, msg.BindingID, msg.MsgID, ""); err != nil {
 			// The user already has the reply, but the marker that suppresses
-			// the duplicate did not stick: no Ack. The reaper redelivers, the
-			// IsSent check above (or, for wxkf, the platform's msgid dedup)
-			// absorbs the retry instead of the user receiving it twice.
+			// the duplicate did not stick: no Ack. The reaper redelivers, and
+			// because IsSent will still say no, the send runs again — so this
+			// counts as a failure, bounding the duplicate storm at maxAttempts.
+			s.countFailure(ctx, m.ID)
 			plog.Errorf("sender %s mark sent %s: %v — leaving pending for redelivery", s.Name, m.ID, err)
 			return
 		}

@@ -7,7 +7,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
-
+	"errors"
 	"time"
 
 	"go.opentelemetry.io/otel"
@@ -23,6 +23,12 @@ import (
 )
 
 var tracer = otel.Tracer("trpc-agent-service/worker")
+
+// errSessionLockLost cancels a run whose session lease was taken over. The lock
+// is what keeps one message from being processed twice across replicas, so once
+// it is gone the in-flight generation must stop: continuing spends tokens a peer
+// is already spending and emits a second reply for one message.
+var errSessionLockLost = errors.New("session lock lost")
 
 func processAttr(msg channels.InboundMessage) otelmetric.MeasurementOption {
 	return otelmetric.WithAttributes(
@@ -249,13 +255,21 @@ func (w *Worker) handle(ctx context.Context, m storage.Message) {
 	}
 
 	// Session lock: serialize concurrent processing of the same session
-	// across replicas. Deferred calls run LIFO: the watchdog stops first,
-	// then the lock is released.
+	// across replicas. The run is bound to the lease — the watchdog cancels it
+	// if the lock is taken over, because from that moment a peer may be
+	// generating a reply for the same message.
+	// Deferred calls run LIFO: the watchdog stops first, then the lock is
+	// released, then the run context is dropped.
+	runCtx := ctx
 	if w.Lock != nil {
-		owner, stopWatchdog, ok := w.acquireSession(ctx, m, msg.AppID, msg.SessionKey)
+		var cancelRun context.CancelCauseFunc
+		runCtx, cancelRun = context.WithCancelCause(ctx)
+		owner, stopWatchdog, ok := w.acquireSession(ctx, m, msg.AppID, msg.SessionKey, cancelRun)
 		if !ok {
-			return // re-queued or shutting down
+			cancelRun(nil)
+			return // left pending for the reaper, or shutting down
 		}
+		defer cancelRun(nil)
 		defer func() {
 			releaseCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 			defer cancel()
@@ -266,15 +280,34 @@ func (w *Worker) handle(ctx context.Context, m storage.Message) {
 		defer stopWatchdog()
 	}
 
-	out, err := w.Processor.Process(ctx, msg)
+	out, err := w.Processor.Process(runCtx, msg)
 	metrics.ProcessDuration.Record(ctx, float64(time.Since(started).Milliseconds()), processAttr(msg))
+	// A run that outlived its lease is not publishable: the peer that took the
+	// session over is producing a reply for the same message, so leave the entry
+	// pending instead of racing it. This also catches a run that finished a hair
+	// before the cancellation reached it.
+	lockLost := errors.Is(context.Cause(runCtx), errSessionLockLost)
+	if err == nil && lockLost {
+		err = errSessionLockLost
+	}
 	if err != nil {
 		// No Ack: leave it pending for redelivery. Redelivery of a processed
 		// message is caught by the done marker above; events journaled twice
 		// inside the crash window remain bounded by the (session_id,
 		// event_seq) unique constraint.
+		if !lockLost {
+			// A lease handover is not this message's failure: the peer that took
+			// the session over will process the same entry, so counting it would
+			// dead-letter a message another replica is about to deliver.
+			w.countFailure(ctx, m.ID)
+		}
 		metrics.ProcessErrorTotal.Add(ctx, 1, processAttr(msg))
-		plog.Errorf("worker %s process %s failed: %v", w.Name, m.ID, err)
+		if lockLost {
+			plog.Warnf("worker %s aborts %s: session %s was taken over mid-run, leaving it pending",
+				w.Name, m.ID, msg.SessionKey)
+		} else {
+			plog.Errorf("worker %s process %s failed: %v", w.Name, m.ID, err)
+		}
 		span.RecordError(err)
 		return
 	}
@@ -302,10 +335,15 @@ func (w *Worker) handle(ctx context.Context, m storage.Message) {
 	//nolint:gosec // G117: SessionKey is a routing key on the internal stream, not a credential
 	payload, err := json.Marshal(out)
 	if err != nil {
+		// Deterministic: no retry can ever marshal this reply, so it counts
+		// toward the dead-letter bound instead of looping forever.
+		w.countFailure(ctx, m.ID)
 		plog.Errorf("worker %s marshal outbound: %v", w.Name, err)
 		return
 	}
 	if _, err := w.Stream.Add(ctx, w.outStream(), payload); err != nil {
+		// Not counted: Redis being down is not this message's failure, and
+		// dead-lettering during an outage would discard deliverable replies.
 		plog.Errorf("worker %s enqueue outbound: %v", w.Name, err)
 		return
 	}
@@ -340,7 +378,10 @@ func (w *Worker) reap(ctx context.Context) {
 		return
 	}
 	for _, m := range msgs {
-		attempts, err := w.Stream.Attempts(ctx, w.inStream(), m.ID)
+		// Read-only: the counter tracks genuine processing failures (recorded by
+		// handle), not takeovers. Counting takeovers dead-lettered messages that
+		// were merely waiting on a busy session or a Redis hiccup.
+		attempts, err := w.Stream.Attempts(ctx, w.inStream(), "workers", m.ID)
 		if err != nil {
 			plog.Warnf("worker %s count attempts %s: %v", w.Name, m.ID, err)
 			continue
@@ -357,11 +398,22 @@ func (w *Worker) reap(ctx context.Context) {
 	}
 }
 
+// countFailure records one genuine processing failure against the workers
+// group's counter, which is what lets the reaper dead-letter a message that
+// always fails. Waiting on a busy session, a lease handover or a Redis outage
+// are not failures and must never come through here.
+func (w *Worker) countFailure(ctx context.Context, id string) {
+	if _, err := w.Stream.IncAttempts(ctx, w.inStream(), "workers", id); err != nil {
+		plog.Warnf("worker %s count failure %s: %v", w.Name, id, err)
+	}
+}
+
 // acquireSession spins for the session lock until lockWait. On timeout the
 // message is left pending and the reaper takes it over after maxIdle, so a
 // busy session delays the message without failing it. The returned stop ends
-// the renewal watchdog.
-func (w *Worker) acquireSession(ctx context.Context, m storage.Message, appID, sessionKey string) (owner string, stop func(), ok bool) {
+// the renewal watchdog; cancelRun is what the watchdog fires to abort the run
+// if the lease is lost underneath it.
+func (w *Worker) acquireSession(ctx context.Context, m storage.Message, appID, sessionKey string, cancelRun context.CancelCauseFunc) (owner string, stop func(), ok bool) {
 	owner = w.Name + ":" + m.ID
 	deadline := time.Now().Add(w.lockWait())
 	for {
@@ -370,7 +422,7 @@ func (w *Worker) acquireSession(ctx context.Context, m storage.Message, appID, s
 			plog.Warnf("worker %s acquire lock %s: %v", w.Name, sessionKey, err)
 		}
 		if acquired {
-			return owner, w.startLockWatchdog(ctx, appID, sessionKey, owner), true
+			return owner, w.startLockWatchdog(ctx, appID, sessionKey, owner, cancelRun), true
 		}
 		if time.Now().After(deadline) {
 			// Leave the entry pending for the reaper instead of re-queueing a
@@ -391,9 +443,11 @@ func (w *Worker) acquireSession(ctx context.Context, m storage.Message, appID, s
 
 // startLockWatchdog renews the session lock every TTL/3 so long tool calls
 // and slow generations cannot outlive the lease. A Redis hiccup is retried on
-// the next tick (the TTL has slack for one or two misses); only losing the
-// lock itself (another owner) stops the renewal — the lock is gone anyway.
-func (w *Worker) startLockWatchdog(ctx context.Context, appID, sessionKey, owner string) (stop func()) {
+// the next tick (the TTL has slack for one or two misses); losing the lock
+// itself (another owner) stops the renewal AND cancels the run — the lease is
+// the only thing keeping a peer from processing the same message, so the
+// generation in flight is no longer ours to finish.
+func (w *Worker) startLockWatchdog(ctx context.Context, appID, sessionKey, owner string, cancelRun context.CancelCauseFunc) (stop func()) {
 	done := make(chan struct{})
 	go func() {
 		ticker := time.NewTicker(w.lockTTL() / 3)
@@ -413,7 +467,8 @@ func (w *Worker) startLockWatchdog(ctx context.Context, appID, sessionKey, owner
 					// the lock at TTL expiry while processing continues.
 					plog.Warnf("worker %s lock renew %s failed (retrying): %v", w.Name, sessionKey, err)
 				case !ok:
-					plog.Warnf("worker %s lost session lock %s", w.Name, sessionKey)
+					plog.Warnf("worker %s lost session lock %s, aborting the run", w.Name, sessionKey)
+					cancelRun(errSessionLockLost)
 					return
 				}
 			}

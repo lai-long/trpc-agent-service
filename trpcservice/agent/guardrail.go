@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
 	plog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
@@ -62,14 +63,21 @@ type BudgetGate interface {
 
 // Guarded wraps a Processor with the guardrail chain:
 //
-//	recall → approval answer → input checks (allowlist/denylist) → budget gate
-//	→ inner processor → budget accounting → output checks (redact/denylist)
-//	→ approval confirmation composition
+//	recall → tenant policy → allowlist → approval answer → input denylist
+//	→ budget gate → inner processor → budget accounting → output checks
+//	(redact/denylist) → approval confirmation composition
+//
+// The allowlist precedes the approval answer so that a user dropped from it
+// cannot confirm a dangerous call intercepted while they were still allowed,
+// and every reply the guardrail emits passes the output checks — the model's,
+// the approval answer's and the interception notice alike, because the latter
+// two embed raw tool arguments and results no model-side filter ever saw.
 //
 // The guardrail owns message-level auditing: routine messages get an async
 // allow event, guardrail decisions (deny / review / review_timeout /
 // dangerous-tool execution) are written synchronously — the compliance red
-// line is that critical decisions are never lost.
+// line is that critical decisions are never lost. Exactly one terminal audit
+// row is written per message.
 type Guarded struct {
 	Inner    Processor
 	Approver *Approver   // nil disables tool-approval handling
@@ -108,17 +116,45 @@ func (g *Guarded) Process(ctx context.Context, msg channels.InboundMessage) (cha
 		return replyShell(msg), nil
 	}
 
-	// 1. A pending approval consumes confirm/reject answers before anything
-	//    else runs. The approval reply carries a tool RESULT — run the output
-	//    checks on it too (desensitization / deny lists must see it).
+	// 1. Tenant policy resolution (guardrail_policy): failures degrade to the
+	//    platform baseline with a warning. It runs before anything that answers
+	//    the user, so every reply path — the approval answer included — is
+	//    filtered by the tenant's own output rules.
+	policy := g.policyFor(ctx, msg.TenantID)
+
+	// 2. Allowlist gate, ahead of the approval answer: a user dropped from the
+	//    allowlist must not be able to confirm a dangerous call that was
+	//    intercepted while they were still on it. The pending approval is left
+	//    to expire on its own.
+	if len(policy.InputAllowUsers) > 0 && !slices.Contains(policy.InputAllowUsers, msg.UserID) {
+		span.SetAttributes(attribute.String("decision", "deny"))
+		plog.Warnf("user %s not in tenant %s allowlist", msg.UserID, msg.TenantID)
+		g.syncAudit(msg, auditDecision{decision: "deny", errorType: "user_not_allowed"})
+		out := replyShell(msg)
+		out.Text = "抱歉，您没有权限使用该服务。"
+		return out, nil
+	}
+
+	// 3. A pending approval consumes confirm/reject answers before the input
+	//    denylist runs — an answer is a control word, not content. Its reply
+	//    carries a tool RESULT the model never produced, so it rides the same
+	//    output checks as an LLM reply.
 	if g.Approver != nil {
 		handled, out, dec, err := g.Approver.Answer(ctx, msg)
 		if err != nil {
 			return channels.OutboundMessage{}, err
 		}
 		if handled {
-			for _, check := range g.Output {
-				out.Text = check(ctx, msg, out.Text)
+			out, deniedWord := g.redactOutput(ctx, msg, policy, out)
+			if deniedWord != "" {
+				// The tool has already run, so the execution decision is the
+				// compliance record; the redaction rides that same row instead
+				// of adding a second terminal audit for one message.
+				plog.Warnf("output deny word %q hit in the approval reply (session=%s)",
+					deniedWord, msg.SessionKey)
+				if dec.errorType == "" {
+					dec.errorType = "sensitive_output"
+				}
 			}
 			span.SetAttributes(attribute.String("decision", firstNonEmpty(dec.decision, "allow")))
 			g.syncAudit(msg, dec)
@@ -126,11 +162,7 @@ func (g *Guarded) Process(ctx context.Context, msg channels.InboundMessage) (cha
 		}
 	}
 
-	// 2. Tenant policy resolution (guardrail_policy): failures degrade to the
-	//    platform baseline with a warning.
-	policy := g.policyFor(ctx, msg.TenantID)
-
-	// 3. Input checks: the platform baseline, or the tenant's deny-word list
+	// 4. Input checks: the platform baseline, or the tenant's deny-word list
 	//    when it replaces the baseline (guardrail_policy.input_deny_words).
 	inputCheckers := g.Input
 	if len(policy.InputDenyWords) > 0 {
@@ -147,16 +179,8 @@ func (g *Guarded) Process(ctx context.Context, msg channels.InboundMessage) (cha
 			return out, nil
 		}
 	}
-	if len(policy.InputAllowUsers) > 0 && !slices.Contains(policy.InputAllowUsers, msg.UserID) {
-		span.SetAttributes(attribute.String("decision", "deny"))
-		plog.Warnf("user %s not in tenant %s allowlist", msg.UserID, msg.TenantID)
-		g.syncAudit(msg, auditDecision{decision: "deny", errorType: "user_not_allowed"})
-		out := replyShell(msg)
-		out.Text = "抱歉，您没有权限使用该服务。"
-		return out, nil
-	}
 
-	// 4. Budget gate: deny when the tenant's daily token usage is
+	// 5. Budget gate: deny when the tenant's daily token usage is
 	//    already over budget; the run's actual tokens are recorded below.
 	if g.Budget != nil && policy.MaxTokensPerDay > 0 && msg.TenantID != "" {
 		ok, err := g.Budget.Allow(ctx, msg.TenantID, policy.MaxTokensPerDay)
@@ -170,7 +194,7 @@ func (g *Guarded) Process(ctx context.Context, msg channels.InboundMessage) (cha
 			return out, nil
 		}
 	}
-	// 5. Inner processing (Runner or echo fallback). Routine allow audit,
+	// 6. Inner processing (Runner or echo fallback). Routine allow audit,
 	//    async lane; process errors ride the same event as error_type.
 	started := time.Now()
 	out, err := g.Inner.Process(ctx, msg)
@@ -200,11 +224,7 @@ func (g *Guarded) Process(ctx context.Context, msg channels.InboundMessage) (cha
 			// A dangerous call was intercepted before the failure: the
 			// pending approval is real, so the confirmation notice (not the
 			// busy reply) is what the user needs.
-			span.SetAttributes(attribute.String("decision", signalDecision(sig).decision))
-			g.syncAudit(msg, signalDecision(sig))
-			out = replyShell(msg)
-			out.Text = signalReply(sig)
-			return out, nil
+			return g.deliverSignal(ctx, span, msg, policy, sig, replyShell(msg)), nil
 		}
 		span.SetAttributes(attribute.String("decision", "degraded"))
 		metrics.ProcessErrorTotal.Add(ctx, 1, processAttr(msg))
@@ -218,31 +238,19 @@ func (g *Guarded) Process(ctx context.Context, msg channels.InboundMessage) (cha
 		g.Budget.Record(ctx, msg.TenantID, int64(out.PromptTokens+out.CompletionTokens))
 	}
 
-	// 6. Output checks: platform desensitization, then the tenant's output
+	// 7. Output checks: platform desensitization, then the tenant's output
 	//    denylist — a hit replaces the reply and audits a deny.
-	for _, check := range g.Output {
-		out.Text = check(ctx, msg, out.Text)
-	}
-	if len(policy.OutputDenyWords) > 0 {
-		for _, w := range policy.OutputDenyWords {
-			if w != "" && strings.Contains(out.Text, w) {
-				span.SetAttributes(attribute.String("decision", "deny"))
-				plog.Warnf("output deny word %q hit (session=%s)", w, msg.SessionKey)
-				g.syncAudit(msg, auditDecision{decision: "deny", errorType: "sensitive_output"})
-				out.Text = "抱歉，回复包含受限内容，已被拦截。"
-				return out, nil
-			}
-		}
+	out, deniedWord := g.redactOutput(ctx, msg, policy, out)
+	if deniedWord != "" {
+		g.denyOutput(span, msg, deniedWord, "")
+		return out, nil
 	}
 
-	// 5. A dangerous call was intercepted during the run: audit the decision
+	// 8. A dangerous call was intercepted during the run: audit the decision
 	//    with full tenant context and replace the LLM reply with the
 	//    deterministic confirmation/conflict/timeout notice.
 	if signaled {
-		span.SetAttributes(attribute.String("decision", signalDecision(sig).decision))
-		g.syncAudit(msg, signalDecision(sig))
-		out.Text = signalReply(sig)
-		return out, nil
+		return g.deliverSignal(ctx, span, msg, policy, sig, out), nil
 	}
 	// Terminal allow audit — deliberately last: it used to run before the
 	// output checks and the approval-signal handling, leaving one message
@@ -266,6 +274,59 @@ func (g *Guarded) policyFor(ctx context.Context, tenantID string) tenant.Guardra
 		return tenant.GuardrailPolicy{}
 	}
 	return p
+}
+
+// outputDeniedReply replaces a reply that tripped the tenant's output
+// denylist. It deliberately does not name the word.
+const outputDeniedReply = "抱歉，回复包含受限内容，已被拦截。"
+
+// redactOutput runs the platform desensitization checkers over a reply and
+// then the tenant's output denylist. A non-empty deniedWord means the reply hit
+// that denylist and its text was replaced by outputDeniedReply.
+//
+// Every reply the guardrail sends goes through here, not just the model's: the
+// approval notices embed raw tool arguments and results, which no model-side
+// check has seen and which land in the whole group chat.
+func (g *Guarded) redactOutput(ctx context.Context, msg channels.InboundMessage,
+	policy tenant.GuardrailPolicy, out channels.OutboundMessage) (channels.OutboundMessage, string) {
+	for _, check := range g.Output {
+		out.Text = check(ctx, msg, out.Text)
+	}
+	for _, w := range policy.OutputDenyWords {
+		if w != "" && strings.Contains(out.Text, w) {
+			out.Text = outputDeniedReply
+			return out, w
+		}
+	}
+	return out, ""
+}
+
+// denyOutput records an output-denylist interception: the span decision, the
+// warning and the synchronous audit row. It is the message's only terminal
+// audit, so callers must not write another. toolName is set when the denied
+// text was an approval notice, tying the row to the intercepted call.
+func (g *Guarded) denyOutput(span trace.Span, msg channels.InboundMessage, word, toolName string) {
+	span.SetAttributes(attribute.String("decision", "deny"))
+	plog.Warnf("output deny word %q hit (session=%s)", word, msg.SessionKey)
+	g.syncAudit(msg, auditDecision{decision: "deny", errorType: "sensitive_output", toolName: toolName})
+}
+
+// deliverSignal replaces out's text with the deterministic notice for an
+// interception and filters it like any other reply. Exactly one terminal audit
+// follows: the deny when the notice itself trips the tenant denylist (the raw
+// arguments are the leak the denylist exists to stop), otherwise the
+// interception decision.
+func (g *Guarded) deliverSignal(ctx context.Context, span trace.Span, msg channels.InboundMessage,
+	policy tenant.GuardrailPolicy, sig Signal, out channels.OutboundMessage) channels.OutboundMessage {
+	out.Text = signalReply(sig)
+	out, deniedWord := g.redactOutput(ctx, msg, policy, out)
+	if deniedWord != "" {
+		g.denyOutput(span, msg, deniedWord, sig.ToolName)
+		return out
+	}
+	span.SetAttributes(attribute.String("decision", signalDecision(sig).decision))
+	g.syncAudit(msg, signalDecision(sig))
+	return out
 }
 
 // SensitiveWordInput denies messages containing any of the words.

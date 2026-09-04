@@ -79,3 +79,34 @@ func TestLimiterNonPositiveDisables(t *testing.T) {
 		t.Fatalf("non-positive config must disable the limit: ok=%v err=%v", ok, err)
 	}
 }
+
+// The bucket is shared by every platform node, so its clock and its TTL must
+// both come from Redis: a caller-supplied timestamp lets one skewed node
+// over-refill the bucket (bypassing the limit) or push it into its peers'
+// future (denying traffic that should pass), and if it lands in the TTL slot it
+// pins the key for ~55 years instead of limiterTTL.
+func TestLimiterBucketClockAndTTLComeFromRedis(t *testing.T) {
+	rdb := redisOrSkip(t)
+	ctx := context.Background()
+	scope := fmt.Sprintf("tenant:test-%d", time.Now().UnixNano())
+	key := "ratelimit:" + scope
+	t.Cleanup(func() { rdb.Del(ctx, key) })
+
+	before := rdb.Time(ctx).Val().UnixMilli()
+	if _, err := NewLimiter(rdb).Allow(ctx, scope, 1, 10); err != nil {
+		t.Fatal(err)
+	}
+	after := rdb.Time(ctx).Val().UnixMilli()
+
+	ts, err := rdb.HGet(ctx, key, "ts").Int64()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ts < before || ts > after {
+		t.Fatalf("bucket ts %d outside the Redis TIME window [%d,%d]: the script is not reading the clock from Redis", ts, before, after)
+	}
+
+	if ttl := rdb.TTL(ctx, key).Val(); ttl > limiterTTL || ttl < limiterTTL-time.Minute {
+		t.Fatalf("bucket TTL %v must be ~%v, not a timestamp-derived lifetime", ttl, limiterTTL)
+	}
+}

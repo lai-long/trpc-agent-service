@@ -191,6 +191,75 @@ func TestSenderRateLimitedRequeues(t *testing.T) {
 	t.Fatal("rate-limited message vanished from the stream")
 }
 
+// A rate-limited requeue is a delay, not a failure. It must never reach the
+// attempts counter: counting takeovers let a tenant that exhausted its send
+// bucket long enough have perfectly deliverable replies dead-lettered.
+func TestSenderRateLimitedRequeueIsNotAnAttempt(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	rdb := testenv.Redis(t)
+	t.Cleanup(func() { _ = rdb.Close() })
+
+	uid := fmt.Sprintf("%d", time.Now().UnixNano())
+	stream := storage.NewStream(rdb)
+	outbound := "test:rlcount:out:" + t.Name() + "-" + uid
+	bucket := "ratelimit:send:counting:t-rlcount"
+	t.Cleanup(func() { rdb.Del(context.Background(), outbound, bucket) })
+	if err := stream.EnsureGroup(ctx, outbound, "senders"); err != nil {
+		t.Fatal(err)
+	}
+
+	ch := &countingChannel{}
+	sender := &channels.Sender{
+		Stream:   stream,
+		Channels: map[string]channels.Channel{"counting": ch},
+		Name:     "test-rlcount",
+		InStream: outbound,
+		// One token, no meaningful refill, a wait too short to ride it out: the
+		// first reply sends and every later one is left pending for the reaper.
+		Limiter: storage.NewLimiter(rdb), SendQPS: 0.001, SendBurst: 1, SendWait: 20 * time.Millisecond,
+		// The strictest dead-letter bound, reaped as often as the 2s read block
+		// allows: two takeovers are enough to have dead-lettered this reply when
+		// a takeover counted as an attempt.
+		ReapInterval: 50 * time.Millisecond, MaxIdle: time.Millisecond, MaxAttempts: 1,
+	}
+	go func() { _ = sender.Run(ctx) }()
+
+	mk := func(id string) []byte {
+		payload, _ := json.Marshal(channels.OutboundMessage{
+			Channel: "counting", MsgID: id, SessionKey: "dm:counting:u1",
+			UserID: "u1", Text: "hi", TenantID: "t-rlcount",
+		})
+		return payload
+	}
+	if _, err := stream.Add(ctx, outbound, mk("rlc-a")); err != nil { // takes the only token
+		t.Fatal(err)
+	}
+	paced, err := stream.Add(ctx, outbound, mk("rlc-b"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { rdb.Del(context.Background(), "retry:"+outbound+":senders:"+paced) })
+
+	waitFor(t, func() bool { return ch.Calls() >= 1 })
+
+	// Two reap cycles land at roughly 2s and 4s (the read block dominates the
+	// loop), so by now the paced reply has been taken over twice.
+	time.Sleep(4600 * time.Millisecond)
+
+	if got := ch.Calls(); got != 1 {
+		t.Fatalf("want exactly 1 send while the bucket is empty, got %d", got)
+	}
+	if got, err := stream.Attempts(ctx, outbound, "senders", paced); err != nil || got != 0 {
+		t.Fatalf("a paced reply must not be counted as an attempt, got %d err=%v", got, err)
+	}
+	n, _, err := stream.Pending(ctx, outbound, "senders")
+	if err != nil || n != 1 {
+		t.Fatalf("the paced reply must still be waiting to go out, got %d pending err=%v", n, err)
+	}
+}
+
 // A tenant send override (rate_policy send_qps/send_burst) replaces the
 // platform default bucket shape.
 func TestSenderTenantRateOverride(t *testing.T) {
@@ -524,8 +593,10 @@ func TestSenderDropsPoisonAndUnknownChannel(t *testing.T) {
 	}
 }
 
-// A channel whose Send fails leaves the message pending (no Ack): the reaper
-// redelivers it later, so a transient IM outage delays instead of losing.
+// A channel whose Send fails leaves the message pending (no Ack) and records the
+// failure against this group's counter: the reaper redelivers it later, so a
+// transient IM outage delays instead of losing, and a permanent one is
+// eventually dead-lettered.
 func TestSenderSendErrorLeavesPending(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -555,14 +626,24 @@ func TestSenderSendErrorLeavesPending(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := stream.Add(ctx, outbound, payload); err != nil {
+	id, err := stream.Add(ctx, outbound, payload)
+	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { rdb.Del(context.Background(), "retry:"+outbound+":senders:"+id) })
 
 	waitFor(t, func() bool { return ch.Calls() >= 1 })
 	n, _, err := stream.Pending(ctx, outbound, "senders")
 	if err != nil || n != 1 {
 		t.Fatalf("failed send must stay pending for retry, got %d pending, err %v", n, err)
+	}
+	// The failure is counted once, and only for the group that owns it.
+	waitFor(t, func() bool {
+		got, err := stream.Attempts(ctx, outbound, "senders", id)
+		return err == nil && got >= 1
+	})
+	if got, err := stream.Attempts(ctx, outbound, "senders-ws", id); err != nil || got != 0 {
+		t.Fatalf("another group must not inherit this failure, got %d err=%v", got, err)
 	}
 }
 
@@ -598,12 +679,16 @@ func TestSenderDeadLettersAfterMaxAttempts(t *testing.T) {
 	if _, err := stream.Read(ctx, outbound, "senders", "dead-sender-dl", 1, time.Second); err != nil {
 		t.Fatal(err)
 	}
-	// One failed delivery already counted; the reaper's own Attempts()
-	// increments past MaxAttempts=1.
-	retryKey := "retry:" + outbound + ":" + id
+	// Two genuine delivery failures already recorded, one past MaxAttempts=1:
+	// the reaper only reads the counter now, so it must dead-letter on sight
+	// instead of trying again. Seeded through the production increment path so
+	// the key format is not duplicated here.
+	retryKey := "retry:" + outbound + ":senders:" + id
 	t.Cleanup(func() { rdb.Del(context.Background(), outbound, retryKey) })
-	if n, err := rdb.Incr(ctx, retryKey).Result(); err != nil || n != 1 {
-		t.Fatalf("seed retry counter: n=%d err=%v", n, err)
+	for want := int64(1); want <= 2; want++ {
+		if n, err := stream.IncAttempts(ctx, outbound, "senders", id); err != nil || n != want {
+			t.Fatalf("seed retry counter: n=%d want %d err=%v", n, want, err)
+		}
 	}
 
 	ch := &countingChannel{}

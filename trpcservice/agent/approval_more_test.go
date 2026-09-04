@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/testenv"
 )
@@ -159,5 +160,59 @@ func TestSummarizeTruncationAndFallback(t *testing.T) {
 	ch := make(chan int)
 	if got, want := summarizeResult(ch), fmt.Sprintf("%v", ch); got != want {
 		t.Fatalf("unmarshalable result must fall back to %%v, got %q want %q", got, want)
+	}
+}
+
+// The summaries are embedded in IM replies, so a truncation must never split a
+// multi-byte rune: cutting on a byte offset left invalid UTF-8 in the notice
+// the whole group chat receives.
+func TestSummarizeTruncatesOnRuneBoundaries(t *testing.T) {
+	cases := []json.RawMessage{
+		json.RawMessage(strings.Repeat("汉", 100)),                  // 300 bytes: the cap lands mid-rune
+		json.RawMessage(strings.Repeat("a", 199) + "😀"),            // 4-byte rune straddling the cap
+		json.RawMessage(`{"x":"` + strings.Repeat("界", 80) + `"}`), // a cut inside a JSON string
+	}
+	for i, args := range cases {
+		got := summarizeArgs(args)
+		if !utf8.ValidString(got) {
+			t.Fatalf("case %d: truncated args must stay valid UTF-8, got %q", i, got)
+		}
+		if want := 200 + len("…"); len(got) > want {
+			t.Fatalf("case %d: summary must stay within the cap, got %d bytes", i, len(got))
+		}
+		if !strings.HasSuffix(got, "…") {
+			t.Fatalf("case %d: a truncated summary must carry the ellipsis, got %q", i, got)
+		}
+	}
+	if got := summarizeResult(strings.Repeat("汉", 300)); !utf8.ValidString(got) {
+		t.Fatalf("truncated result must stay valid UTF-8, got %q", got)
+	}
+	// A short input passes through untouched.
+	if got := summarizeArgs(json.RawMessage("汉字")); got != "汉字" {
+		t.Fatalf("a short summary must pass through, got %q", got)
+	}
+}
+
+// truncate steps back off a partial rune instead of emitting half of one.
+func TestTruncateWalksBackOffAPartialRune(t *testing.T) {
+	const s = "abc汉def" // 汉 occupies bytes 3..5
+	for _, tc := range []struct {
+		max  int
+		want string
+	}{
+		{len(s), s},  // no truncation
+		{200, s},     // cap above the length
+		{6, "abc汉…"}, // cut on a rune boundary
+		{5, "abc…"},  // cut inside 汉: walks back
+		{4, "abc…"},  // cut inside 汉: walks back
+		{3, "abc…"},  // cut exactly before 汉
+	} {
+		got := truncate(s, tc.max)
+		if got != tc.want {
+			t.Fatalf("truncate(%q, %d) = %q, want %q", s, tc.max, got, tc.want)
+		}
+		if !utf8.ValidString(got) {
+			t.Fatalf("truncate(%q, %d) produced invalid UTF-8: %q", s, tc.max, got)
+		}
 	}
 }

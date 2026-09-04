@@ -366,7 +366,7 @@ func (a *Assembler) assemble(ctx context.Context, app tenant.AgentApp, t tenant.
 	// filter stays empty — that path is single-tenant dev only.
 	var filter map[string]any
 	if t.ID != "" {
-		filter = map[string]any{"tenant_id": t.ID, "app_id": app.ID}
+		filter = map[string]any{MetadataTenantID: t.ID, MetadataAppID: app.ID}
 	}
 	return NewRunnerProcessor(RunnerConfig{
 		AppName:         app.ID,

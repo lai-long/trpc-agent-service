@@ -469,3 +469,169 @@ func TestGuardedOutputDenySingleAudit(t *testing.T) {
 		t.Fatalf("deny path must not leave an async allow audit, got %+v", evs)
 	}
 }
+
+// The interception notice embeds the raw tool arguments, which no model-side
+// filter ever saw, so it rides the platform redaction checkers like any reply.
+func TestGuardedSignalReplyIsRedacted(t *testing.T) {
+	aud := &fakeAuditor{}
+	ap := NewApprover(nil, testRegistry(), 0) // nil rdb: store disabled, signals work
+	ap.setSignal(approvalScope{"test-app", "dm:mock:u1"}, Signal{
+		Kind: "created", ToolName: "op_a", Args: `{"x":"13800138000"}`,
+		Deadline: time.Now().Add(5 * time.Minute), Fresh: true,
+	})
+	g := &Guarded{
+		Inner: EchoProcessor{}, Approver: ap, Auditor: aud,
+		Output: []OutputChecker{RedactOutput()},
+	}
+	out, err := g.Process(context.Background(), testMsg("执行操作"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.Text, "危险操作") || !strings.Contains(out.Text, "op_a") {
+		t.Fatalf("want the confirmation notice, got %q", out.Text)
+	}
+	if strings.Contains(out.Text, "13800138000") {
+		t.Fatalf("the phone number in the tool args must be redacted, got %q", out.Text)
+	}
+	// The interception is still audited as a review.
+	evs := aud.syncDecisions()
+	if len(evs) != 1 || evs[0].Decision != "review" || evs[0].ToolName != "op_a" {
+		t.Fatalf("want one sync review for op_a, got %+v", evs)
+	}
+}
+
+// The notice also rides the tenant's output denylist. A hit replaces it and
+// becomes the message's single terminal audit, naming the intercepted tool:
+// the review row would otherwise be written for a reply the user never got.
+func TestGuardedSignalReplyHitsOutputDenyWords(t *testing.T) {
+	aud := &fakeAuditor{}
+	ap := NewApprover(nil, testRegistry(), 0)
+	ap.setSignal(approvalScope{"test-app", "dm:mock:u1"}, Signal{
+		Kind: "created", ToolName: "op_a", Args: `{"x":"内部名单"}`,
+		Deadline: time.Now().Add(5 * time.Minute), Fresh: true,
+	})
+	g := &Guarded{
+		Inner: EchoProcessor{}, Approver: ap, Auditor: aud,
+		PolicyFor: policyStub(tenant.GuardrailPolicy{OutputDenyWords: []string{"内部"}}),
+	}
+	out, err := g.Process(context.Background(), testMsg("执行操作"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Text != outputDeniedReply {
+		t.Fatalf("the notice must trip the tenant denylist, got %q", out.Text)
+	}
+	evs := aud.syncDecisions()
+	if len(evs) != 1 || evs[0].Decision != "deny" ||
+		evs[0].ErrorType != "sensitive_output" || evs[0].ToolName != "op_a" {
+		t.Fatalf("want one sync deny/sensitive_output naming op_a, got %+v", evs)
+	}
+	if n := len(aud.asyncDecisions()); n != 0 {
+		t.Fatalf("the deny path must not leave an async allow row, got %d", n)
+	}
+}
+
+// The degraded path composes the same notice after a model failure, so it is
+// filtered the same way.
+func TestGuardedModelErrorSignalReplyIsFiltered(t *testing.T) {
+	aud := &fakeAuditor{}
+	ap := NewApprover(nil, testRegistry(), 0)
+	ap.setSignal(approvalScope{"test-app", "dm:mock:u1"}, Signal{
+		Kind: "created", ToolName: "op_a", Args: `{"x":"内部名单"}`,
+		Deadline: time.Now().Add(5 * time.Minute), Fresh: true,
+	})
+	g := &Guarded{
+		Inner:     failProcessor{err: &ModelError{Err: errors.New("boom")}},
+		Approver:  ap,
+		Auditor:   aud,
+		PolicyFor: policyStub(tenant.GuardrailPolicy{OutputDenyWords: []string{"内部"}}),
+	}
+	out, err := g.Process(context.Background(), testMsg("执行操作"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Text != outputDeniedReply {
+		t.Fatalf("the degraded-path notice must be filtered too, got %q", out.Text)
+	}
+	evs := aud.syncDecisions()
+	if len(evs) != 1 || evs[0].Decision != "deny" || evs[0].ToolName != "op_a" {
+		t.Fatalf("want one sync deny naming op_a, got %+v", evs)
+	}
+}
+
+// The approval answer embeds the tool's raw result, so it rides the tenant
+// output denylist as well as the platform checkers. The tool really ran, so the
+// execution decision stays the audit row and the redaction folds into it
+// instead of adding a second terminal audit for one message.
+func TestGuardedApprovalAnswerHitsOutputDenyWords(t *testing.T) {
+	ap, rdb := approverForTest(t)
+	sessionKey := "test:approval:" + t.Name()
+	t.Cleanup(func() { rdb.Del(context.Background(), approvalKey(approvalScope{"test-app", sessionKey})) })
+
+	if _, err := ap.BeforeTool(invocationCtx(sessionKey, "u1"), toolArgs("c1", "op_a", `{"x":"内部名单"}`)); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = ap.TakeSignal(approvalScope{"test-app", sessionKey})
+
+	aud := &fakeAuditor{}
+	g := &Guarded{
+		Inner: EchoProcessor{}, Approver: ap, Auditor: aud,
+		PolicyFor: policyStub(tenant.GuardrailPolicy{OutputDenyWords: []string{"内部"}}),
+	}
+	msg := testMsg("确认")
+	msg.SessionKey = sessionKey
+	out, err := g.Process(context.Background(), msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Text != outputDeniedReply {
+		t.Fatalf("the tool result must not reach the chat, got %q", out.Text)
+	}
+	evs := aud.syncDecisions()
+	if len(evs) != 1 || evs[0].Decision != "allow" ||
+		evs[0].ToolName != "op_a" || evs[0].ErrorType != "sensitive_output" {
+		t.Fatalf("want one sync allow/op_a row carrying the redaction, got %+v", evs)
+	}
+}
+
+// A user dropped from the tenant allowlist must not be able to confirm a
+// dangerous call that was intercepted while they were still on it: the answer
+// branch used to run ahead of the allowlist gate.
+func TestGuardedAllowlistBlocksApprovalAnswer(t *testing.T) {
+	ap, rdb := approverForTest(t)
+	sessionKey := "test:approval:" + t.Name()
+	t.Cleanup(func() { rdb.Del(context.Background(), approvalKey(approvalScope{"test-app", sessionKey})) })
+
+	if _, err := ap.BeforeTool(invocationCtx(sessionKey, "u1"), toolArgs("c1", "op_a", `{"x":"1"}`)); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = ap.TakeSignal(approvalScope{"test-app", sessionKey})
+
+	aud := &fakeAuditor{}
+	g := &Guarded{
+		Inner: EchoProcessor{}, Approver: ap, Auditor: aud,
+		PolicyFor: policyStub(tenant.GuardrailPolicy{InputAllowUsers: []string{"vip-user"}}),
+	}
+	msg := testMsg("确认")
+	msg.SessionKey = sessionKey
+	out, err := g.Process(context.Background(), msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.Text, "权限") {
+		t.Fatalf("a de-allowlisted user must be refused, got %q", out.Text)
+	}
+	evs := aud.syncDecisions()
+	if len(evs) != 1 || evs[0].Decision != "deny" || evs[0].ErrorType != "user_not_allowed" {
+		t.Fatalf("want one sync deny/user_not_allowed, got %+v", evs)
+	}
+	// Answer consumes the pending record before executing, so its survival is
+	// the proof that the tool never ran.
+	p, err := ap.pending(context.Background(), approvalScope{"test-app", sessionKey})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p == nil {
+		t.Fatal("the pending approval must survive a refused answer")
+	}
+}
