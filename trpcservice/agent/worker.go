@@ -53,6 +53,7 @@ func (EchoProcessor) Process(_ context.Context, msg channels.InboundMessage) (ch
 		UserID:     msg.UserID,
 		ChatID:     msg.ChatID,
 		BindingID:  msg.BindingID,
+		ReplyToken: msg.ReplyToken,
 		Text:       "echo: " + msg.Text,
 		TenantID:   msg.TenantID,
 		TraceID:    msg.TraceID,

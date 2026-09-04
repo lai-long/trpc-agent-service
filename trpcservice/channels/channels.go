@@ -32,6 +32,7 @@ type InboundMessage struct {
 	MediaRef    string    // TypeMedia: artifact reference of the fetched media
 	WebhookPath string    // callback path the message arrived on; routes to tenant/app
 	BindingID   string    // channel_binding row serving this callback, stamped by the Gateway; scopes the per-binding idempotency keys (done:/sent:)
+	ReplyToken  string    // platform reply credential (wecomws: the callback frame's headers.req_id, passed through verbatim on reply); other channels leave it empty
 	TenantID    string    // owning tenant UUID, stamped by the Gateway
 	AppID       string    // owning agent app UUID, stamped by the Gateway
 	TraceID     string    // trace ID, spanning callback → Worker → reply
@@ -75,7 +76,8 @@ type OutboundMessage struct {
 	UserID      string // recipient (required for direct chats)
 	ChatID      string // recipient group (required for group chats)
 	Text        string
-	BindingID   string // channel_binding row the inbound arrived on, carried for the sent: idempotency key
+	BindingID   string // channel_binding row the inbound arrived on, carried for the sent: idempotency key; wecomws Send locates the connection by it
+	ReplyToken  string // platform reply credential carried through from the inbound (wecomws: headers.req_id); other channels leave it empty
 	TenantID    string // owning tenant UUID, carried through for sender metrics
 	TraceID     string
 	TraceParent string // W3C traceparent, carried through to the outbound span
@@ -140,6 +142,25 @@ type MediaStore interface {
 	SaveMedia(ctx context.Context, channel, msgID, filename, mimeType string, data []byte) (ref string, err error)
 }
 
+// SplitText breaks s into segments of at most n bytes, on rune boundaries
+// (never splitting inside a UTF-8 sequence). Channels with a per-message
+// size limit send the segments sequentially.
+func SplitText(s string, n int) []string {
+	if len(s) <= n {
+		return []string{s}
+	}
+	var out []string
+	for len(s) > n {
+		cut := n
+		for cut > 0 && (s[cut]&0xC0) == 0x80 { // don't split inside a UTF-8 sequence
+			cut--
+		}
+		out = append(out, s[:cut])
+		s = s[cut:]
+	}
+	return append(out, s)
+}
+
 // SessionKey builds the unique conversation key:
 //   - direct chat: dm:{channel}:{user_id} — a user reuses one session across days
 //   - group chat: group:{channel}:{chat_id} — the bot's context is shared per group
@@ -190,6 +211,18 @@ type Channel interface {
 	// Send calls the IM proactive-send API (wecom message/send, wechat kf
 	// messages, etc.) to deliver the reply to the user.
 	Send(ctx context.Context, msg OutboundMessage) error
+}
+
+// Starter is implemented by channels owning long-lived connections (e.g.
+// wecomws WebSocket): Start blocks until ctx is canceled, running the
+// connections and their reconnect loops; a nil return means a clean
+// shutdown. Regular adapters are unaffected — a type assertion at the
+// assembly site decides whether a channel is started.
+type Starter interface {
+	Channel
+	// Start blocks until ctx is canceled, running long-lived connections
+	// and reconnect loops; nil return means clean shutdown.
+	Start(ctx context.Context, h Handler) error
 }
 
 // BindingCredentials carries one channel_binding row's callback verification

@@ -43,8 +43,8 @@ func e2eAttr(msg OutboundMessage) otelmetric.RecordOption {
 	)
 }
 
-// Sender consumes the outbound stream as part of consumer group "senders" and
-// dispatches each message to the Send of its Channel.
+// Sender consumes the outbound stream as part of a consumer group (Group,
+// default "senders") and dispatches each message to the Send of its Channel.
 //
 // Per-message protocol (outbound idempotency): check the sent: key first and
 // skip already-delivered replies; send; mark sent; only then Ack. A crash
@@ -59,6 +59,19 @@ type Sender struct {
 	Sent     *storage.SentMarker // nil disables outbound idempotency
 	Channels map[string]Channel  // channel name → channel implementation
 	Name     string              // consumer name
+
+	// Group is the consumer group this sender reads; empty means "senders".
+	// A second group (e.g. "senders-ws") partitions stream:outbound by
+	// channel: the main group skips messages it does not own via Skip, and
+	// each group carries its own pending list and reaper.
+	Group string
+	// Skip, when set, marks messages this sender must not deliver — they
+	// belong to another consumer group on the same stream. A skipped message
+	// is acked and dropped here without sending or MarkSent: it must ack,
+	// because an un-acked skip would be reaped, inflate its attempts counter
+	// and eventually dead-letter a perfectly deliverable message. It must
+	// also not consume a rate-limit token nor write the sent: marker.
+	Skip func(msg OutboundMessage) bool
 
 	// Limiter paces sends per {channel}:{tenant_id}; nil disables pacing.
 	// SendQPS/SendBurst are the platform-level bucket shape; SendWait bounds
@@ -88,6 +101,13 @@ func (s *Sender) inStream() string {
 		return s.InStream
 	}
 	return storage.StreamOutbound
+}
+
+func (s *Sender) group() string {
+	if s.Group != "" {
+		return s.Group
+	}
+	return "senders"
 }
 
 func (s *Sender) sendQPS() float64 {
@@ -152,7 +172,7 @@ func (s *Sender) Run(ctx context.Context) error {
 			lastReap = time.Now()
 		}
 
-		msgs, err := s.Stream.Read(ctx, s.inStream(), "senders", s.Name, 10, 2*time.Second)
+		msgs, err := s.Stream.Read(ctx, s.inStream(), s.group(), s.Name, 10, 2*time.Second)
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil
@@ -176,11 +196,11 @@ func (s *Sender) Run(ctx context.Context) error {
 // A message that keeps failing past maxAttempts is dead-lettered so it cannot
 // loop forever.
 func (s *Sender) reap(ctx context.Context) {
-	if err := s.Stream.EnsureGroup(ctx, s.inStream(), "senders"); err != nil {
+	if err := s.Stream.EnsureGroup(ctx, s.inStream(), s.group()); err != nil {
 		plog.Warnf("sender %s ensure group before reap: %v", s.Name, err)
 		return
 	}
-	msgs, err := s.Stream.AutoClaim(ctx, s.inStream(), "senders", s.Name, s.maxIdle(), 50)
+	msgs, err := s.Stream.AutoClaim(ctx, s.inStream(), s.group(), s.Name, s.maxIdle(), 50)
 	if err != nil {
 		plog.Warnf("sender %s autoclaim: %v", s.Name, err)
 		return
@@ -193,7 +213,7 @@ func (s *Sender) reap(ctx context.Context) {
 		}
 		if attempts > s.maxAttempts() {
 			plog.Errorf("sender %s dead-letters %s after %d attempts", s.Name, m.ID, attempts)
-			if err := s.Stream.DeadLetter(ctx, s.inStream(), "senders", m); err != nil {
+			if err := s.Stream.DeadLetter(ctx, s.inStream(), s.group(), m); err != nil {
 				plog.Errorf("sender %s deadletter %s: %v", s.Name, m.ID, err)
 			}
 			continue
@@ -207,7 +227,7 @@ func (s *Sender) handle(ctx context.Context, m storage.Message) {
 	var msg OutboundMessage
 	if err := json.Unmarshal(m.Payload, &msg); err != nil {
 		plog.Errorf("sender %s drop poison message %s: %v", s.Name, m.ID, err)
-		_ = s.Stream.Ack(ctx, s.inStream(), "senders", m.ID)
+		_ = s.Stream.Ack(ctx, s.inStream(), s.group(), m.ID)
 		return
 	}
 
@@ -220,6 +240,17 @@ func (s *Sender) handle(ctx context.Context, m storage.Message) {
 		attribute.String("session_key", msg.SessionKey),
 	)
 
+	// Another consumer group owns this channel (e.g. wecomws ↔ senders-ws):
+	// ack and step aside before touching the sent: marker, the rate bucket
+	// or the channel registry. The Skip-ack above all else also keeps the
+	// attempts counter (shared across groups, key carries no group) from
+	// being inflated for a message this group will never deliver.
+	if s.Skip != nil && s.Skip(msg) {
+		metrics.OutboundTotal.Add(ctx, 1, sendAttr(msg, "skipped_other_group"))
+		_ = s.Stream.Ack(ctx, s.inStream(), s.group(), m.ID)
+		return
+	}
+
 	// Already delivered (sent but un-acked in a previous life): skip the send.
 	if s.Sent != nil && msg.MsgID != "" {
 		sent, err := s.Sent.IsSent(ctx, msg.Channel, msg.BindingID, msg.MsgID)
@@ -230,7 +261,7 @@ func (s *Sender) handle(ctx context.Context, m storage.Message) {
 		if sent {
 			plog.Infof("sender %s skip already-sent reply for msg %s", s.Name, msg.MsgID)
 			metrics.OutboundTotal.Add(ctx, 1, sendAttr(msg, "skipped_duplicate"))
-			_ = s.Stream.Ack(ctx, s.inStream(), "senders", m.ID)
+			_ = s.Stream.Ack(ctx, s.inStream(), s.group(), m.ID)
 			return
 		}
 	}
@@ -240,7 +271,7 @@ func (s *Sender) handle(ctx context.Context, m storage.Message) {
 		// An unknown channel is a configuration error, not a retryable
 		// failure: Ack, drop and alert.
 		plog.Errorf("sender %s: no channel named %q, drop %s", s.Name, msg.Channel, m.ID)
-		_ = s.Stream.Ack(ctx, s.inStream(), "senders", m.ID)
+		_ = s.Stream.Ack(ctx, s.inStream(), s.group(), m.ID)
 		return
 	}
 
@@ -295,7 +326,7 @@ func (s *Sender) handle(ctx context.Context, m storage.Message) {
 			return
 		}
 	}
-	if err := s.Stream.Ack(ctx, s.inStream(), "senders", m.ID); err != nil {
+	if err := s.Stream.Ack(ctx, s.inStream(), s.group(), m.ID); err != nil {
 		plog.Warnf("sender %s ack %s: %v", s.Name, m.ID, err)
 	}
 	zap.L().Debug("outbound delivered",

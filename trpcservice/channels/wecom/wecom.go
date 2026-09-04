@@ -558,18 +558,8 @@ func (c *Channel) invalidateToken() {
 }
 
 // splitText breaks s into segments of at most n bytes, on rune boundaries.
+// The implementation lives in the channels package (channels.SplitText) so
+// other size-limited channels share it.
 func splitText(s string, n int) []string {
-	if len(s) <= n {
-		return []string{s}
-	}
-	var out []string
-	for len(s) > n {
-		cut := n
-		for cut > 0 && (s[cut]&0xC0) == 0x80 { // don't split inside a UTF-8 sequence
-			cut--
-		}
-		out = append(out, s[:cut])
-		s = s[cut:]
-	}
-	return append(out, s)
+	return channels.SplitText(s, n)
 }

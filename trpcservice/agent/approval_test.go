@@ -259,7 +259,7 @@ func TestApprovalCrossAppIsolation(t *testing.T) {
 		t.Fatalf("app-a dangerous call must be pended: res=%v err=%v", res, err)
 	}
 
-	// Tenant B's user sends "确认" for the same session key: no pending record
+	// Tenant B's user sends the confirm keyword for the same session key: no pending record
 	// is visible in B's scope, so the answer passes through untouched.
 	msg := testMsg("确认")
 	msg.AppID = "app-b"

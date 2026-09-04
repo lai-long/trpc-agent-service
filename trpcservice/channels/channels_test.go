@@ -1,6 +1,7 @@
 package channels
 
 import (
+	"context"
 	"errors"
 	"net/url"
 	"strings"
@@ -16,6 +17,10 @@ func TestRenderPlain(t *testing.T) {
 	// Plain text passes through untouched.
 	if got := RenderPlain("纯文本，没有标记"); got != "纯文本，没有标记" {
 		t.Fatalf("plain text must pass through: %q", got)
+	}
+	// A '[' that never forms [text](url) survives verbatim.
+	if got := RenderPlain("见 [未闭合 和 ](畸形"); got != "见 [未闭合 和 ](畸形" {
+		t.Fatalf("unclosed bracket must survive: %q", got)
 	}
 }
 
@@ -42,5 +47,93 @@ func TestScrubError(t *testing.T) {
 	plain := errors.New("plain")
 	if ScrubError(plain) != plain {
 		t.Fatal("non-url error must pass through unchanged")
+	}
+}
+
+// SplitText breaks long text into ≤n-byte segments without ever cutting
+// inside a UTF-8 sequence.
+func TestSplitText(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		n    int
+		want []string
+	}{
+		{"short", "hello", 10, []string{"hello"}},
+		{"exact fit", "hello", 5, []string{"hello"}},
+		{"ascii split", "hello", 2, []string{"he", "ll", "o"}},
+		{"empty", "", 4, []string{""}},
+		// Each 中文 rune is 3 bytes: n=3 yields one rune per segment, and the
+		// segments reassemble losslessly.
+		{"cjk", "中文中文", 3, []string{"中", "文", "中", "文"}},
+		{"cjk multi-rune chunks", "中文中文", 6, []string{"中文", "中文"}},
+		// 4-byte emoji with n on the boundary.
+		{"emoji boundary", "🚀🚀", 4, []string{"🚀", "🚀"}},
+		// The cut walks back to the rune boundary behind it.
+		{"emoji cut walks back", "a🚀b", 4, []string{"a", "🚀", "b"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := SplitText(tc.in, tc.n)
+			if len(got) != len(tc.want) {
+				t.Fatalf("SplitText(%q, %d):\n got %#v\nwant %#v", tc.in, tc.n, got, tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Fatalf("SplitText(%q, %d):\n got %#v\nwant %#v", tc.in, tc.n, got, tc.want)
+				}
+			}
+			// The segments must reassemble the input losslessly.
+			var joined strings.Builder
+			for _, s := range got {
+				joined.WriteString(s)
+			}
+			if joined.String() != tc.in {
+				t.Fatalf("segments do not reassemble: %q != %q", joined.String(), tc.in)
+			}
+		})
+	}
+}
+
+// SessionKey: direct chats key on the user, group chats key on the chat.
+func TestSessionKey(t *testing.T) {
+	cases := []struct {
+		channel, user, chat, want string
+	}{
+		{"wecom", "u1", "", "dm:wecom:u1"},
+		{"mock", "external-42", "", "dm:mock:external-42"},
+		{"wecom", "u1", "chat-9", "group:wecom:chat-9"},
+		{"wxkf", "", "chat-9", "group:wxkf:chat-9"}, // chatID wins over a missing user
+	}
+	for _, tc := range cases {
+		if got := SessionKey(tc.channel, tc.user, tc.chat); got != tc.want {
+			t.Fatalf("SessionKey(%q, %q, %q) = %q, want %q", tc.channel, tc.user, tc.chat, got, tc.want)
+		}
+	}
+}
+
+// HandlerFunc turns a plain function into a Handler.
+func TestHandlerFunc(t *testing.T) {
+	var got InboundMessage
+	h := HandlerFunc(func(_ context.Context, msg InboundMessage) (OutboundMessage, error) {
+		got = msg
+		return OutboundMessage{Text: "pong", Channel: msg.Channel}, nil
+	})
+	out, err := h.Handle(context.Background(), InboundMessage{Channel: "mock", Text: "ping"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Text != "ping" || got.Channel != "mock" {
+		t.Fatalf("handler did not receive the message: %+v", got)
+	}
+	if out.Text != "pong" {
+		t.Fatalf("unexpected outbound: %+v", out)
+	}
+
+	_, err = HandlerFunc(func(context.Context, InboundMessage) (OutboundMessage, error) {
+		return OutboundMessage{}, errors.New("nope")
+	}).Handle(context.Background(), InboundMessage{})
+	if err == nil {
+		t.Fatal("the wrapped error must surface")
 	}
 }

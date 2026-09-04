@@ -151,6 +151,7 @@ func (p *RunnerProcessor) Process(ctx context.Context, msg channels.InboundMessa
 		UserID:     msg.UserID,
 		ChatID:     msg.ChatID,
 		BindingID:  msg.BindingID,
+		ReplyToken: msg.ReplyToken,
 		TenantID:   msg.TenantID,
 		TraceID:    msg.TraceID,
 		Model:      p.model,
