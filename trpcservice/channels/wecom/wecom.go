@@ -211,6 +211,7 @@ func (c *Channel) verifyURL(w http.ResponseWriter, r *http.Request, crypt *wxbiz
 		http.Error(w, "verification failed", http.StatusForbidden)
 		return
 	}
+	//nolint:gosec // G705: echo is the platform-challenge plaintext, verified and decrypted above
 	_, _ = w.Write(echo)
 }
 
@@ -232,6 +233,7 @@ func (c *Channel) receive(w http.ResponseWriter, r *http.Request, crypt *wxbizms
 	}
 
 	var cm callbackMessage
+	//nolint:gosec // G709: plain is the signature-verified, decrypted platform callback
 	if err := xml.Unmarshal(plain, &cm); err != nil {
 		plog.Warnf("wecom parse callback xml: %v", err)
 		writeSuccess(w)

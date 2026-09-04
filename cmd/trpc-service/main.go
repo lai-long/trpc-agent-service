@@ -161,10 +161,9 @@ func serve(role string) error {
 
 	// Worker-side infrastructure: session backends, artifact store, processor.
 	var (
-		sessByType       map[string]session.Service
-		defaultSess      string
-		processor        agent.Processor = agent.EchoProcessor{}
-		processorCleanup                 = func() {}
+		sessByType  map[string]session.Service
+		defaultSess string
+		processor   agent.Processor = agent.EchoProcessor{}
 	)
 	// Artifact storage (S3-compatible, MinIO locally): the gateway's media
 	// sink and the worker's runner artifact service share one instance.
@@ -183,6 +182,7 @@ func serve(role string) error {
 				_ = s.Close()
 			}
 		}()
+		var processorCleanup func()
 		processor, processorCleanup = buildProcessor(ctx, cfg, rdb, auditor, pgPool, kb, resolver, sessByType, defaultSess, artifacts, secrets)
 		defer processorCleanup()
 	} else {

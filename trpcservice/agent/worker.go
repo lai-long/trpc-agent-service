@@ -298,6 +298,7 @@ func (w *Worker) handle(ctx context.Context, m storage.Message) {
 	metrics.InjectTraceparent(ctx, carrier)
 	out.TraceParent = carrier.Get("traceparent")
 
+	//nolint:gosec // G117: SessionKey is a routing key on the internal stream, not a credential
 	payload, err := json.Marshal(out)
 	if err != nil {
 		plog.Errorf("worker %s marshal outbound: %v", w.Name, err)

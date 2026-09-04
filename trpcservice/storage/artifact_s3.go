@@ -181,7 +181,7 @@ func (s *S3ArtifactService) LoadArtifact(ctx context.Context, sessionInfo artifa
 	if err != nil {
 		return nil, fmt.Errorf("s3 artifact: get %s v%d: %w", filename, target, err)
 	}
-	defer obj.Close()
+	defer func() { _ = obj.Close() }()
 	// GetObject defers most errors to the first read; Stat surfaces a
 	// missing key here.
 	stat, err := obj.Stat()

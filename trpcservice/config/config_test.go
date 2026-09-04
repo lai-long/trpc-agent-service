@@ -10,7 +10,7 @@ import (
 func TestLoadDefaults(t *testing.T) {
 	for _, k := range []string{"TRPC_HTTP_ADDR", "TRPC_PG_DSN", "TRPC_REDIS_ADDR",
 		"TRPC_LOG_LEVEL", "TRPC_LOG_FORMAT", "TRPC_SECRETS_DIR"} {
-		os.Unsetenv(k)
+		_ = os.Unsetenv(k)
 	}
 
 	cfg := Load()
@@ -41,7 +41,7 @@ func TestLoadFromEnv(t *testing.T) {
 // TestMockChannelDefaultsOff pins the secure default: the mock callback is an
 // unauthenticated message injector, so it takes an explicit opt-in.
 func TestMockChannelDefaultsOff(t *testing.T) {
-	os.Unsetenv("TRPC_MOCK_CHANNEL")
+	_ = os.Unsetenv("TRPC_MOCK_CHANNEL")
 	if got := Load().MockChannel; got != "false" {
 		t.Errorf("MockChannel default = %q, want false", got)
 	}
@@ -51,7 +51,7 @@ func TestMockChannelDefaultsOff(t *testing.T) {
 // internal only, so reaching it beyond the host takes an explicit
 // TRPC_ADMIN_ADDR.
 func TestAdminAddrDefaultsLoopback(t *testing.T) {
-	os.Unsetenv("TRPC_ADMIN_ADDR")
+	_ = os.Unsetenv("TRPC_ADMIN_ADDR")
 	if got := Load().AdminAddr; got != "127.0.0.1:8081" {
 		t.Errorf("AdminAddr default = %q, want 127.0.0.1:8081", got)
 	}
@@ -61,7 +61,7 @@ func TestAdminAddrDefaultsLoopback(t *testing.T) {
 // derivation: an explicit env list wins (trimmed, lowercased), otherwise the
 // host of the platform's own default endpoint.
 func TestModelHostAllowlist(t *testing.T) {
-	os.Unsetenv("TRPC_MODEL_BASE_URL_ALLOW")
+	_ = os.Unsetenv("TRPC_MODEL_BASE_URL_ALLOW")
 	if got := Load().ModelHostAllowlist(); len(got) != 1 || got[0] != "api.deepseek.com" {
 		t.Errorf("default allowlist = %v, want [api.deepseek.com]", got)
 	}

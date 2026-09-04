@@ -42,7 +42,7 @@ func (f *fakeKfAPI) handler() http.Handler {
 			return
 		}
 		if f.rejectErrcode != 0 {
-			_, _ = w.Write([]byte(fmt.Sprintf(`{"errcode":%d,"errmsg":"rejected"}`, f.rejectErrcode)))
+			_, _ = fmt.Fprintf(w, `{"errcode":%d,"errmsg":"rejected"}`, f.rejectErrcode)
 			return
 		}
 		_, _ = w.Write([]byte(`{"errcode":0,"errmsg":"ok"}`))

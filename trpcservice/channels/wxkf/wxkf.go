@@ -209,6 +209,7 @@ func (c *Channel) verifyURL(w http.ResponseWriter, r *http.Request, crypt *wxbiz
 		http.Error(w, "verification failed", http.StatusForbidden)
 		return
 	}
+	//nolint:gosec // G705: echo is the platform-challenge plaintext, verified and decrypted above
 	_, _ = w.Write(echo)
 }
 

@@ -211,7 +211,7 @@ func (a *Auditor) insert(ctx context.Context, events []AuditEvent) error {
 		)
 	}
 	results := a.pool.SendBatch(ctx, batch)
-	defer results.Close()
+	defer func() { _ = results.Close() }()
 	for range events {
 		if _, err := results.Exec(); err != nil {
 			return fmt.Errorf("insert audit_log: %w", err)

@@ -204,7 +204,8 @@ func (p *RunnerProcessor) Process(ctx context.Context, msg channels.InboundMessa
 // retryBackoff sleeps 500ms * 2^(attempt-1) with ±50% jitter, bounded at 8s.
 // attempt starts at 1 for the first retry; a canceled context returns early.
 func retryBackoff(ctx context.Context, attempt int) error {
-	base := 500 * time.Millisecond << min(attempt-1, 4)                              // capped at 8s
+	base := 500 * time.Millisecond << min(attempt-1, 4) // capped at 8s
+	//nolint:gosec // G404: retry jitter needs no cryptographic randomness
 	jitter := time.Duration(rand.Int64N(int64(base))) - time.Duration(int64(base)/2) // ±50%
 	delay := base + jitter
 	if delay < 0 {
@@ -251,14 +252,14 @@ func (p *RunnerProcessor) runOnce(ctx context.Context, msg channels.InboundMessa
 			runErr = errors.New(evt.Error.Message)
 			continue
 		}
-		if evt.Response != nil && evt.Response.Usage != nil {
-			usage.prompt += evt.Response.Usage.PromptTokens
-			usage.completion += evt.Response.Usage.CompletionTokens
-			metrics.TokensTotal.Add(ctx, int64(evt.Response.Usage.PromptTokens), tokenAttr(msg.TenantID, "prompt"))
-			metrics.TokensTotal.Add(ctx, int64(evt.Response.Usage.CompletionTokens), tokenAttr(msg.TenantID, "completion"))
+		if evt.Response != nil && evt.Usage != nil {
+			usage.prompt += evt.Usage.PromptTokens
+			usage.completion += evt.Usage.CompletionTokens
+			metrics.TokensTotal.Add(ctx, int64(evt.Usage.PromptTokens), tokenAttr(msg.TenantID, "prompt"))
+			metrics.TokensTotal.Add(ctx, int64(evt.Usage.CompletionTokens), tokenAttr(msg.TenantID, "completion"))
 		}
-		if evt.IsFinalResponse() && evt.Response != nil && len(evt.Response.Choices) > 0 {
-			reply.WriteString(evt.Response.Choices[0].Message.Content)
+		if evt.IsFinalResponse() && evt.Response != nil && len(evt.Choices) > 0 {
+			reply.WriteString(evt.Choices[0].Message.Content)
 		}
 	}
 	if reply.Len() > 0 {

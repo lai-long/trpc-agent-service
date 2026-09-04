@@ -173,6 +173,7 @@ func (h EnqueueHandler) Handle(ctx context.Context, msg channels.InboundMessage)
 		}
 	}
 
+	//nolint:gosec // G117: SessionKey is a routing key on the internal stream, not a credential
 	payload, err := json.Marshal(msg)
 	if err != nil {
 		rollbackDedup()

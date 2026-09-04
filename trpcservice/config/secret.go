@@ -34,6 +34,7 @@ func (r *FileResolver) Resolve(_ context.Context, ref string) (string, error) {
 	if ref == "" || ref != filepath.Base(ref) {
 		return "", fmt.Errorf("invalid secret ref %q", ref)
 	}
+	//nolint:gosec // G304: ref is validated as a bare file name above (no traversal)
 	data, err := os.ReadFile(filepath.Join(r.dir, ref))
 	if err != nil {
 		return "", fmt.Errorf("resolve secret %q: %w", ref, err)
