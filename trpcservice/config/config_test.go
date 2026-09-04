@@ -57,6 +57,22 @@ func TestAdminAddrDefaultsLoopback(t *testing.T) {
 	}
 }
 
+// TestMetricsAddrDefault pins the internal metrics listener address. It is a
+// contract with artifacts no compiler checks: deploy/prometheus/prometheus.yml
+// scrapes this port and the k8s manifests point their probes at containerPort
+// 8082, so a silent default change would break scraping and rollouts while
+// every build stayed green.
+func TestMetricsAddrDefault(t *testing.T) {
+	_ = os.Unsetenv("TRPC_METRICS_ADDR")
+	if got := Load().MetricsAddr; got != ":8082" {
+		t.Errorf("MetricsAddr default = %q, want :8082", got)
+	}
+	t.Setenv("TRPC_METRICS_ADDR", "127.0.0.1:9099")
+	if got := Load().MetricsAddr; got != "127.0.0.1:9099" {
+		t.Errorf("MetricsAddr = %q, want the TRPC_METRICS_ADDR value", got)
+	}
+}
+
 // TestModelHostAllowlist covers the platform model-endpoint allowlist
 // derivation: an explicit env list wins (trimmed, lowercased), otherwise the
 // host of the platform's own default endpoint.

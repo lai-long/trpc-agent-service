@@ -222,7 +222,6 @@ func serve(role string) error {
 			DefaultBurst: parseInt(cfg.GatewayRateBurst, 100),
 		}
 		mux := http.NewServeMux()
-		mux.Handle("GET /metrics", metricsHandler)
 
 		// Channel registry for the outbound sender: mock (only when enabled —
 		// it is an unauthenticated injector, TRPC_MOCK_CHANNEL=false in prod),
@@ -383,29 +382,6 @@ func serve(role string) error {
 				parseDuration(cfg.MigrationObserve, 24*time.Hour))
 			g.Go(func() error { migrator.Run(gctx); return nil })
 		}
-
-		// A split worker still exports metrics on its own listener. The
-		// listener is auxiliary: a bind failure (e.g. colocated gateway on
-		// the same address in local dev) must not kill the worker.
-		if role == "worker" {
-			mux := http.NewServeMux()
-			mux.Handle("GET /metrics", metricsHandler)
-			srv := &http.Server{Addr: cfg.WorkerAddr, Handler: mux,
-				ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second}
-			g.Go(func() error {
-				zap.L().Info("worker metrics listening", zap.String("addr", cfg.WorkerAddr))
-				if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-					plog.Warnf("worker metrics listener failed (metrics off): %v", err)
-				}
-				return nil
-			})
-			g.Go(func() error {
-				<-gctx.Done()
-				shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				defer cancel()
-				return srv.Shutdown(shutdownCtx)
-			})
-		}
 	}
 
 	// --- Admin role: management API + housekeeping --------------------------
@@ -421,9 +397,10 @@ func serve(role string) error {
 			// The admin API always gets its own listener (TRPC_ADMIN_ADDR):
 			// the gateway listener faces the IM platforms (public), the admin
 			// listener must not (mTLS optional). In
-			// all-in-one mode this moves the admin API off :8080 too.
+			// all-in-one mode this moves the admin API off :8080 too. This mux
+			// carries nothing but /admin/* — every route on it is token-gated,
+			// and /metrics lives on the internal metrics listener below.
 			adminMux := http.NewServeMux()
-			adminMux.Handle("GET /metrics", metricsHandler)
 			srv := &http.Server{Addr: cfg.AdminAddr, Handler: adminMux,
 				ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second}
 			tlsCfg, err := adminTLSConfig(cfg)
@@ -462,6 +439,32 @@ func serve(role string) error {
 			g.Go(func() error { archiver.Run(gctx); return nil })
 		}
 	}
+
+	// Metrics ride their own internal listener in every role. The gateway's
+	// callback mux faces the IM platforms, and these series carry per-tenant
+	// traffic volumes, token spend and queue depth — reconnaissance material
+	// for anyone who can reach the callbacks. Not token-gated either: the
+	// deployment's own liveness/readiness probes scrape this endpoint. The
+	// listener is auxiliary, so a bind failure (a second role colocated on the
+	// same address in local dev) leaves metrics off instead of taking the
+	// process down.
+	metricsMux := http.NewServeMux()
+	metricsMux.Handle("GET /metrics", metricsHandler)
+	metricsSrv := &http.Server{Addr: cfg.MetricsAddr, Handler: metricsMux,
+		ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second}
+	g.Go(func() error {
+		zap.L().Info("metrics listening", zap.String("addr", cfg.MetricsAddr))
+		if err := metricsSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			plog.Warnf("metrics listener failed (metrics off): %v", err)
+		}
+		return nil
+	})
+	g.Go(func() error {
+		<-gctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		return metricsSrv.Shutdown(shutdownCtx)
+	})
 
 	// Queue depth / pending gauges feeding the alerts.
 	metrics.StartStreamCollector(gctx, stream, 15*time.Second)

@@ -25,20 +25,22 @@ const AdminTokenDevInsecure = "dev-insecure"
 // Config aggregates the service's own configuration.
 type Config struct {
 	HTTPAddr string // TRPC_HTTP_ADDR: Gateway/HTTP listen address
-	// AdminAddr is the Admin API listen address in split-role deployments
-	// (serve admin); all-in-one shares the gateway listener. Bound to
-	// loopback by default: the Admin API is internal only and a deployment
-	// must opt in explicitly to expose it beyond the host.
+	// AdminAddr is the Admin API listen address. Every role that serves the
+	// Admin API gets this listener of its own, all-in-one included, so the
+	// management surface never shares the gateway's public callback address.
+	// Bound to loopback by default: the Admin API is internal only and a
+	// deployment must opt in explicitly to expose it beyond the host.
 	AdminAddr string // TRPC_ADMIN_ADDR
-	// WorkerAddr is the worker role's metrics listener in split-role
-	// deployments (serve worker); each role needs its own address on a
-	// shared host.
-	WorkerAddr string // TRPC_WORKER_ADDR
-	PGDSN      string // TRPC_PG_DSN: PostgreSQL DSN (required for worker/admin roles)
-	RedisAddr  string // TRPC_REDIS_ADDR: Redis address (required for gateway/worker roles)
-	LogLevel   string // TRPC_LOG_LEVEL: debug/info/warn/error
-	LogFormat  string // TRPC_LOG_FORMAT: "json" for JSON output, anything else for console
-	SecretsDir string // TRPC_SECRETS_DIR: key directory for the local file-based SecretResolver
+	// MetricsAddr is the internal listener every role serves /metrics on.
+	// Deliberately not the gateway's callback address: that listener faces
+	// the IM platforms, and the exported series carry per-tenant traffic
+	// volumes, token spend and queue depth.
+	MetricsAddr string // TRPC_METRICS_ADDR
+	PGDSN       string // TRPC_PG_DSN: PostgreSQL DSN (required for worker/admin roles)
+	RedisAddr   string // TRPC_REDIS_ADDR: Redis address (required for gateway/worker roles)
+	LogLevel    string // TRPC_LOG_LEVEL: debug/info/warn/error
+	LogFormat   string // TRPC_LOG_FORMAT: "json" for JSON output, anything else for console
+	SecretsDir  string // TRPC_SECRETS_DIR: key directory for the local file-based SecretResolver
 
 	ModelBaseURL string // TRPC_MODEL_BASE_URL: OpenAI-compatible endpoint (DeepSeek default)
 	// ModelBaseURLAllow is the platform-level allowlist of model endpoint
@@ -171,14 +173,14 @@ type Config struct {
 // fields at startup and fail fast.
 func Load() Config {
 	return Config{
-		HTTPAddr:   getenv("TRPC_HTTP_ADDR", ":8080"),
-		AdminAddr:  getenv("TRPC_ADMIN_ADDR", "127.0.0.1:8081"),
-		WorkerAddr: getenv("TRPC_WORKER_ADDR", ":8082"),
-		PGDSN:      getenv("TRPC_PG_DSN", "postgres://trpc:trpc-dev-only@localhost:5432/trpc?sslmode=disable"),
-		RedisAddr:  getenv("TRPC_REDIS_ADDR", "localhost:6380"), // host 6379 is often taken by other local services; compose maps 6380
-		LogLevel:   getenv("TRPC_LOG_LEVEL", "info"),
-		LogFormat:  getenv("TRPC_LOG_FORMAT", "console"),
-		SecretsDir: getenv("TRPC_SECRETS_DIR", "data/secrets"),
+		HTTPAddr:    getenv("TRPC_HTTP_ADDR", ":8080"),
+		AdminAddr:   getenv("TRPC_ADMIN_ADDR", "127.0.0.1:8081"),
+		MetricsAddr: getenv("TRPC_METRICS_ADDR", ":8082"),
+		PGDSN:       getenv("TRPC_PG_DSN", "postgres://trpc:trpc-dev-only@localhost:5432/trpc?sslmode=disable"),
+		RedisAddr:   getenv("TRPC_REDIS_ADDR", "localhost:6380"), // host 6379 is often taken by other local services; compose maps 6380
+		LogLevel:    getenv("TRPC_LOG_LEVEL", "info"),
+		LogFormat:   getenv("TRPC_LOG_FORMAT", "console"),
+		SecretsDir:  getenv("TRPC_SECRETS_DIR", "data/secrets"),
 
 		ModelBaseURL:      getenv("TRPC_MODEL_BASE_URL", "https://api.deepseek.com"),
 		ModelBaseURLAllow: getenv("TRPC_MODEL_BASE_URL_ALLOW", ""),

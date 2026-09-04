@@ -23,7 +23,7 @@ spec:
             - configMapRef: {name: trpc-service-config}
             - secretRef: {name: trpc-service-infra}
           env:
-            - {name: TRPC_WORKER_ADDR, value: ":8082"}
+            - {name: TRPC_METRICS_ADDR, value: ":8082"}
           ports:
             - {containerPort: 8082, name: metrics}
           securityContext:

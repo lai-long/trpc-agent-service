@@ -884,8 +884,11 @@ Admin 校验：`channel == "wecomws"` 的 binding 创建/更新时，`config` �
 
 Admin API 仅内网可达（`TRPC_ADMIN_ADDR` 默认绑 `127.0.0.1:8081`），鉴权 fail-closed：
 `TRPC_ADMIN_TOKEN` 未设置时拒绝启动（本地开发须显式声明哨兵值 `dev-insecure`）；
-可选用 mTLS（三件套齐备即启用）。mock 通道默认关闭（`TRPC_MOCK_CHANNEL=false`）——
-其回调是无鉴权消息注入器，开启必须显式声明。租户/应用配置中的 `model.base_url` 受
+可选用 mTLS（三件套齐备即启用）。`/metrics` 既不在 Admin 口也不在对外的回调口上：每个
+角色另起一个内网 metrics 监听（`TRPC_METRICS_ADDR`，默认 `:8082`），Prometheus 与 k8s
+探针都抓它——导出的序列带租户维度流量、token 消耗与队列积压，挂在公网可达的回调 mux 上
+等于白送侦察材料；Admin 口上于是只剩逐路由 token 鉴权的 `/admin/*`。mock 通道默认关闭
+（`TRPC_MOCK_CHANNEL=false`）——其回调是无鉴权消息注入器，开启必须显式声明。租户/应用配置中的 `model.base_url` 受
 平台级白名单约束（`TRPC_MODEL_BASE_URL_ALLOW`，默认即平台自身端点的 host）：必须
 https 且 host 精确命中白名单，五条写路径（createTenant / updateTenant / createApp /
 updateApp / publish 事务内）与 Worker 装配时双重校验——会话原文全部流向该端点，

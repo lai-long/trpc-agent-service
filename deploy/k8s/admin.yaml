@@ -24,11 +24,14 @@ spec:
             - {name: TRPC_ADMIN_TOKEN, valueFrom: {secretKeyRef: {name: trpc-admin-token, key: token}}}
           ports:
             - {containerPort: 8081, name: http}
+            # /metrics lives here, not on the admin port: that mux carries
+            # nothing but token-gated /admin/* routes.
+            - {containerPort: 8082, name: metrics}
           securityContext:
             runAsNonRoot: true
             allowPrivilegeEscalation: false
           readinessProbe:
-            httpGet: {path: /metrics, port: http}
+            httpGet: {path: /metrics, port: metrics}
             initialDelaySeconds: 3
             periodSeconds: 10
           resources:

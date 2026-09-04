@@ -21,11 +21,14 @@ spec:
             - secretRef: {name: trpc-service-infra}
           ports:
             - {containerPort: 8080, name: http}
+            # Internal only: not in the Service below, so it never reaches the
+            # LoadBalancer the IM platforms webhook to.
+            - {containerPort: 8082, name: metrics}
           securityContext:
             runAsNonRoot: true
             allowPrivilegeEscalation: false
           readinessProbe:
-            httpGet: {path: /metrics, port: http}
+            httpGet: {path: /metrics, port: metrics}
             initialDelaySeconds: 3
             periodSeconds: 10
           resources:

@@ -7,4 +7,6 @@ rule_files:
 scrape_configs:
   - job_name: trpc-service
     static_configs:
-      - targets: ["host.docker.internal:8080"]
+      # The internal metrics listener (TRPC_METRICS_ADDR). :8080 is the
+      # gateway's public callback port and serves no /metrics.
+      - targets: ["host.docker.internal:8082"]

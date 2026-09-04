@@ -14,7 +14,9 @@
 // carried in the message payload.
 //
 // Metrics export via an in-process Prometheus exporter; the /metrics handler
-// is mounted on the main HTTP mux and scraped by the Prometheus container.
+// is served on the internal metrics listener every role starts
+// (TRPC_METRICS_ADDR), never on the gateway's public callback mux — the
+// series carry per-tenant traffic volumes and token spend.
 package metrics
 
 import (
