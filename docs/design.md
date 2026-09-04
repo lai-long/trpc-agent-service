@@ -519,10 +519,10 @@ PG 要求分区键包含在所有唯一约束中，与 `(session_id, event_seq)`
 |---|---|---|---|---:|---|
 | `stream:inbound` | Stream | `stream:inbound` | 归一化消息 JSON | 队列 MAXLEN 10 万条截断 | Gateway→Worker 入站队列，消费组 `workers` |
 | `stream:outbound` | Stream | `stream:outbound` | 回复消息 JSON | 队列 MAXLEN 10 万条截断 | Worker→Channel Adapter 出站队列，消费组 `senders`（webhook 通道）与 `senders-ws`（wecomws，见 5.3.4） |
-| `dedup:{channel}:{msg_id}` | String | `dedup:wecom:msg123` | `1` 或请求 ID | 24 小时 | 消息幂等 |
-| `lock:sess:{session_id}` | String | `lock:sess:8b3c...` | 请求唯一标识 | 5–10 秒 | 防止并发修改同一会话 |
+| `dedup:{channel}:{binding_id}:{msg_id}` | String | `dedup:wecom:{b1}:msg123` | `1` 或请求 ID | 24 小时 | 消息幂等。binding 维度隔离租户：msg_id 的唯一性由 IM 按 corp/应用保证，同一数字 ID 可合法出现在同通道的两个绑定上 |
+| `lock:sess:{app_id}:{session_id}` | String | `lock:sess:{app}:8b3c...` | 请求唯一标识 | 5–10 秒 | 防止并发修改同一会话。app 维度对齐会话身份 `(app_id, session_key)`：两个租户的用户可能携带相同 `channel:user` 会话键，一个租户的长跑不得排队另一个租户的消息 |
 | `lock:leader:{name}` | String | `lock:leader:wecomws` | owner 标识 | 15 秒（TTL/3 续期） | 平台级单持有者锁（5.3.4 WS 长连接 leader 竞选） |
-| `sent:{channel}:{msg_id}` | String | `sent:wecom:msg123` | IM 返回的消息 ID | 24 小时 | 出站回复幂等，防发送重试造成 IM 侧重复消息。实现注：幂等单元取「入站消息的回复」（一条入站一条回复），比 `{session_id}:{event_seq}` 更贴合出站消费语义，效果等价 |
+| `sent:{channel}:{binding_id}:{msg_id}` | String | `sent:wecom:{b1}:msg123` | IM 返回的消息 ID | 24 小时 | 出站回复幂等，防发送重试造成 IM 侧重复消息（binding 维度同 dedup）。实现注：幂等单元取「入站消息的回复」（一条入站一条回复），比 `{session_id}:{event_seq}` 更贴合出站消费语义，效果等价 |
 
 Session 存储优先复用框架后端（`session/redis` / `session/postgres`），平台不自建会话缓存层。
 框架后端须同时满足三点——`(session_id, event_seq)` 级幂等唯一约束、summary 覆盖游标语义、
@@ -543,7 +543,7 @@ PG 后端落 5.1.3 的 `session_event` / `session` 表（或框架等价表结�
 幂等写入逻辑：
 
 ```text
-SET dedup:{channel}:{msg_id} {request_id} NX EX 86400
+SET dedup:{channel}:{binding_id}:{msg_id} {request_id} NX EX 86400
 返回 OK  → 首次到达，继续处理
 返回 nil → 重复消息，直接丢弃
 ```
@@ -551,12 +551,12 @@ SET dedup:{channel}:{msg_id} {request_id} NX EX 86400
 幂等分三层，职责不同：
 
 - 入口层（`dedup:` key）：只挡 IM 平台的重推。企微/微信的重发通常几秒内到达，但应答失败后的重推间隔可达分钟级（最多 3 次），TTL 取 24h 覆盖全部重试窗口，与出站 `sent:` 对齐。
-- 执行层（`done:{channel}:{msg_id}` 标记 + `(session_id, event_seq)` 唯一约束兜底）：挡 Stream 重投。
+- 执行层（`done:{channel}:{binding_id}:{msg_id}` 标记 + `(session_id, event_seq)` 唯一约束兜底）：挡 Stream 重投。
   Worker 在回复入队出站后写 done 标记（24h）；重投消息（崩溃接管、Ack 丢失）命中标记直接跳过处理——
   因为重投会触发新的 LLM 运行并产生全新的事件 ID，事件唯一约束在这种场景下数学上永远拦不住，
   只能兜住「同一事件对象被重复追加」的最后防线。done 标记才是执行层幂等的真正实现。
 
-出站幂等：出站消费组发送前先查 `sent:{channel}:{msg_id}`（见上表实现注），命中说明已发过，直接 XACK；
+出站幂等：出站消费组发送前先查 `sent:{channel}:{binding_id}:{msg_id}`（见上表实现注），命中说明已发过，直接 XACK；
 未命中则调 IM 发送接口，成功后写入该 key 再 XACK。「发送成功但 ACK 前崩溃」导致的重投
 不会让用户收到重复回复。
 
@@ -693,7 +693,15 @@ Go 并发安全专项（Worker 长进程不泄漏）：
 
 两类通道在回调协议、回复方式和身份体系上差异显著。Channel Adapter 对上层暴露统一的
 归一化消息模型（channel、msg_id、session_key、用户身份、内容类型），差异全部收敛在
-适配器内部：
+适配器内部。
+
+多租户接入（实现注）：回调路由为 `/callback/{channel}/{binding_id}`——网关按绑定 ID 取
+`channel_binding` 行，将请求连同该绑定的 `token_ref` / `aeskey_ref`（corp_id 可经
+`config.corp_id` 覆盖）交给适配器，验签按绑定各自的密钥进行，之后再进入共享的
+路由/限流/护栏管线；启动后新建绑定经快照刷新（TTL + 失效广播）即时可达，无需重启。
+env 配置的 `/{channel}/callback` 旧路径保留为单绑定默认。已知限制：出站发送侧的
+corpsecret 仍取 env 全局配置（适配器无绑定级发送密钥），同一通道多 corp 的回复触达
+为下一步项。
 
 | 维度 | 企业微信 | 微信客服 |
 |---|---|---|
@@ -739,7 +747,7 @@ Guardrail 命中需审批的工具调用时走带内确认，不引入带外审�
 1. Guardrail 拦截工具调用，当前执行轮次收尾：经 Outbound 向用户发送确认消息（工具名、
    参数摘要、有效期），写入待审批记录（工具调用 ID + 截止时间），审计记 `decision=review`，
    随后释放会话锁——挂起期间不持锁，Worker 保持无状态。
-   （实现注：待审批记录存 Redis `approval:{session_key}` 而非 `session.state`——同为节点共享
+   （实现注：待审批记录存 Redis `approval:{app_id}:{session_key}` 而非 `session.state`——键带 app 维度，两个租户的用户即使携带相同 `channel:user` 会话键也互不可见、互不可确认（跨租户越权回归测试覆盖）；同为节点共享
    持久化，但带原生 TTL、无需加载整个 session 即可读，且不占事件序列；语义等价。）
 2. 用户在 IM 内回复「确认/拒绝」：作为普通消息进入同一 `session_key`，分布式锁保证与
    其他执行串行；Worker 检出待审批记录，由 Guardrail 先做答复匹配——
@@ -867,8 +875,15 @@ Admin 校验：`channel == "wecomws"` 的 binding 创建/更新时，`config` �
 
 ### 5.4 Admin API 接口清单
 
-Admin API 仅内网可达，管理端鉴权（网关 mTLS 或 SSO token，按部署环境二选一）；
-所有写操作记审计（操作人、变更前后内容），与风险 9 的变更审计要求一致。核心路由：
+Admin API 仅内网可达（`TRPC_ADMIN_ADDR` 默认绑 `127.0.0.1:8081`），鉴权 fail-closed：
+`TRPC_ADMIN_TOKEN` 未设置时拒绝启动（本地开发须显式声明哨兵值 `dev-insecure`）；
+可选用 mTLS（三件套齐备即启用）。mock 通道默认关闭（`TRPC_MOCK_CHANNEL=false`）——
+其回调是无鉴权消息注入器，开启必须显式声明。租户/应用配置中的 `model.base_url` 受
+平台级白名单约束（`TRPC_MODEL_BASE_URL_ALLOW`，默认即平台自身端点的 host）：必须
+https 且 host 精确命中白名单，五条写路径（createTenant / updateTenant / createApp /
+updateApp / publish 事务内）与 Worker 装配时双重校验——会话原文全部流向该端点，
+端点选择权必须留在平台层。所有写操作记审计（操作人、变更前后内容），与风险 9 的
+变更审计要求一致。核心路由：
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
@@ -981,3 +996,26 @@ Admin API 仅内网可达，管理端鉴权（网关 mTLS 或 SSO token，按部
 - 应用配置回滚：旧版本重新置 `published` + pub/sub 广播失效，秒级生效（见 5.2.3）。
 - 平台版本回滚：Gateway/Worker 无状态，K8s 滚动回退上一镜像；在途消息由 Stream pending 机制交接，不丢。
 - 数据层回滚：schema 变更只做增量（加列、加表、加索引），不做破坏性变更；必须改列时先加新列双写、迁移后删旧列。
+
+### 8.1 已知限制与质量门禁
+
+已知限制（单独立项跟进，不阻塞验收标准）：
+
+1. **出站发送密钥为通道级**：wecom/wxkf 发送侧 corpsecret 取 env 全局配置；同一通道
+   接入多个 corp 时回复触达需补绑定级发送密钥（回调验签已按绑定隔离，见 5.3.1）。
+2. **预算窗口与原子性**：token 预算为「首次使用后 48h 滑动窗」而非自然日，且为消息粒度
+   前置拦截，run 执行中无中断点；Allow/Record 非原子，并发超支可达 N 倍。
+3. **归档表读路径**：`session_event_archive` 只服务 summary 回放（LEFT JOIN），事件流
+   重放不读归档表——存活超 30 天且无 summary 的会话历史不可重放（只增不减的合规审计
+   数据在归档表中完整保留）。
+4. **回调链路无 Handler 超时**：依赖 ReadTimeout/IdleTimeout 兜底；Redis 抖动时回调
+   挂死由 IM 重推窗口自愈。
+5. **Worker 消费串行**：单副本内消息逐条处理，无租户公平调度；慢消息的租户隔离依赖
+   入口限流 + 水平扩容。
+6. **遥测为硬依赖**：OTLP Collector 不可用时进程拒绝启动（可观测性当依赖而非旁路）。
+7. **风险 2/4 的运维面**：Migrator 已用 `FOR UPDATE SKIP LOCKED` 选主（5.2.6），Archiver
+   仍依赖单副本 admin 角色的部署约定。
+
+质量门禁：CI（`.github/workflows/test.yml`）以 pgvector PG + Redis + MinIO 真实服务跑
+全量测试，**skip>0 即失败**（集成测试经 `TRPC_TEST_*` 环境变量门控），覆盖率基线 40%
+（实测 62.1%），覆盖率只升不降。
