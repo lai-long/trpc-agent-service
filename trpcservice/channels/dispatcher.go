@@ -231,6 +231,19 @@ func (s *Sender) handle(ctx context.Context, m storage.Message) {
 		return
 	}
 
+	// Another consumer group owns this channel (e.g. wecomws ↔ senders-ws):
+	// ack and step aside before touching the sent: marker, the rate bucket
+	// or the channel registry — and before any tracing setup, which only
+	// matters for messages this group actually delivers. The Skip-ack above
+	// all else also keeps the attempts counter (shared across groups, key
+	// carries no group) from being inflated for a message this group will
+	// never deliver.
+	if s.Skip != nil && s.Skip(msg) {
+		metrics.OutboundTotal.Add(ctx, 1, sendAttr(msg, "skipped_other_group"))
+		_ = s.Stream.Ack(ctx, s.inStream(), s.group(), m.ID)
+		return
+	}
+
 	// Continue the message trace across the outbound Stream boundary.
 	ctx = metrics.ExtractTraceparent(ctx, propagation.MapCarrier{"traceparent": msg.TraceParent})
 	ctx, span := senderTracer.Start(ctx, "sender.send")
@@ -239,17 +252,6 @@ func (s *Sender) handle(ctx context.Context, m storage.Message) {
 		attribute.String("channel", msg.Channel),
 		attribute.String("session_key", msg.SessionKey),
 	)
-
-	// Another consumer group owns this channel (e.g. wecomws ↔ senders-ws):
-	// ack and step aside before touching the sent: marker, the rate bucket
-	// or the channel registry. The Skip-ack above all else also keeps the
-	// attempts counter (shared across groups, key carries no group) from
-	// being inflated for a message this group will never deliver.
-	if s.Skip != nil && s.Skip(msg) {
-		metrics.OutboundTotal.Add(ctx, 1, sendAttr(msg, "skipped_other_group"))
-		_ = s.Stream.Ack(ctx, s.inStream(), s.group(), m.ID)
-		return
-	}
 
 	// Already delivered (sent but un-acked in a previous life): skip the send.
 	if s.Sent != nil && msg.MsgID != "" {

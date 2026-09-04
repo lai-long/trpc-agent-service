@@ -56,7 +56,7 @@ groups:
         annotations:
           summary: "end-to-end p95 {{ $value }}ms exceeds the 15s goal"
 
-      # Processing error rate above 1% (design 5.2.4).
+      # Processing error rate above 1%.
       - alert: ProcessErrorRateHigh
         expr: |
           sum(rate(worker_process_error_total[5m]))
@@ -66,11 +66,12 @@ groups:
         annotations:
           summary: "process error rate {{ $value }} > 1%"
 
-      # IM delivery success rate below 99% (design 5.2.4). The denominator
-      # counts deliverable outcomes only: skipped_other_group marks messages
+      # IM delivery success rate below 99%. The denominator counts
+      # deliverable outcomes only: skipped_other_group marks messages
       # another consumer group owns (they are counted again by that group),
-      # and including them makes the ratio dip below 99% whenever the
-      # wecomws share of traffic exceeds ~1%.
+      # and skipped_duplicate marks dedup hits; including either makes the
+      # ratio dip below 99% whenever the wecomws share of traffic exceeds
+      # ~1%.
       - alert: IMDeliveryDegraded
         expr: |
           sum(rate(im_outbound_total{result="ok"}[5m]))

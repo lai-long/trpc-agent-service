@@ -59,14 +59,25 @@ func StartStreamCollector(ctx context.Context, stats StreamStats, interval time.
 		{"stream:deadletter", ""},
 	}
 	collect := func() {
+		// stream:outbound appears once per consumer group; one XLEN per
+		// stream per cycle is enough.
+		type lenResult struct {
+			n   int64
+			err error
+		}
+		lens := make(map[string]lenResult, len(targets))
 		for _, t := range targets {
-			streamAttr := otelmetric.WithAttributes(attribute.String("stream", t.stream))
-			n, err := stats.Len(ctx, t.stream)
-			if err != nil {
-				plog.Warnf("stream collector len %s: %v", t.stream, err)
+			r, ok := lens[t.stream]
+			if !ok {
+				r.n, r.err = stats.Len(ctx, t.stream)
+				lens[t.stream] = r
+			}
+			if r.err != nil {
+				plog.Warnf("stream collector len %s: %v", t.stream, r.err)
 				continue
 			}
-			StreamLength.Record(ctx, n, streamAttr)
+			streamAttr := otelmetric.WithAttributes(attribute.String("stream", t.stream))
+			StreamLength.Record(ctx, r.n, streamAttr)
 			if t.group == "" {
 				continue
 			}

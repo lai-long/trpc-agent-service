@@ -135,7 +135,7 @@ func serve(role string) error {
 	}
 	// wecomws replies ride the same outbound stream but are delivered by the
 	// wecomws leader's dedicated consumer group; the main sender skips them.
-	if err := stream.EnsureGroup(ctx, storage.StreamOutbound, "senders-ws"); err != nil {
+	if err := stream.EnsureGroup(ctx, storage.StreamOutbound, wecomws.SenderGroup); err != nil {
 		return err
 	}
 
@@ -255,16 +255,10 @@ func serve(role string) error {
 			plog.Warnf("wecomws channel disabled: tenant routing (resolver) unavailable, " +
 				"bindings cannot be enumerated")
 		} else if ws := startWecomws(cfg, secrets, wsRoutes{resolver}); ws != nil {
-			// Only channels owning long-lived connections get started; a
-			// Starter that a regular adapter never implements leaves
-			// mock/wecom/wxkf untouched.
-			if st, ok := any(ws).(channels.Starter); ok {
-				channelSet[ws.Name()] = ws
-				wsStarter = st
-			} else {
-				plog.Errorf("wecomws channel does not implement channels.Starter — " +
-					"not registered (its replies could never be delivered)")
-			}
+			// *wecomws.Channel implements channels.Starter (long-lived
+			// connections); the assignment is the compile-time check.
+			channelSet[ws.Name()] = ws
+			wsStarter = ws
 		}
 
 		// Multi-tenant callback paths:
@@ -335,7 +329,7 @@ func serve(role string) error {
 			SendPolicyFor: sendPolicyFor,
 			// wecomws messages belong to the leader's senders-ws group: ack
 			// and step aside here — no send, no rate token, no sent: marker.
-			Skip: func(m channels.OutboundMessage) bool { return m.Channel == "wecomws" },
+			Skip: func(m channels.OutboundMessage) bool { return m.Channel == wecomws.ChannelName },
 		}
 		g.Go(func() error { return sender.Run(gctx) })
 
@@ -348,12 +342,12 @@ func serve(role string) error {
 				Sent:          storage.NewSentMarker(rdb),
 				Channels:      map[string]channels.Channel{wsStarter.Name(): wsStarter},
 				Name:          consumer + "-sws",
-				Group:         "senders-ws",
+				Group:         wecomws.SenderGroup,
 				Limiter:       storage.NewLimiter(rdb),
 				SendQPS:       parseFloat(cfg.SendRateQPS, 20),
 				SendBurst:     parseInt(cfg.SendRateBurst, 40),
 				SendPolicyFor: sendPolicyFor,
-				Skip:          func(m channels.OutboundMessage) bool { return m.Channel != "wecomws" },
+				Skip:          func(m channels.OutboundMessage) bool { return m.Channel != wecomws.ChannelName },
 			}
 			g.Go(func() error {
 				return runWecomwsLeader(gctx, storage.NewLeaderLock(rdb), wsStarter, wsSender, enqueue,
@@ -632,25 +626,44 @@ func (w wsRoutes) RoutesByChannel(ctx context.Context, channel string) ([]wecomw
 	return out, nil
 }
 
+// Re-campaign pacing: the base wait doubles per consecutive quick failure
+// toward the cap, so an instantly failing child (e.g. misconfiguration) does
+// not spin the acquire/run/release cycle on a fixed 2s cadence forever.
+const (
+	recampaignBase = 2 * time.Second
+	recampaignCap  = time.Minute
+)
+
+func recampaignWait(failStreak int) time.Duration {
+	d := recampaignBase
+	for i := 0; i < failStreak && d < recampaignCap; i++ {
+		d *= 2
+	}
+	return min(d, recampaignCap)
+}
+
 // runWecomwsLeader campaigns for the platform-wide wecomws leadership and,
 // while held, runs the bot connections and the senders-ws consumer group.
 // Losing the lease (another replica took over and kicked our connections)
 // or a child failure tears everything down; the loop re-campaigns until ctx
 // is done, so the whole group can take over after a leader crash.
 func runWecomwsLeader(ctx context.Context, leader *storage.LeaderLock, starter channels.Starter, wsSender *channels.Sender, h channels.Handler, owner string, ttl time.Duration) error {
+	failStreak := 0
 	for ctx.Err() == nil {
-		release, lost, err := leader.Acquire(ctx, "wecomws", owner, ttl)
+		release, lost, err := leader.Acquire(ctx, wecomws.ChannelName, owner, ttl)
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil
 			}
 			plog.Warnf("wecomws leader acquire: %v", err)
-			if !sleepFor(ctx, 2*time.Second) {
+			failStreak++
+			if !wecomws.Sleep(ctx, recampaignWait(failStreak)) {
 				return nil
 			}
 			continue
 		}
 		plog.Infof("wecomws leadership acquired (owner %s)", owner)
+		started := time.Now()
 		runCtx, cancel := context.WithCancel(ctx)
 		inner, innerCtx := errgroup.WithContext(runCtx)
 		inner.Go(func() error { return starter.Start(innerCtx, h) })
@@ -672,27 +685,22 @@ func runWecomwsLeader(ctx context.Context, leader *storage.LeaderLock, starter c
 		<-innerDone // drain: children stopped, run loops returned
 		if innerErr != nil && ctx.Err() == nil {
 			plog.Errorf("wecomws leader role failed, re-campaigning: %v", innerErr)
+			if time.Since(started) < recampaignCap {
+				failStreak++
+			} else {
+				failStreak = 0
+			}
+		} else {
+			failStreak = 0
 		}
 		if ctx.Err() != nil {
 			return nil
 		}
-		if !sleepFor(ctx, 2*time.Second) {
+		if !wecomws.Sleep(ctx, recampaignWait(failStreak)) {
 			return nil
 		}
 	}
 	return nil
-}
-
-// sleepFor waits for d; false when ctx is done first.
-func sleepFor(ctx context.Context, d time.Duration) bool {
-	timer := time.NewTimer(d)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return false
-	case <-timer.C:
-		return true
-	}
 }
 
 // buildSessionServices builds one session service per supported backend

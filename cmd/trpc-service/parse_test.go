@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"testing"
 	"time"
 )
@@ -70,32 +69,22 @@ func TestParseDuration(t *testing.T) {
 	}
 }
 
-// TestSleepFor covers all three outcomes: a done context wins immediately,
-// a short wait completes, and a cancellation mid-wait returns early.
-func TestSleepFor(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	if sleepFor(ctx, time.Hour) {
-		t.Error("sleepFor on a canceled context must return false")
+// TestRecampaignWait pins the re-campaign backoff curve: the base wait
+// doubles per consecutive quick failure and saturates at the cap.
+func TestRecampaignWait(t *testing.T) {
+	cases := []struct {
+		streak int
+		want   time.Duration
+	}{
+		{0, recampaignBase},
+		{1, 2 * recampaignBase},
+		{2, 4 * recampaignBase},
+		{10, recampaignCap}, // saturates, never overflows past the cap
 	}
-
-	start := time.Now()
-	if !sleepFor(context.Background(), 10*time.Millisecond) {
-		t.Error("sleepFor on a live context must return true")
-	}
-	if elapsed := time.Since(start); elapsed > time.Second {
-		t.Errorf("10ms sleep took %v", elapsed)
-	}
-
-	ctx2, cancel2 := context.WithCancel(context.Background())
-	timer := time.AfterFunc(20*time.Millisecond, cancel2)
-	defer timer.Stop()
-	start = time.Now()
-	if sleepFor(ctx2, 10*time.Second) {
-		t.Error("sleepFor must return false when the context is canceled mid-wait")
-	}
-	if elapsed := time.Since(start); elapsed >= 5*time.Second {
-		t.Errorf("mid-wait cancellation took %v, must return early", elapsed)
+	for _, tc := range cases {
+		if got := recampaignWait(tc.streak); got != tc.want {
+			t.Errorf("recampaignWait(%d) = %v, want %v", tc.streak, got, tc.want)
+		}
 	}
 }
 
