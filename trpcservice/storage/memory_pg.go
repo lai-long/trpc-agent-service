@@ -253,14 +253,20 @@ func (s *PGMemoryService) UpdateMemory(ctx context.Context, memoryKey memory.Key
 	if err := memoryKey.CheckMemoryKey(); err != nil {
 		return err
 	}
+	// The tenant predicate matches the read paths: without it, isolation
+	// would rest on "the UUID is unguessable" alone (review P1-10).
+	tenantID, err := s.tenants.resolve(ctx, memoryKey.AppName)
+	if err != nil {
+		return err
+	}
 	topicsJSON, err := json.Marshal(topics)
 	if err != nil {
 		return err
 	}
 	tag, err := s.pool.Exec(ctx,
-		`UPDATE memory_item SET content=$3, topics=$4, updated_at=now()
-		 WHERE id=$1 AND user_id=$2 AND deleted_at IS NULL`,
-		memoryKey.MemoryID, memoryKey.UserID, mem, topicsJSON)
+		`UPDATE memory_item SET content=$4, topics=$5, updated_at=now()
+		 WHERE id=$1 AND user_id=$2 AND tenant_id=$3 AND deleted_at IS NULL`,
+		memoryKey.MemoryID, memoryKey.UserID, tenantID, mem, topicsJSON)
 	if err != nil {
 		return fmt.Errorf("update memory: %w", err)
 	}
@@ -269,9 +275,9 @@ func (s *PGMemoryService) UpdateMemory(ctx context.Context, memoryKey memory.Key
 		return nil
 	}
 	tag, err = s.pool.Exec(ctx,
-		`UPDATE memory_item SET content=$3, topics=$4, deleted_at=NULL, updated_at=now()
-		 WHERE id=$1 AND user_id=$2 AND deleted_at IS NOT NULL`,
-		memoryKey.MemoryID, memoryKey.UserID, mem, topicsJSON)
+		`UPDATE memory_item SET content=$4, topics=$5, deleted_at=NULL, updated_at=now()
+		 WHERE id=$1 AND user_id=$2 AND tenant_id=$3 AND deleted_at IS NOT NULL`,
+		memoryKey.MemoryID, memoryKey.UserID, tenantID, mem, topicsJSON)
 	if err != nil {
 		return fmt.Errorf("update memory (revive): %w", err)
 	}
@@ -290,9 +296,14 @@ func (s *PGMemoryService) DeleteMemory(ctx context.Context, memoryKey memory.Key
 	if err := memoryKey.CheckMemoryKey(); err != nil {
 		return err
 	}
+	tenantID, err := s.tenants.resolve(ctx, memoryKey.AppName)
+	if err != nil {
+		return err
+	}
 	if _, err := s.pool.Exec(ctx,
-		`UPDATE memory_item SET deleted_at = now() WHERE id=$1 AND user_id=$2 AND deleted_at IS NULL`,
-		memoryKey.MemoryID, memoryKey.UserID); err != nil {
+		`UPDATE memory_item SET deleted_at = now()
+		 WHERE id=$1 AND user_id=$2 AND tenant_id=$3 AND deleted_at IS NULL`,
+		memoryKey.MemoryID, memoryKey.UserID, tenantID); err != nil {
 		return fmt.Errorf("delete memory: %w", err)
 	}
 	if _, err := s.pool.Exec(ctx,
@@ -306,10 +317,14 @@ func (s *PGMemoryService) DeleteMemory(ctx context.Context, memoryKey memory.Key
 // of the user within the app scope (tenant-shared rows are untouched — they
 // belong to the tenant, not the user's app session).
 func (s *PGMemoryService) ClearMemories(ctx context.Context, userKey memory.UserKey) error {
+	tenantID, err := s.tenants.resolve(ctx, userKey.AppName)
+	if err != nil {
+		return err
+	}
 	if _, err := s.pool.Exec(ctx,
 		`UPDATE memory_item SET deleted_at = now()
-		 WHERE app_id=$1 AND user_id=$2 AND deleted_at IS NULL`,
-		userKey.AppName, userKey.UserID); err != nil {
+		 WHERE tenant_id=$1 AND app_id=$2 AND user_id=$3 AND deleted_at IS NULL`,
+		tenantID, userKey.AppName, userKey.UserID); err != nil {
 		return fmt.Errorf("clear memories: %w", err)
 	}
 	return nil

@@ -562,34 +562,50 @@ func (s *PGSessionService) Close() error {
 
 // ensureSession returns the internal session UUID, inserting the row when
 // missing, and locks it FOR UPDATE (must run inside a transaction).
+//
+// The insert uses ON CONFLICT DO NOTHING with one bounded re-select instead
+// of a bare INSERT: two concurrent first messages of the same new session
+// (lock TTL expiry, two replicas) used to race past the SELECT and one of
+// them died on the unique constraint, aborting its whole event transaction
+// (review P1-9). With the conflict path, the loser re-locks the winner's row
+// and proceeds.
 func (s *PGSessionService) ensureSession(ctx context.Context, tx pgx.Tx, key session.Key, stateJSON []byte) (string, error) {
-	var sessID string
-	err := tx.QueryRow(ctx,
-		`SELECT id FROM session WHERE app_id = $1 AND session_key = $2 FOR UPDATE`,
-		key.AppName, key.SessionID).Scan(&sessID)
-	if err == nil {
-		return sessID, nil
-	}
-	if !errors.Is(err, pgx.ErrNoRows) {
-		return "", fmt.Errorf("lock session: %w", err)
-	}
+	for attempt := 0; attempt < 3; attempt++ {
+		var sessID string
+		err := tx.QueryRow(ctx,
+			`SELECT id FROM session WHERE app_id = $1 AND session_key = $2 FOR UPDATE`,
+			key.AppName, key.SessionID).Scan(&sessID)
+		if err == nil {
+			return sessID, nil
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return "", fmt.Errorf("lock session: %w", err)
+		}
 
-	tenantID, err := s.tenantForApp(ctx, key.AppName)
-	if err != nil {
-		return "", err
+		tenantID, err := s.tenantForApp(ctx, key.AppName)
+		if err != nil {
+			return "", err
+		}
+		if stateJSON == nil {
+			stateJSON = []byte(`{}`)
+		}
+		err = tx.QueryRow(ctx,
+			`INSERT INTO session (tenant_id, app_id, session_key, user_id, channel, state)
+			 VALUES ($1, $2, $3, $4, $5, $6)
+			 ON CONFLICT (app_id, session_key) DO NOTHING
+			 RETURNING id`,
+			tenantID, key.AppName, key.SessionID, key.UserID, channelOf(key.SessionID), stateJSON,
+		).Scan(&sessID)
+		if err == nil {
+			return sessID, nil
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return "", fmt.Errorf("insert session: %w", err)
+		}
+		// Lost the insert race: loop once more — the SELECT will now lock the
+		// winner's row and succeed.
 	}
-	if stateJSON == nil {
-		stateJSON = []byte(`{}`)
-	}
-	err = tx.QueryRow(ctx,
-		`INSERT INTO session (tenant_id, app_id, session_key, user_id, channel, state)
-		 VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
-		tenantID, key.AppName, key.SessionID, key.UserID, channelOf(key.SessionID), stateJSON,
-	).Scan(&sessID)
-	if err != nil {
-		return "", fmt.Errorf("insert session: %w", err)
-	}
-	return sessID, nil
+	return "", fmt.Errorf("ensure session %s: concurrent insert did not settle", key.SessionID)
 }
 
 // loadEvents replays the journal in event_seq order, incrementally from
