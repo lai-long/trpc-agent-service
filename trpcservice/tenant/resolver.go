@@ -32,6 +32,12 @@ func PublishInvalidation(ctx context.Context, rdb *redis.Client) error {
 // then this TTL is the only refresh mechanism.
 const DefaultCacheTTL = 30 * time.Second
 
+// DefaultReloadBackoff is how long a failed reload postpones the next attempt.
+// A failed reload leaves the snapshot stale by definition, so without a
+// backoff every single request retries it — under r.mu's write lock, which
+// serializes the whole request path behind one failing four-table load.
+const DefaultReloadBackoff = 5 * time.Second
+
 var (
 	// ErrUnknownBinding means no channel_binding row serves the webhook path.
 	ErrUnknownBinding = errors.New("unknown channel binding")
@@ -51,10 +57,16 @@ type Route struct {
 
 // Resolver answers webhook_path → Route lookups from a cached snapshot of
 // the tenant tables, refreshed every TTL. A failed reload keeps serving the
-// previous snapshot (stale beats down); only a failed first load errors.
+// previous snapshot (stale beats down) and waits ReloadBackoff before trying
+// again; only a failed first load errors.
 type Resolver struct {
 	store Store
 	ttl   time.Duration
+
+	// ReloadBackoff is how long a failed reload postpones the next attempt
+	// (DefaultReloadBackoff unless set). It is a field so an operator who
+	// tolerates more staleness during an outage can widen it.
+	ReloadBackoff time.Duration
 
 	mu           sync.RWMutex
 	tenants      map[string]Tenant
@@ -63,6 +75,7 @@ type Resolver struct {
 	bindingsByID map[string]ChannelBinding // by binding id (callback dispatch)
 	migs         map[string]Migration      // by tenant_id + ":" + resource
 	loadedAt     time.Time
+	retryAt      time.Time // zero unless the last reload failed
 	loaded       bool
 }
 
@@ -73,7 +86,7 @@ func NewResolver(store Store) *Resolver {
 
 // NewResolverWithTTL creates a Resolver with an explicit cache TTL.
 func NewResolverWithTTL(store Store, ttl time.Duration) *Resolver {
-	return &Resolver{store: store, ttl: ttl}
+	return &Resolver{store: store, ttl: ttl, ReloadBackoff: DefaultReloadBackoff}
 }
 
 // Resolve maps a webhook path to its tenant route, refreshing the cache when
@@ -222,27 +235,44 @@ func (r *Resolver) WatchInvalidations(ctx context.Context, rdb *redis.Client) {
 	}()
 }
 
+// stale reports whether the snapshot has to be reloaded. Callers must hold
+// r.mu. A failed reload postpones the next attempt until retryAt: the snapshot
+// is already past its TTL, so without that the very next request retries, and
+// every request after it — each one a four-table load serialized behind the
+// write lock, which is exactly the convoy you do not want during the outage
+// that made the reload fail.
+func (r *Resolver) stale(now time.Time) bool {
+	if !r.loaded {
+		return true
+	}
+	if now.Before(r.retryAt) {
+		return false
+	}
+	return now.Sub(r.loadedAt) >= r.ttl
+}
+
 // refresh reloads the snapshot when the cache is stale. Concurrent refreshes
 // are serialized by the write lock; the double-check after acquiring it
 // keeps a burst of callbacks from reloading more than once.
 func (r *Resolver) refresh(ctx context.Context) error {
 	r.mu.RLock()
-	fresh := r.loaded && time.Since(r.loadedAt) < r.ttl
+	stale := r.stale(time.Now())
 	r.mu.RUnlock()
-	if fresh {
+	if !stale {
 		return nil
 	}
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.loaded && time.Since(r.loadedAt) < r.ttl {
+	if !r.stale(time.Now()) {
 		return nil
 	}
 	d, err := r.store.LoadAll(ctx)
 	if err != nil {
 		if r.loaded {
-			plog.Warnf("tenant reload failed, serving snapshot from %s: %v",
-				r.loadedAt.Format(time.RFC3339), err)
+			r.retryAt = time.Now().Add(r.ReloadBackoff)
+			plog.Warnf("tenant reload failed, serving snapshot from %s (next attempt in %s): %v",
+				r.loadedAt.Format(time.RFC3339), r.ReloadBackoff, err)
 			return nil
 		}
 		return fmt.Errorf("load tenants: %w", err)
@@ -268,6 +298,7 @@ func (r *Resolver) refresh(ctx context.Context) error {
 	}
 	r.tenants, r.apps, r.bindings, r.bindingsByID, r.migs = tenants, apps, bindings, bindingsByID, migs
 	r.loadedAt = time.Now()
+	r.retryAt = time.Time{}
 	r.loaded = true
 	return nil
 }

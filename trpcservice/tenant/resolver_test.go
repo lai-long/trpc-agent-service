@@ -210,6 +210,73 @@ func TestReloadFailureServesStale(t *testing.T) {
 	}
 }
 
+// A failed reload must not be retried by every request that follows. The
+// snapshot is already past its TTL when LoadAll fails, so without a backoff
+// each callback re-runs the four-table load under the write lock — a PG
+// outage then throttles the whole request path to one failing query at a
+// time, and the log line repeats per request.
+func TestReloadFailureBacksOff(t *testing.T) {
+	store := &fakeStore{data: testData()}
+	r := tenant.NewResolverWithTTL(store, 20*time.Millisecond)
+	r.ReloadBackoff = 150 * time.Millisecond
+	ctx := context.Background()
+
+	if _, err := r.Resolve(ctx, "/mock/callback"); err != nil {
+		t.Fatal(err)
+	}
+	store.mu.Lock()
+	store.err = errors.New("pg down")
+	store.mu.Unlock()
+
+	// Past the TTL: one attempt, which fails and is absorbed into the stale
+	// snapshot. The four requests behind it must not retry.
+	time.Sleep(25 * time.Millisecond)
+	for i := 0; i < 5; i++ {
+		route, err := r.Resolve(ctx, "/mock/callback")
+		if err != nil {
+			t.Fatalf("stale snapshot should keep serving, got %v", err)
+		}
+		if route.Tenant.ID != "t1" {
+			t.Fatalf("unexpected route: %+v", route)
+		}
+	}
+	if n := store.loadCount(); n != 2 {
+		t.Fatalf("want exactly one reload attempt during the backoff, got %d loads", n)
+	}
+
+	// The backoff expires, so the resolver tries again — still failing, still
+	// serving the snapshot.
+	time.Sleep(160 * time.Millisecond)
+	if _, err := r.Resolve(ctx, "/mock/callback"); err != nil {
+		t.Fatal(err)
+	}
+	if n := store.loadCount(); n != 3 {
+		t.Fatalf("want a retry once the backoff expires, got %d loads", n)
+	}
+
+	// Recovery clears the backoff and the reload resumes.
+	store.mu.Lock()
+	store.err = nil
+	store.mu.Unlock()
+	time.Sleep(160 * time.Millisecond)
+	if _, err := r.Resolve(ctx, "/mock/callback"); err != nil {
+		t.Fatal(err)
+	}
+	if n := store.loadCount(); n != 4 {
+		t.Fatalf("want the reload to resume after recovery, got %d loads", n)
+	}
+}
+
+// The backoff is defaulted by the constructors, not left at zero (a zero
+// backoff is the retry storm the field exists to prevent).
+func TestReloadBackoffDefault(t *testing.T) {
+	r := tenant.NewResolver(&fakeStore{data: testData()})
+	if r.ReloadBackoff != tenant.DefaultReloadBackoff {
+		t.Fatalf("want the default reload backoff %s, got %s",
+			tenant.DefaultReloadBackoff, r.ReloadBackoff)
+	}
+}
+
 func TestFirstLoadFailure(t *testing.T) {
 	store := &fakeStore{err: errors.New("pg down")}
 	r := tenant.NewResolver(store)
