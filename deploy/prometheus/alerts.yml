@@ -22,6 +22,16 @@ groups:
         annotations:
           summary: "oldest pending in {{ $labels.stream }}/{{ $labels.group }} is {{ $value }}s old"
 
+      # senders-ws backlog: the wecomws leader holds both the connections and
+      # this consumer group — a growing pending count means leaderless (no
+      # replica holds the lease) or a wedged WS send.
+      - alert: SendersWsBacklog
+        expr: stream_pending{group="senders-ws"} > 50
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "senders-ws backlog {{ $value }}: wecomws leaderless or wedged"
+
       # Anything in the dead-letter stream needs human intervention.
       - alert: DeadLetterPresent
         expr: stream_length{stream="stream:deadletter"} > 0
@@ -56,11 +66,15 @@ groups:
         annotations:
           summary: "process error rate {{ $value }} > 1%"
 
-      # IM delivery success rate below 99% (design 5.2.4).
+      # IM delivery success rate below 99% (design 5.2.4). The denominator
+      # counts deliverable outcomes only: skipped_other_group marks messages
+      # another consumer group owns (they are counted again by that group),
+      # and including them makes the ratio dip below 99% whenever the
+      # wecomws share of traffic exceeds ~1%.
       - alert: IMDeliveryDegraded
         expr: |
           sum(rate(im_outbound_total{result="ok"}[5m]))
-            / clamp_min(sum(rate(im_outbound_total[5m])), 1) < 0.99
+            / clamp_min(sum(rate(im_outbound_total{result=~"ok|error"}[5m])), 1) < 0.99
         for: 5m
         labels: {severity: warning}
         annotations:

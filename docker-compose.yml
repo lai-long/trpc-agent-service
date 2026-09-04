@@ -5,6 +5,14 @@
 #   docker compose up -d      # start all dependencies
 #   docker compose down       # stop (data persists in named volumes)
 #   docker compose down -v    # stop and wipe data (init.sql reruns on next start)
+#
+# Channel enablement happens on the service process env (unset = disabled):
+#   TRPC_WECOM_CORP_ID=...            # wecom webhook channel
+#   TRPC_WXKF_CORP_ID=... TRPC_WXKF_KF_ACCOUNT=...  # wechat kf channel
+#   # WeCom smart-bot WebSocket channel; bots live in channel_binding.config:
+#   TRPC_WECOMWS_ADDR=wss://openws.work.weixin.qq.com
+#   # TRPC_WECOMWS_PING_INTERVAL=30s TRPC_WECOMWS_LEADER_TTL=15s
+#   # TRPC_WECOMWS_RESYNC_INTERVAL=15s TRPC_WECOMWS_SEGMENT_BYTES=2048
 
 services:
   postgres:
