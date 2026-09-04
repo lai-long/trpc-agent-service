@@ -443,3 +443,30 @@ func TestGuardedBudgetGate(t *testing.T) {
 		t.Fatalf("want 1500 tokens recorded for t1, got %v", fb.recorded)
 	}
 }
+
+// Exactly one terminal audit per message: the allow audit used to run before
+// the output checks, so a denied reply left an allow row AND a deny row in
+// audit_log and the interception-rate accounting double-counted (review
+// P1-11). The deny case must carry exactly one sync deny row and no async
+// allow row.
+func TestGuardedOutputDenySingleAudit(t *testing.T) {
+	aud := &fakeAuditor{}
+	g := &Guarded{
+		Inner:     EchoProcessor{},
+		Auditor:   aud,
+		PolicyFor: policyStub(tenant.GuardrailPolicy{OutputDenyWords: []string{"内部"}}),
+	}
+	out, err := g.Process(context.Background(), testMsg("这是内部消息"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.Text, "受限内容") {
+		t.Fatalf("output deny word must replace the reply, got %q", out.Text)
+	}
+	if evs := aud.syncDecisions(); len(evs) != 1 || evs[0].Decision != "deny" {
+		t.Fatalf("want exactly one sync deny, got %+v", evs)
+	}
+	if evs := aud.asyncDecisions(); len(evs) != 0 {
+		t.Fatalf("deny path must not leave an async allow audit, got %+v", evs)
+	}
+}

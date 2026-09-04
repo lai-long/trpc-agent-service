@@ -215,7 +215,6 @@ func (g *Guarded) Process(ctx context.Context, msg channels.InboundMessage) (cha
 		out.Text = degradedReply
 		return out, nil
 	}
-	g.asyncAudit(msg, out, started, nil)
 	// Budget accounting with the run's actual tokens (预算限制).
 	if g.Budget != nil && msg.TenantID != "" {
 		g.Budget.Record(ctx, msg.TenantID, int64(out.PromptTokens+out.CompletionTokens))
@@ -247,7 +246,13 @@ func (g *Guarded) Process(ctx context.Context, msg channels.InboundMessage) (cha
 		out.Text = signalReply(sig)
 		return out, nil
 	}
+	// Terminal allow audit — deliberately last: it used to run before the
+	// output checks and the approval-signal handling, leaving one message
+	// with an allow row AND a deny/review row in audit_log, which corrupted
+	// the interception-rate accounting (review P1-11). Exactly one terminal
+	// audit per message, from here or from the branches above.
 	span.SetAttributes(attribute.String("decision", "allow"))
+	g.asyncAudit(msg, out, started, nil)
 	return out, nil
 }
 

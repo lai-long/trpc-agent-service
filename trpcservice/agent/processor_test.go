@@ -11,6 +11,8 @@ import (
 	tagent "trpc.group/trpc-go/trpc-agent-go/agent"
 	"trpc.group/trpc-go/trpc-agent-go/event"
 	"trpc.group/trpc-go/trpc-agent-go/model"
+
+	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
 )
 
 // fakeRunner implements runner.Runner with a scripted behavior per call.
@@ -164,5 +166,47 @@ func TestRunnerProcessorEmptyResponseIsModelError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "no final response") {
 		t.Fatalf("unexpected cause: %v", err)
+	}
+}
+
+// Drain/shutdown cancellation is infrastructure, not a model failure (review
+// P1-12): Process returns the raw cancel error instead of a ModelError, so
+// the guardrail does not degrade into a busy reply and the worker leaves the
+// message pending for a surviving replica.
+func TestRunnerProcessorCancelReturnsRawError(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	r := &fakeRunner{run: func(ctx context.Context, _ int) (<-chan *event.Event, error) {
+		cancel() // the drain deadline fires mid-run
+		return scriptedEvents(errorEvent("shutting down"))(ctx, 0)
+	}}
+	p := newRunnerProcessor(r, "test-model", time.Second, 1)
+	_, err := p.Process(ctx, channels.InboundMessage{Channel: "mock", SessionKey: "s1", UserID: "u1", Text: "hi"})
+	if err == nil {
+		t.Fatal("canceled run must return an error")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("want the raw cancel error, got %v", err)
+	}
+	var me *ModelError
+	if errors.As(err, &me) {
+		t.Fatal("cancellation must not be wrapped as ModelError")
+	}
+}
+
+// The backoff sleeps ~2^attempt scaled with jitter and aborts on a canceled
+// context (review P1-13).
+func TestRetryBackoff(t *testing.T) {
+	start := time.Now()
+	if err := retryBackoff(context.Background(), 1); err != nil {
+		t.Fatal(err)
+	}
+	el := time.Since(start)
+	if el < 200*time.Millisecond || el > 2*time.Second {
+		t.Fatalf("first backoff = %v, want within [250ms, 750ms] jittered bounds", el)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := retryBackoff(ctx, 3); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled backoff must return the cancel error, got %v", err)
 	}
 }

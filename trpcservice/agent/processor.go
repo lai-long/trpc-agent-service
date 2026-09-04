@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"strings"
 	"time"
 
@@ -162,6 +163,13 @@ func (p *RunnerProcessor) Process(ctx context.Context, msg channels.InboundMessa
 		if attempt > 0 {
 			plog.Warnf("retrying run (attempt %d/%d, session=%s): %v",
 				attempt+1, p.retries+1, msg.SessionKey, lastErr)
+			// Exponential backoff with jitter before the next attempt:
+			// immediate retries hit a struggling model with aligned
+			// multi-replica spikes and amplify the outage instead of riding
+			// it out (review P1-13). Canceled by the run context.
+			if err := retryBackoff(ctx, attempt); err != nil {
+				return out, ctx.Err()
+			}
 		}
 		reply, usage, err := p.runOnce(ctx, msg)
 		out.PromptTokens += usage.prompt
@@ -183,10 +191,34 @@ func (p *RunnerProcessor) Process(ctx context.Context, msg channels.InboundMessa
 			return out, infra.Err
 		}
 		if ctx.Err() != nil {
-			break // shutting down: no further attempts
+			// Shutdown/drain cancellation is infrastructure, not a model
+			// failure: returning it raw keeps it off the ModelError path, so
+			// the guardrail does not degrade into a busy reply and the
+			// worker does not Ack — the redelivery that a surviving replica
+			// takes over still owns this message (review P1-12).
+			return out, ctx.Err()
 		}
 	}
 	return out, &ModelError{Err: lastErr}
+}
+
+// retryBackoff sleeps 500ms * 2^(attempt-1) with ±50% jitter, bounded at 8s.
+// attempt starts at 1 for the first retry; a canceled context returns early.
+func retryBackoff(ctx context.Context, attempt int) error {
+	base := 500 * time.Millisecond << min(attempt-1, 4)                              // capped at 8s
+	jitter := time.Duration(rand.Int64N(int64(base))) - time.Duration(int64(base)/2) // ±50%
+	delay := base + jitter
+	if delay < 0 {
+		delay = 0
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 // infraError wraps failures of runner.Run itself (session store down, etc.)
