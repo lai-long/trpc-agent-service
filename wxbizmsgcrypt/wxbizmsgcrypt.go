@@ -4,13 +4,13 @@ import (
 	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/rand"
 	"crypto/sha1"
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/xml"
 	"fmt"
-	"math/rand"
 	"sort"
 	"strings"
 )
@@ -116,8 +116,13 @@ func NewWXBizMsgCrypt(token, encoding_aeskey, receiver_id string, protocol_type 
 
 func (self *WXBizMsgCrypt) randString(n int) string {
 	b := make([]byte, n)
+	// crypto/rand, not math/rand: the prefix is the only thing that keeps two
+	// identical replies from encrypting to the same ciphertext under the fixed
+	// IV, so a predictable PRNG would make replies linkable. Read returns no
+	// error on Go 1.24+ (a dead platform CSPRNG panics inside the package).
+	rand.Read(b)
 	for i := range b {
-		b[i] = letterBytes[rand.Int63()%int64(len(letterBytes))]
+		b[i] = letterBytes[int(b[i])%len(letterBytes)]
 	}
 	return string(b)
 }
@@ -231,7 +236,12 @@ func (self *WXBizMsgCrypt) ParsePlainText(plaintext []byte) ([]byte, uint32, []b
 	}
 	random := plaintext[:16]
 	msg_len := binary.BigEndian.Uint32(plaintext[16:20])
-	if text_len < (20 + msg_len) {
+	// Compared as msg_len > text_len-20, not text_len < 20+msg_len: msg_len
+	// comes out of the decrypted buffer, so 20+msg_len overflows uint32 for
+	// msg_len >= 0xFFFFFFEC, wraps below text_len, passes the guard, and the
+	// slice expression below then panics on inverted bounds. text_len >= 20 is
+	// already established, so the subtraction cannot underflow.
+	if msg_len > text_len-20 {
 		return nil, 0, nil, nil, NewCryptError(IllegalBuffer, "plain is to small 2")
 	}
 

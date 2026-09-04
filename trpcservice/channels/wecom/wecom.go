@@ -323,10 +323,20 @@ func (c *Channel) receive(w http.ResponseWriter, r *http.Request, crypt *wxbizms
 	q := r.URL.Query()
 	plain, cerr := crypt.DecryptMsg(q.Get("msg_signature"), q.Get("timestamp"), q.Get("nonce"), body)
 	if cerr != nil {
-		// Signature/decryption failures are not retryable: ack so the
-		// platform does not redeliver, and log for investigation.
-		plog.Warnf("wecom decrypt failed: %s", cerr.ErrMsg)
-		writeSuccess(w)
+		// Two failures, two answers. An unverified callback (bad signature,
+		// envelope that is not XML) is indistinguishable from internet junk: ack
+		// it, redelivery cannot make it readable. A verified one we still cannot
+		// read is the platform's and broken on our side — wrong or misshapen AES
+		// key, ciphertext truncated in transit, receiver_id naming another corp —
+		// so acking it would drop the user's message behind one warn line. 5xx
+		// makes the platform redeliver, and fixing the credential recovers it.
+		if cerr.ErrCode == wxbizmsgcrypt.ValidateSignatureError || cerr.ErrCode == wxbizmsgcrypt.ParseXmlError {
+			plog.Warnf("wecom drop unverified callback: %s", cerr.ErrMsg)
+			writeSuccess(w)
+			return
+		}
+		plog.Errorf("wecom cannot read an authenticated callback (code %d): %s", cerr.ErrCode, cerr.ErrMsg)
+		http.Error(w, "decrypt failed", http.StatusInternalServerError)
 		return
 	}
 

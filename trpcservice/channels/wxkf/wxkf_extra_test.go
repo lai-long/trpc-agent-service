@@ -2,10 +2,16 @@ package wxkf
 
 import (
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/sha1"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -19,17 +25,70 @@ import (
 // a binding-scoped handler; the recorder carries the answer.
 func postForged(t *testing.T, c *Channel, h channels.Handler, innerJSON string) *httptest.ResponseRecorder {
 	t.Helper()
+	body, query := forgeCallback(t, innerJSON)
+	return postRaw(t, c, h, body, query)
+}
+
+// postRaw serves one callback body under the test binding's credentials.
+func postRaw(t *testing.T, c *Channel, h channels.Handler, body []byte, query string) *httptest.ResponseRecorder {
+	t.Helper()
 	handler, err := c.CallbackHandler(h, channels.BindingCredentials{
 		CorpID: testCorpID, TokenRef: "tok", AESKeyRef: "aes",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	body, query := forgeCallback(t, innerJSON)
 	req := httptest.NewRequest(http.MethodPost, "/callback/wxkf/b1?"+query, strings.NewReader(string(body)))
 	rec := httptest.NewRecorder()
 	handler(rec, req)
 	return rec
+}
+
+// craftCallback encrypts an arbitrary buffer — not the random+length+message+
+// corpid layout EncryptMsg builds — and signs it correctly. That combination is
+// what production produces when our AES key is wrong or a ciphertext is
+// truncated: the signature verifies, so the callback is provably the platform's,
+// and the plaintext behind it is unreadable.
+func craftCallback(t *testing.T, plaintext string) (body []byte, query string) {
+	t.Helper()
+	aeskey, err := base64.StdEncoding.DecodeString(testAESKey + "=")
+	if err != nil {
+		t.Fatal(err)
+	}
+	block, err := aes.NewCipher(aeskey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The library's own PKCS7: pad to its 32-byte block, always adding at
+	// least one byte.
+	const blockSize = 32
+	pad := blockSize - len(plaintext)%blockSize
+	padded := append([]byte(plaintext), make([]byte, pad)...)
+	for i := len(padded) - pad; i < len(padded); i++ {
+		padded[i] = byte(pad)
+	}
+	ciphertext := make([]byte, len(padded))
+	cipher.NewCBCEncrypter(block, aeskey[:aes.BlockSize]).CryptBlocks(ciphertext, padded)
+	encrypt := base64.StdEncoding.EncodeToString(ciphertext)
+
+	const timestamp, nonce = "1700000000", "nonce-1"
+	signature := sha1Hex(testToken, timestamp, nonce, encrypt)
+	body = []byte(fmt.Sprintf(`{"encrypt":%q}`, encrypt))
+	query = fmt.Sprintf("msg_signature=%s&timestamp=%s&nonce=%s",
+		url.QueryEscape(signature), timestamp, nonce)
+	return body, query
+}
+
+// sha1Hex is the platform's signature rule: sort the four parts, concatenate,
+// sha1, lowercase hex.
+func sha1Hex(parts ...string) string {
+	sorted := append([]string(nil), parts...)
+	sort.Strings(sorted)
+	sha := sha1.New()
+	for _, p := range sorted {
+		sha.Write([]byte(p))
+	}
+	return fmt.Sprintf("%x", sha.Sum(nil))
 }
 
 func TestNewValidation(t *testing.T) {
@@ -148,6 +207,40 @@ func TestVerifyURLRejectsBadSignature(t *testing.T) {
 	handler(rec, httptest.NewRequest(http.MethodGet, "/callback/wxkf/b1?msg_signature=tampered&timestamp=1700000000&nonce=n&echostr=x", nil))
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("bad signature must be rejected 403, got %d", rec.Code)
+	}
+}
+
+// A callback that never proved it came from the platform is junk — here a valid
+// envelope under a tampered signature. It stays acked: redelivery cannot make it
+// readable, and a 5xx would let any scanner turn this public endpoint into an
+// error-rate firehose.
+func TestReceiveUnverifiedCallbackIsAcked(t *testing.T) {
+	c := testChannel(t, "")
+	rec := postRaw(t, c, channels.HandlerFunc(func(context.Context, channels.InboundMessage) (channels.OutboundMessage, error) {
+		t.Error("handler must not run for an unverified callback")
+		return channels.OutboundMessage{}, nil
+	}), []byte(`{"encrypt":"abcd"}`), "msg_signature=tampered&timestamp=1700000000&nonce=n")
+	if rec.Code != http.StatusOK || rec.Body.String() != "success" {
+		t.Fatalf("an unverified callback must be acked, got %d %q", rec.Code, rec.Body.String())
+	}
+}
+
+// A callback whose signature verifies is provably the platform's, so failing to
+// read it is our fault: a wrong or misshapen AES key, a ciphertext truncated in
+// transit, a receiver_id naming another corp. It used to be acked exactly like
+// junk, which lost the user's message with one warn line as the only trace; it
+// must answer 5xx so the platform redelivers and a fixed credential recovers the
+// backlog. The shared crypto library's own bounds panic is pinned by the WeCom
+// adapter's TestReceiveOverflowingMsgLenDoesNotPanic.
+func TestReceiveAuthenticatedButUnreadableIsNotAcked(t *testing.T) {
+	c := testChannel(t, "")
+	body, query := craftCallback(t, "short")
+	rec := postRaw(t, c, channels.HandlerFunc(func(context.Context, channels.InboundMessage) (channels.OutboundMessage, error) {
+		t.Error("handler must not run for an unreadable callback")
+		return channels.OutboundMessage{}, nil
+	}), body, query)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("an authenticated but unreadable callback must answer 5xx, got %d", rec.Code)
 	}
 }
 

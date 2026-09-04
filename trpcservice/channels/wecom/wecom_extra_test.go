@@ -2,10 +2,17 @@ package wecom
 
 import (
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/sha1"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -19,17 +26,80 @@ import (
 // binding-scoped handler; the recorder carries the answer.
 func postForged(t *testing.T, c *Channel, h channels.Handler, innerXML string) *httptest.ResponseRecorder {
 	t.Helper()
+	body, query := forgeCallback(t, innerXML)
+	return postRaw(t, c, h, body, query)
+}
+
+// postRaw serves one callback body under the test binding's credentials.
+func postRaw(t *testing.T, c *Channel, h channels.Handler, body []byte, query string) *httptest.ResponseRecorder {
+	t.Helper()
 	handler, err := c.CallbackHandler(h, channels.BindingCredentials{
 		CorpID: testCorpID, TokenRef: "tok", AESKeyRef: "aes",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	body, query := forgeCallback(t, innerXML)
 	req := httptest.NewRequest(http.MethodPost, "/callback/wecom/b1?"+query, strings.NewReader(string(body)))
 	rec := httptest.NewRecorder()
 	handler(rec, req)
 	return rec
+}
+
+// craftCallback encrypts an arbitrary buffer — not the random+length+message+
+// corpid layout EncryptMsg builds — and signs it correctly. That combination is
+// what production produces when our AES key is wrong or a ciphertext is
+// truncated: the signature verifies, so the callback is provably the platform's,
+// and the plaintext behind it is unreadable.
+func craftCallback(t *testing.T, plaintext string) (body []byte, query string) {
+	t.Helper()
+	aeskey, err := base64.StdEncoding.DecodeString(testAESKey + "=")
+	if err != nil {
+		t.Fatal(err)
+	}
+	block, err := aes.NewCipher(aeskey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The library's own PKCS7: pad to its 32-byte block, always adding at
+	// least one byte.
+	const blockSize = 32
+	pad := blockSize - len(plaintext)%blockSize
+	padded := append([]byte(plaintext), make([]byte, pad)...)
+	for i := len(padded) - pad; i < len(padded); i++ {
+		padded[i] = byte(pad)
+	}
+	ciphertext := make([]byte, len(padded))
+	cipher.NewCBCEncrypter(block, aeskey[:aes.BlockSize]).CryptBlocks(ciphertext, padded)
+	encrypt := base64.StdEncoding.EncodeToString(ciphertext)
+
+	const timestamp, nonce = "1700000000", "nonce-1"
+	signature := sha1Hex(testToken, timestamp, nonce, encrypt)
+	body = []byte(fmt.Sprintf(`<xml><ToUserName><![CDATA[%s]]></ToUserName><Encrypt><![CDATA[%s]]></Encrypt><AgentID><![CDATA[1000002]]></AgentID></xml>`,
+		testCorpID, encrypt))
+	query = fmt.Sprintf("msg_signature=%s&timestamp=%s&nonce=%s",
+		url.QueryEscape(signature), timestamp, nonce)
+	return body, query
+}
+
+// sha1Hex is the platform's signature rule: sort the four parts, concatenate,
+// sha1, lowercase hex.
+func sha1Hex(parts ...string) string {
+	sorted := append([]string(nil), parts...)
+	sort.Strings(sorted)
+	sha := sha1.New()
+	for _, p := range sorted {
+		sha.Write([]byte(p))
+	}
+	return fmt.Sprintf("%x", sha.Sum(nil))
+}
+
+// overflowPlaintext is a decrypted buffer whose declared message length is
+// 0xFFFFFFFF: 20+msg_len wraps to 19 in uint32, so a guard written as
+// "text_len < 20+msg_len" passes and the slice expression panics on inverted
+// bounds.
+func overflowPlaintext() string {
+	buf := binary.BigEndian.AppendUint32([]byte("0123456789abcdef"), 0xFFFFFFFF)
+	return string(append(buf, []byte("hello"+testCorpID)...))
 }
 
 const mediaInner = `<xml><ToUserName><![CDATA[ww1234567890]]></ToUserName><FromUserName><![CDATA[zhangsan]]></FromUserName><CreateTime>1700000000</CreateTime><MsgType><![CDATA[image]]></MsgType><PicUrl><![CDATA[https://wework.qpic.cn/x]]></PicUrl><MediaId><![CDATA[MEDIA123]]></MediaId><MsgId>777000333</MsgId><AgentID>1000002</AgentID></xml>`
@@ -180,6 +250,57 @@ func TestReceiveUnparsableXML(t *testing.T) {
 	}), `not-xml<<<`)
 	if rec.Code != http.StatusOK || rec.Body.String() != "success" {
 		t.Fatalf("unparsable xml must be acked, got %d %q", rec.Code, rec.Body.String())
+	}
+}
+
+// A callback that never proved it came from the platform is junk — a bad
+// signature or an envelope that is not XML. It stays acked: redelivery cannot
+// make it readable, and a 5xx would let any scanner turn this public endpoint
+// into an error-rate firehose.
+func TestReceiveUnverifiedCallbackIsAcked(t *testing.T) {
+	c := testChannel(t, "")
+	rec := postRaw(t, c, channels.HandlerFunc(func(context.Context, channels.InboundMessage) (channels.OutboundMessage, error) {
+		t.Error("handler must not run for an unverified callback")
+		return channels.OutboundMessage{}, nil
+	}), []byte(`<xml><Encrypt><![CDATA[abcd]]></Encrypt></xml>`),
+		"msg_signature=tampered&timestamp=1700000000&nonce=n")
+	if rec.Code != http.StatusOK || rec.Body.String() != "success" {
+		t.Fatalf("an unverified callback must be acked, got %d %q", rec.Code, rec.Body.String())
+	}
+}
+
+// A callback whose signature verifies is provably the platform's, so failing to
+// read it is our fault: a wrong or misshapen AES key, a ciphertext truncated in
+// transit, a receiver_id naming another corp. It used to be acked exactly like
+// junk, which lost the user's message with one warn line as the only trace; it
+// must answer 5xx so the platform redelivers and a fixed credential recovers the
+// backlog.
+func TestReceiveAuthenticatedButUnreadableIsNotAcked(t *testing.T) {
+	c := testChannel(t, "")
+	body, query := craftCallback(t, "short")
+	rec := postRaw(t, c, channels.HandlerFunc(func(context.Context, channels.InboundMessage) (channels.OutboundMessage, error) {
+		t.Error("handler must not run for an unreadable callback")
+		return channels.OutboundMessage{}, nil
+	}), body, query)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("an authenticated but unreadable callback must answer 5xx, got %d", rec.Code)
+	}
+}
+
+// The declared message length is read out of the decrypted buffer, so a
+// corrupted or wrongly-keyed callback can carry 0xFFFFFFFF: 20+msg_len wraps to
+// 19 in uint32, the guard written as "text_len < 20+msg_len" let it through, and
+// the slice expression panicked on inverted bounds — one callback taking the
+// whole process down. It must be a bounds error like any other unreadable body.
+func TestReceiveOverflowingMsgLenDoesNotPanic(t *testing.T) {
+	c := testChannel(t, "")
+	body, query := craftCallback(t, overflowPlaintext())
+	rec := postRaw(t, c, channels.HandlerFunc(func(context.Context, channels.InboundMessage) (channels.OutboundMessage, error) {
+		t.Error("handler must not run for an unreadable callback")
+		return channels.OutboundMessage{}, nil
+	}), body, query)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("an overflowing msg_len must be refused as unreadable, got %d", rec.Code)
 	}
 }
 
