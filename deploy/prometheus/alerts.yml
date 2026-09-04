@@ -66,13 +66,14 @@ groups:
         annotations:
           summary: "IM delivery success {{ $value }} < 99%"
 
-      # Send pacing is re-queuing messages: an IM platform limit is biting.
+      # Send pacing is leaving messages pending for reaper takeover: an IM
+      # platform limit is biting.
       - alert: SendRateLimited
         expr: rate(send_rate_limited_total[10m]) > 0
         for: 10m
         labels: {severity: info}
         annotations:
-          summary: "outbound sends re-queued by pacing on {{ $labels.channel }}"
+          summary: "outbound sends left pending by pacing on {{ $labels.channel }}"
 
       # Gateway admission control rejects traffic (rate limit or backpressure).
       - alert: GatewayRejecting

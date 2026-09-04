@@ -111,7 +111,12 @@ func (w *Worker) maxIdle() time.Duration {
 	if w.MaxIdle > 0 {
 		return w.MaxIdle
 	}
-	return 10 * time.Minute
+	// Same number, two roles: the takeover delay for a left-pending message
+	// (busy session) and the safety bound against claiming an in-flight run.
+	// Must exceed the worst-case processing time - model timeout x retries
+	// + retry backoff + the approved-tool timeout (60s x 2 + ~8s + 60s ≈
+	// 190s); 4min keeps slack above that while bounding the delay.
+	return 4 * time.Minute
 }
 
 func (w *Worker) maxAttempts() int64 {

@@ -139,13 +139,25 @@
 
 ## 快速开始
 
+安全默认全部关闭（Admin API 必须带 token 启动、mock 通道默认关），本地演示需要
+显式声明：
+
 ```bash
 git clone https://github.com/liuzengh/trpc-agent-service.git
 cd trpc-agent-service
 
+# 1. 启动依赖（postgres + redis + minio）
+docker compose up -d
+
+# 2. 构建并启动（Admin API 无 token 拒绝启动；mock 通道是无鉴权注入器，
+#    仅本地演示时显式开启）
 ./build.sh
-./start.sh
+TRPC_ADMIN_TOKEN=dev-insecure TRPC_MOCK_CHANNEL=true ./start.sh
 ```
+
+生产部署（k8s）：注入真实 `TRPC_ADMIN_TOKEN`（deploy/k8s/admin.yaml 经
+Secret 引用）、保持 `TRPC_MOCK_CHANNEL=false`，部署步骤见 `deploy/k8s/README.md`
+（含数据库 schema 初始化 Job）。
 
 停止服务：
 

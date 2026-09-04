@@ -122,7 +122,12 @@ func (s *Sender) maxIdle() time.Duration {
 	if s.MaxIdle > 0 {
 		return s.MaxIdle
 	}
-	return 10 * time.Minute
+	// The takeover latency of a rate-limited or wedged send, and the safety
+	// bound against claiming an in-flight send, are the same number: it must
+	// exceed the worst-case send (sendWait 30s pacing + the IM API timeout
+	// per segment); 2min leaves ample slack while keeping requeue delay
+	// bounded instead of the previous 10min.
+	return 2 * time.Minute
 }
 
 func (s *Sender) maxAttempts() int64 {
