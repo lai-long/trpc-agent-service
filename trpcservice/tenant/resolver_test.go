@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/liuzengh/trpc-agent-service/trpcservice/testenv"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/testenv"
 )
 
 // fakeStore implements tenant.Store with a load counter for cache assertions.

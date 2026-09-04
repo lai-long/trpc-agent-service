@@ -47,7 +47,11 @@ func TestSenderOutboundIdempotency(t *testing.T) {
 
 	stream := storage.NewStream(rdb)
 	outbound := "test:sent:out:" + t.Name()
-	sentKey := fmt.Sprintf("sent:counting:dup-msg-%s", t.Name())
+	// The msgID must be unique per run: the sent: marker lives 24h, so a
+	// fixed ID would make the second run's FIRST delivery skip as
+	// "already sent" (exposed by repeat runs against live Redis).
+	msgID := fmt.Sprintf("dup-msg-%s-%d", t.Name(), time.Now().UnixNano())
+	sentKey := fmt.Sprintf("sent:counting::%s", msgID)
 	t.Cleanup(func() { rdb.Del(context.Background(), outbound, sentKey) })
 	if err := stream.EnsureGroup(ctx, outbound, "senders"); err != nil {
 		t.Fatal(err)
@@ -63,7 +67,7 @@ func TestSenderOutboundIdempotency(t *testing.T) {
 	go func() { _ = sender.Run(ctx) }()
 
 	out := channels.OutboundMessage{
-		Channel: "counting", MsgID: "dup-msg-" + t.Name(),
+		Channel: "counting", MsgID: msgID,
 		SessionKey: "dm:counting:u1", UserID: "u1", Text: "reply",
 	}
 	payload, _ := json.Marshal(out)
