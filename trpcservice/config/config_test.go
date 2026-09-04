@@ -38,6 +38,15 @@ func TestLoadFromEnv(t *testing.T) {
 	}
 }
 
+// TestMockChannelDefaultsOff pins the secure default: the mock callback is an
+// unauthenticated message injector, so it takes an explicit opt-in.
+func TestMockChannelDefaultsOff(t *testing.T) {
+	os.Unsetenv("TRPC_MOCK_CHANNEL")
+	if got := Load().MockChannel; got != "false" {
+		t.Errorf("MockChannel default = %q, want false", got)
+	}
+}
+
 func TestMustEnv(t *testing.T) {
 	t.Setenv("TRPC_TEST_REQUIRED", "v")
 	if _, err := MustEnv("TRPC_TEST_REQUIRED"); err != nil {
