@@ -21,6 +21,20 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/config"
 )
 
+// TestCheckAdminToken pins the fail-closed gate: the Admin API must never
+// start unauthenticated by accident, only with an explicit dev sentinel.
+func TestCheckAdminToken(t *testing.T) {
+	if err := checkAdminToken(config.Config{}); err == nil {
+		t.Fatal("unset TRPC_ADMIN_TOKEN must refuse to serve the Admin API")
+	}
+	if err := checkAdminToken(config.Config{AdminToken: config.AdminTokenDevInsecure}); err != nil {
+		t.Fatalf("explicit dev sentinel must be accepted: %v", err)
+	}
+	if err := checkAdminToken(config.Config{AdminToken: "s3cret"}); err != nil {
+		t.Fatalf("a real token must be accepted: %v", err)
+	}
+}
+
 func TestAdminTLSConfigUnset(t *testing.T) {
 	cfg, err := adminTLSConfig(config.Config{})
 	if cfg != nil || err != nil {

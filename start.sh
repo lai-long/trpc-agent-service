@@ -15,6 +15,11 @@ if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
   exit 0
 fi
 
+# The Admin API refuses to start without a token; local dev opts out with the
+# config.AdminTokenDevInsecure sentinel so the loopback-only listener stays
+# reachable (deploy/k8s injects a real secret instead).
+export TRPC_ADMIN_TOKEN="${TRPC_ADMIN_TOKEN:-dev-insecure}"
+
 # The mock channel is an unauthenticated message injector: the binary keeps it
 # off by default, so the local dev entrypoint opts in explicitly (the k8s
 # ConfigMap sets TRPC_MOCK_CHANNEL=false). This is the only place that turns

@@ -14,12 +14,20 @@ import (
 	"os"
 )
 
+// AdminTokenDevInsecure is the only accepted way to run the Admin API
+// without a real bearer token: an empty value refuses to start, so local
+// development must state the intent (design 5.4: the Admin API is internal
+// only and must never be reachable unauthenticated by accident).
+const AdminTokenDevInsecure = "dev-insecure"
+
 // Config aggregates the service's own configuration.
 type Config struct {
 	HTTPAddr string // TRPC_HTTP_ADDR: Gateway/HTTP listen address
 	// AdminAddr is the Admin API listen address in split-role deployments
-	// (serve admin); all-in-one shares the gateway listener. Internal only
-	// (design 5.4).
+	// (serve admin); all-in-one shares the gateway listener. Bound to
+	// loopback by default: the Admin API is internal only (design 5.4) and a
+	// deployment that needs it reachable beyond the host must say so
+	// explicitly (deploy/k8s sets :8081 for the cluster-internal Service).
 	AdminAddr string // TRPC_ADMIN_ADDR
 	// WorkerAddr is the worker role's metrics listener in split-role
 	// deployments (serve worker); each role needs its own address on a
@@ -75,8 +83,10 @@ type Config struct {
 	// a deployment must opt in explicitly (design 5.4 仅内网可达).
 	MockChannel string // TRPC_MOCK_CHANNEL: "true" to enable (dev only)
 
-	// AdminToken guards the Admin API (Authorization: Bearer); empty means
-	// dev mode with no auth — set it in any shared environment.
+	// AdminToken guards the Admin API (Authorization: Bearer). An unset token
+	// is a fatal misconfiguration at startup, not dev mode: the API can
+	// repoint a tenant's model endpoint and rewrite its policies. Local dev
+	// opts out with the explicit AdminTokenDevInsecure sentinel.
 	AdminToken string // TRPC_ADMIN_TOKEN
 
 	// Admin mTLS (split admin role only, design 5.4): when all three are set,
@@ -145,7 +155,7 @@ type Config struct {
 func Load() Config {
 	return Config{
 		HTTPAddr:   getenv("TRPC_HTTP_ADDR", ":8080"),
-		AdminAddr:  getenv("TRPC_ADMIN_ADDR", ":8081"),
+		AdminAddr:  getenv("TRPC_ADMIN_ADDR", "127.0.0.1:8081"),
 		WorkerAddr: getenv("TRPC_WORKER_ADDR", ":8082"),
 		PGDSN:      getenv("TRPC_PG_DSN", "postgres://trpc:trpc-dev-only@localhost:5432/trpc?sslmode=disable"),
 		RedisAddr:  getenv("TRPC_REDIS_ADDR", "localhost:6380"), // host 6379 is often taken by other local services; compose maps 6380

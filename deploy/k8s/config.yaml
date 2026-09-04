@@ -18,6 +18,9 @@ data:
   # production (the binary default is already off; stated here so a future
   # default flip cannot silently re-arm it).
   TRPC_MOCK_CHANNEL: "false"
+  # The admin listener defaults to loopback (design 5.4: internal only); the
+  # cluster-internal Service needs it on all interfaces.
+  TRPC_ADMIN_ADDR: ":8081"
   OTEL_EXPORTER_OTLP_ENDPOINT: "otel-collector.trpc-infra.svc:4317" # Jaeger/Tempo via collector
 ---
 # Infrastructure addresses and secret REFS. In production these come from a

@@ -90,6 +90,17 @@ func serve(role string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// Config validation before any dependency probe: an unauthenticated Admin
+	// API can repoint a tenant's model endpoint (design 5.4), so a missing
+	// token has to refuse the role rather than degrade into an
+	// unauthenticated listener. Deliberately ahead of Redis/PG — otherwise an
+	// infra outage would decide whether the gate runs.
+	if role == "all" || role == "admin" {
+		if err := checkAdminToken(cfg); err != nil {
+			return err
+		}
+	}
+
 	// One secret resolver per process (design 决策三): file backend for local
 	// dev, KMS sidecar when configured, always behind the short-TTL cache.
 	secrets := buildSecretResolver(ctx, cfg)
@@ -360,9 +371,6 @@ func serve(role string) error {
 				return srv.Shutdown(shutdownCtx)
 			})
 			adminAPI.RegisterRoutes(adminMux)
-			if cfg.AdminToken == "" {
-				plog.Warnf("admin API unprotected (TRPC_ADMIN_TOKEN unset) — dev mode only")
-			}
 			plog.Infof("admin API enabled (/admin/...)")
 
 			// Monthly-ish archival (design 5.1.3): move old session_event /
@@ -378,6 +386,24 @@ func serve(role string) error {
 	metrics.StartStreamCollector(gctx, stream, 15*time.Second)
 
 	return g.Wait()
+}
+
+// checkAdminToken enforces design 5.4 (the Admin API is internal only): an
+// unset TRPC_ADMIN_TOKEN is a fatal misconfiguration rather than a dev-mode
+// warning, because the API can repoint a tenant's model endpoint and rewrite
+// its policies. Local development opts out with the explicit
+// config.AdminTokenDevInsecure sentinel.
+func checkAdminToken(cfg config.Config) error {
+	if cfg.AdminToken == "" {
+		return fmt.Errorf("TRPC_ADMIN_TOKEN must be set to serve the Admin API "+
+			"(or %q to run it unauthenticated on localhost only)",
+			config.AdminTokenDevInsecure)
+	}
+	if cfg.AdminToken == config.AdminTokenDevInsecure {
+		plog.Warnf("admin API unprotected (TRPC_ADMIN_TOKEN=%s) — dev mode only",
+			config.AdminTokenDevInsecure)
+	}
+	return nil
 }
 
 // startPGConsumers connects to PG and starts the consumers that depend on it:
