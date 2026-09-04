@@ -196,6 +196,37 @@ type Channel interface {
 	Send(ctx context.Context, msg OutboundMessage) error
 }
 
+// BindingCredentials carries one channel_binding row's callback verification
+// material (design 5.3.1 多租户接入). Secret material stays as references —
+// the adapter resolves them through its SecretResolver and never logs them.
+type BindingCredentials struct {
+	BindingID string
+	// CorpID is the crypt receiver id (WeCom corp / WeChat corp); empty falls
+	// back to the adapter's env-configured corp, or the binding's config.
+	CorpID string
+	// TokenRef / AESKeyRef are the callback verification secret references;
+	// empty falls back to the adapter's env-configured single-binding default.
+	TokenRef  string
+	AESKeyRef string
+}
+
+// BindingAware is implemented by Channel adapters that can serve multiple
+// tenants, verifying each callback with the serving binding's own credentials.
+// The gateway dispatches /callback/{channel}/{binding_id} to the adapter;
+// the env-configured callback path stays mounted as the single-binding
+// default for deployments that have not moved to binding rows. The hardcoded
+// one-path-per-adapter model structurally limited the platform to one tenant
+// per channel (review P1-5).
+type BindingAware interface {
+	// CallbackHandler returns the HTTP handler serving one binding's
+	// callbacks: GET answers the platform's URL-registration challenge, POST
+	// verifies the signature and decrypts before any payload is parsed, then
+	// hands the normalized message to h. Errors mean the binding's credential
+	// references could not be resolved — the caller answers 5xx and the IM
+	// redelivers.
+	CallbackHandler(h Handler, creds BindingCredentials) (http.HandlerFunc, error)
+}
+
 // ScrubError strips credentials from *url.Error values before they reach a
 // log or trace: the WeCom/KF APIs carry access_token (and the corpsecret, on
 // gettoken) in the query string, and net/http embeds the full URL in the

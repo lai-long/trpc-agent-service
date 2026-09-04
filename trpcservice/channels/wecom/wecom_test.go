@@ -297,3 +297,81 @@ func TestCallbackMedia(t *testing.T) {
 		t.Fatalf("media text must carry a placeholder: %q", got.Text)
 	}
 }
+
+// Per-binding callbacks (design 5.3.1 多租户接入): each binding verifies under
+// its own token/AES key, so binding2's handler must reject — with a 200 ack,
+// never a 5xx retry storm — a callback encrypted for binding1, and the same
+// inner message encrypted for binding2 must come through on its own handler.
+func TestCallbackHandlerPerBinding(t *testing.T) {
+	resolver := mapResolver{
+		"tok": testToken, "aes": testAESKey, "secret": "corp-secret", // env default
+		"tok-b2": testToken + "-b2", "aes-b2": testAESKey, // binding 2 creds
+	}
+	c, err := New(Config{
+		CorpID: testCorpID, AgentID: 1000002,
+		TokenRef: "tok", AESKeyRef: "aes", SecretRef: "secret",
+	}, resolver)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var got channels.InboundMessage
+	recording := channels.HandlerFunc(func(_ context.Context, msg channels.InboundMessage) (channels.OutboundMessage, error) {
+		got = msg
+		return channels.OutboundMessage{}, nil
+	})
+
+	h1, err := c.CallbackHandler(recording, channels.BindingCredentials{BindingID: "b1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h2, err := c.CallbackHandler(recording, channels.BindingCredentials{
+		BindingID: "b2", TokenRef: "tok-b2", AESKeyRef: "aes-b2",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	inner := `<xml><ToUserName><![CDATA[ww1234567890]]></ToUserName><FromUserName><![CDATA[zhangsan]]></FromUserName><CreateTime>1700000000</CreateTime><MsgType><![CDATA[text]]></MsgType><Content><![CDATA[绑定一]]></Content><MsgId>9876543222</MsgId><AgentID>1000002</AgentID></xml>`
+	body, query := forgeCallback(t, inner)
+
+	// Binding1's handler decrypts its own callback.
+	req := httptest.NewRequest(http.MethodPost, "/callback/wecom/b1?"+query, strings.NewReader(string(body)))
+	rec := httptest.NewRecorder()
+	h1(rec, req)
+	if rec.Code != http.StatusOK || got.Text != "绑定一" {
+		t.Fatalf("binding1 callback must decrypt: status=%d got=%+v", rec.Code, got)
+	}
+
+	// Binding2's handler must not decrypt binding1's callback (wrong keys),
+	// and must still ack 200 so the platform does not redeliver.
+	got = channels.InboundMessage{}
+	req = httptest.NewRequest(http.MethodPost, "/callback/wecom/b2?"+query, strings.NewReader(string(body)))
+	rec = httptest.NewRecorder()
+	h2(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("cross-binding decrypt failure must ack 200, got %d", rec.Code)
+	}
+	if got.MsgID != "" {
+		t.Fatalf("cross-binding callback must not enter the pipeline, got %+v", got)
+	}
+
+	// A callback encrypted under binding2's own keys reaches the pipeline.
+	crypt2 := wxbizmsgcrypt.NewWXBizMsgCrypt(testToken+"-b2", testAESKey, testCorpID, wxbizmsgcrypt.XmlType)
+	encrypted, cerr := crypt2.EncryptMsg(inner, "1700000000", "nonce-2")
+	if cerr != nil {
+		t.Fatalf("encrypt b2: %s", cerr.ErrMsg)
+	}
+	var env sendEnvelope
+	if err := xml.Unmarshal(encrypted, &env); err != nil {
+		t.Fatal(err)
+	}
+	body2 := []byte(fmt.Sprintf(`<xml><ToUserName><![CDATA[ww1234567890]]></ToUserName><Encrypt><![CDATA[%s]]></Encrypt><AgentID><![CDATA[1000002]]></AgentID></xml>`, env.Encrypt))
+	query2 := fmt.Sprintf("msg_signature=%s&timestamp=%s&nonce=%s", env.MsgSignature, env.TimeStamp, env.Nonce)
+	req = httptest.NewRequest(http.MethodPost, "/callback/wecom/b2?"+query2, strings.NewReader(string(body2)))
+	rec = httptest.NewRecorder()
+	h2(rec, req)
+	if rec.Code != http.StatusOK || got.Text != "绑定一" {
+		t.Fatalf("binding2 callback must decrypt under its own keys: status=%d got=%+v", rec.Code, got)
+	}
+}

@@ -65,17 +65,26 @@ type Config struct {
 // Channel is the WeChat KF implementation of channels.Channel.
 type Channel struct {
 	cfg    Config
-	crypt  *wxbizmsgcrypt.WXBizMsgCrypt
 	secret config.SecretResolver
 	client *http.Client
+
+	// crypts caches one WXBizMsgCrypt per credential set
+	// (corp|tokenRef|aesKeyRef): multi-tenant callbacks arrive with
+	// per-binding refs (design 5.3.1) and each verification needs the
+	// matching crypt. Ref resolution rides the process-level cached
+	// resolver, so rotation propagates within the cache TTL.
+	cryptMu sync.Mutex
+	crypts  map[string]*wxbizmsgcrypt.WXBizMsgCrypt
 
 	tokenMu     sync.Mutex
 	accessToken string
 	tokenExpiry time.Time
 }
 
-// New creates the channel: the callback token and AES key are resolved and
-// validated at startup (fail fast on misconfiguration).
+// New creates the channel: the env callback token and AES key are resolved
+// and validated at startup (fail fast on misconfiguration). They remain the
+// single-binding default for the legacy /wxkf/callback path; per-binding
+// credentials flow through CallbackHandler.
 func New(cfg Config, resolver config.SecretResolver) (*Channel, error) {
 	if cfg.CorpID == "" || cfg.KfAccount == "" {
 		return nil, fmt.Errorf("wxkf: CorpID and KfAccount are required")
@@ -84,38 +93,96 @@ func New(cfg Config, resolver config.SecretResolver) (*Channel, error) {
 		cfg.APIBase = defaultAPIBase
 	}
 	ctx := context.Background()
-	token, err := resolver.Resolve(ctx, cfg.TokenRef)
-	if err != nil {
+	if _, err := resolver.Resolve(ctx, cfg.TokenRef); err != nil {
 		return nil, fmt.Errorf("wxkf: resolve token: %w", err)
 	}
-	aesKey, err := resolver.Resolve(ctx, cfg.AESKeyRef)
-	if err != nil {
+	if _, err := resolver.Resolve(ctx, cfg.AESKeyRef); err != nil {
 		return nil, fmt.Errorf("wxkf: resolve aes key: %w", err)
 	}
 	return &Channel{
 		cfg:    cfg,
-		crypt:  wxbizmsgcrypt.NewWXBizMsgCrypt(token, aesKey, cfg.CorpID, wxbizmsgcrypt.XmlType),
 		secret: resolver,
 		client: &http.Client{Timeout: 10 * time.Second},
+		crypts: map[string]*wxbizmsgcrypt.WXBizMsgCrypt{},
 	}, nil
+}
+
+// cryptFor resolves the credential set and returns its crypt, building and
+// caching it on first use. Empty refs fall back to the env-configured
+// single-binding default.
+func (c *Channel) cryptFor(corpID, tokenRef, aesKeyRef string) (*wxbizmsgcrypt.WXBizMsgCrypt, error) {
+	if corpID == "" {
+		corpID = c.cfg.CorpID
+	}
+	if tokenRef == "" {
+		tokenRef = c.cfg.TokenRef
+	}
+	if aesKeyRef == "" {
+		aesKeyRef = c.cfg.AESKeyRef
+	}
+	key := corpID + "|" + tokenRef + "|" + aesKeyRef
+	c.cryptMu.Lock()
+	defer c.cryptMu.Unlock()
+	if crypt, ok := c.crypts[key]; ok {
+		return crypt, nil
+	}
+	ctx := context.Background()
+	token, err := c.secret.Resolve(ctx, tokenRef)
+	if err != nil {
+		return nil, fmt.Errorf("wxkf: resolve token %q: %w", tokenRef, err)
+	}
+	aesKey, err := c.secret.Resolve(ctx, aesKeyRef)
+	if err != nil {
+		return nil, fmt.Errorf("wxkf: resolve aes key %q: %w", aesKeyRef, err)
+	}
+	crypt := wxbizmsgcrypt.NewWXBizMsgCrypt(token, aesKey, corpID, wxbizmsgcrypt.XmlType)
+	c.crypts[key] = crypt
+	return crypt, nil
 }
 
 // Name implements channels.Channel.
 func (c *Channel) Name() string { return "wxkf" }
 
 // RegisterRoutes implements channels.Channel: GET verifies the callback URL,
-// POST receives encrypted messages.
+// POST receives encrypted messages. The path is the env-configured
+// single-binding default (design 5.3.1); tenant bindings are served through
+// CallbackHandler at /callback/{channel}/{binding_id}.
 func (c *Channel) RegisterRoutes(mux *http.ServeMux, h channels.Handler) {
-	mux.HandleFunc(http.MethodGet+" "+callbackPath, c.verifyURL)
-	mux.HandleFunc(http.MethodPost+" "+callbackPath, func(w http.ResponseWriter, r *http.Request) {
-		c.receive(w, r, h)
+	handler, err := c.CallbackHandler(h, channels.BindingCredentials{})
+	if err != nil {
+		// New already validated the env refs, so this is defensive: mount
+		// nothing and let the path 404 instead of half-serving.
+		plog.Errorf("wxkf callback mount failed: %v", err)
+		return
+	}
+	mux.HandleFunc(http.MethodGet+" "+callbackPath, func(w http.ResponseWriter, r *http.Request) {
+		handler(w, r)
 	})
+	mux.HandleFunc(http.MethodPost+" "+callbackPath, handler)
+}
+
+// CallbackHandler implements channels.BindingAware.
+func (c *Channel) CallbackHandler(h channels.Handler, creds channels.BindingCredentials) (http.HandlerFunc, error) {
+	crypt, err := c.cryptFor(creds.CorpID, creds.TokenRef, creds.AESKeyRef)
+	if err != nil {
+		return nil, err
+	}
+	return func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			c.verifyURL(w, r, crypt)
+		case http.MethodPost:
+			c.receive(w, r, crypt, h)
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
+	}, nil
 }
 
 // verifyURL answers the platform's URL-registration challenge.
-func (c *Channel) verifyURL(w http.ResponseWriter, r *http.Request) {
+func (c *Channel) verifyURL(w http.ResponseWriter, r *http.Request, crypt *wxbizmsgcrypt.WXBizMsgCrypt) {
 	q := r.URL.Query()
-	echo, cerr := c.crypt.VerifyURL(q.Get("msg_signature"), q.Get("timestamp"), q.Get("nonce"), q.Get("echostr"))
+	echo, cerr := crypt.VerifyURL(q.Get("msg_signature"), q.Get("timestamp"), q.Get("nonce"), q.Get("echostr"))
 	if cerr != nil {
 		plog.Warnf("wxkf url verification failed: %s", cerr.ErrMsg)
 		http.Error(w, "verification failed", http.StatusForbidden)
@@ -125,7 +192,7 @@ func (c *Channel) verifyURL(w http.ResponseWriter, r *http.Request) {
 }
 
 // receive handles one encrypted message callback.
-func (c *Channel) receive(w http.ResponseWriter, r *http.Request, h channels.Handler) {
+func (c *Channel) receive(w http.ResponseWriter, r *http.Request, crypt *wxbizmsgcrypt.WXBizMsgCrypt, h channels.Handler) {
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 1<<20))
 	if err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
@@ -147,7 +214,7 @@ func (c *Channel) receive(w http.ResponseWriter, r *http.Request, h channels.Han
 		return
 	}
 	q := r.URL.Query()
-	plain, cerr := c.crypt.DecryptMsg(q.Get("msg_signature"), q.Get("timestamp"), q.Get("nonce"), xmlEnvelope(envelope.Encrypt))
+	plain, cerr := crypt.DecryptMsg(q.Get("msg_signature"), q.Get("timestamp"), q.Get("nonce"), xmlEnvelope(envelope.Encrypt))
 	if cerr != nil {
 		// Signature/decryption failures are not retryable: ack so the
 		// platform does not redeliver, and log for investigation.

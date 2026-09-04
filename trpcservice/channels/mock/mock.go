@@ -42,9 +42,22 @@ func New() *Channel {
 func (c *Channel) Name() string { return "mock" }
 
 // RegisterRoutes implements channels.Channel.
-// POST /mock/callback simulates the IM webhook callback.
+// POST /mock/callback simulates the IM webhook callback (dev only: the mock
+// is an unauthenticated injector, see config.MockChannel).
 func (c *Channel) RegisterRoutes(mux *http.ServeMux, h channels.Handler) {
-	mux.HandleFunc("POST /mock/callback", func(w http.ResponseWriter, r *http.Request) {
+	handler, err := c.CallbackHandler(h, channels.BindingCredentials{})
+	if err != nil {
+		plog.Errorf("mock callback mount failed: %v", err)
+		return
+	}
+	mux.HandleFunc("POST /mock/callback", handler)
+}
+
+// CallbackHandler implements channels.BindingAware: the mock has no
+// credentials, but binding-scoped paths let multi-tenant integration tests
+// exercise the dispatcher with two tenants on one channel.
+func (c *Channel) CallbackHandler(h channels.Handler, _ channels.BindingCredentials) (http.HandlerFunc, error) {
+	return func(w http.ResponseWriter, r *http.Request) {
 		// 1. Decode the IM callback payload (a real implementation verifies
 		//    the signature and decrypts before this step).
 		var req callbackRequest
@@ -99,7 +112,7 @@ func (c *Channel) RegisterRoutes(mux *http.ServeMux, h channels.Handler) {
 			return
 		}
 		writeReply(w, "ok", out.Text)
-	})
+	}, nil
 }
 
 // Send implements channels.Channel. The mock calls no IM API; it only records

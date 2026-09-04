@@ -56,13 +56,14 @@ type Resolver struct {
 	store Store
 	ttl   time.Duration
 
-	mu       sync.RWMutex
-	tenants  map[string]Tenant
-	apps     map[string]AgentApp
-	bindings map[string]ChannelBinding // by webhook_path
-	migs     map[string]Migration      // by tenant_id + ":" + resource
-	loadedAt time.Time
-	loaded   bool
+	mu           sync.RWMutex
+	tenants      map[string]Tenant
+	apps         map[string]AgentApp
+	bindings     map[string]ChannelBinding // by webhook_path (gateway routing)
+	bindingsByID map[string]ChannelBinding // by binding id (callback dispatch)
+	migs         map[string]Migration      // by tenant_id + ":" + resource
+	loadedAt     time.Time
+	loaded       bool
 }
 
 // NewResolver creates a Resolver with the default cache TTL.
@@ -221,14 +222,16 @@ func (r *Resolver) refresh(ctx context.Context) error {
 		apps[a.ID] = a
 	}
 	bindings := make(map[string]ChannelBinding, len(d.Bindings))
+	bindingsByID := make(map[string]ChannelBinding, len(d.Bindings))
 	for _, b := range d.Bindings {
 		bindings[b.WebhookPath] = b
+		bindingsByID[b.ID] = b
 	}
 	migs := make(map[string]Migration, len(d.Migrations))
 	for _, m := range d.Migrations {
 		migs[m.TenantID+":"+m.Resource] = m
 	}
-	r.tenants, r.apps, r.bindings, r.migs = tenants, apps, bindings, migs
+	r.tenants, r.apps, r.bindings, r.bindingsByID, r.migs = tenants, apps, bindings, bindingsByID, migs
 	r.loadedAt = time.Now()
 	r.loaded = true
 	return nil
@@ -246,4 +249,23 @@ func (r *Resolver) ActiveMigration(tenantID, resource string) *Migration {
 	}
 	cp := m
 	return &cp
+}
+
+// BindingByID looks up one channel binding by its ID, for the callback
+// dispatcher at /callback/{channel}/{binding_id}: the path identifies the
+// binding row directly, and the adapter needs the row's credential references
+// to verify the callback (design 5.3.1). Status enforcement stays on the
+// routing path (EnqueueHandler.Resolve) which re-checks binding, tenant and
+// app before a message enters the pipeline.
+func (r *Resolver) BindingByID(ctx context.Context, id string) (ChannelBinding, error) {
+	if err := r.refresh(ctx); err != nil {
+		return ChannelBinding{}, err
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	b, ok := r.bindingsByID[id]
+	if !ok {
+		return ChannelBinding{}, fmt.Errorf("%w: binding %s", ErrUnknownBinding, id)
+	}
+	return b, nil
 }

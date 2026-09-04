@@ -239,6 +239,24 @@ func serve(role string) error {
 			channelSet[kf.Name()] = kf
 		}
 
+		// Multi-tenant callback paths (design 5.3.1 多租户接入):
+		// /callback/{channel}/{binding_id} dispatches to the owning adapter
+		// with the binding's own credential references, so each tenant's
+		// webhook verifies under its own token/AES key. Bindings created
+		// after startup become reachable on the next resolver refresh — no
+		// restart, no mux surgery. The legacy env-configured paths above stay
+		// mounted as the single-binding default.
+		if resolver != nil {
+			bindingDispatch := web.BindingDispatcher{
+				Channels: channelSet,
+				Bindings: resolver,
+				Handler:  enqueue,
+			}
+			mux.Handle("GET /callback/{channel}/{binding}", bindingDispatch)
+			mux.Handle("POST /callback/{channel}/{binding}", bindingDispatch)
+			plog.Infof("binding callbacks enabled (/callback/{channel}/{binding_id})")
+		}
+
 		srv := &http.Server{
 			Addr:    cfg.HTTPAddr,
 			Handler: mux,

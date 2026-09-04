@@ -23,6 +23,10 @@ INSERT INTO agent_app (id, tenant_id, name, agent_type, config, version, status)
      '{"prompt": "你是演示助手，回答简洁友好。", "tools": {"allow": ["get_weather", "delete_user_data"]}}',
      1, 'published');
 
+-- Binding paths: the legacy /{channel}/callback paths are the env-configured
+-- single-binding defaults. Tenant bindings mount at
+-- /callback/{channel}/{binding_id} (design 5.3.1) and carry their own
+-- token_ref/aeskey_ref, so each tenant's webhook verifies under its own keys.
 INSERT INTO channel_binding (id, tenant_id, channel, app_id, webhook_path, status) VALUES
     ('00000000-0000-0000-0000-000000000201', '00000000-0000-0000-0000-000000000001',
      'mock', '00000000-0000-0000-0000-000000000101', '/mock/callback', 'active'),
@@ -30,4 +34,8 @@ INSERT INTO channel_binding (id, tenant_id, channel, app_id, webhook_path, statu
      'testweb', '00000000-0000-0000-0000-000000000101', '/testweb/callback', 'active'),
     -- token_ref/aeskey_ref resolve via the SecretResolver (data/secrets/ locally)
     ('00000000-0000-0000-0000-000000000203', '00000000-0000-0000-0000-000000000001',
-     'wecom', '00000000-0000-0000-0000-000000000101', '/wecom/callback', 'active');
+     'wecom', '00000000-0000-0000-0000-000000000101', '/wecom/callback', 'active'),
+    -- Multi-tenant demo: a second tenant on the same mock channel, served
+    -- through the binding-scoped path. Requires TRPC_MOCK_CHANNEL=true.
+    ('00000000-0000-0000-0000-000000000204', '00000000-0000-0000-0000-000000000001',
+     'mock', '00000000-0000-0000-0000-000000000101', '/callback/mock/00000000-0000-0000-0000-000000000204', 'active');
