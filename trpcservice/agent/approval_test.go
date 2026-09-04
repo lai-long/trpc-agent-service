@@ -28,7 +28,11 @@ func approverForTest(t *testing.T) (*Approver, *redis.Client) {
 }
 
 func invocationCtx(sessionKey, userID string) context.Context {
-	inv := &tagent.Invocation{Session: &session.Session{ID: sessionKey, UserID: userID}}
+	return invocationCtxFor("test-app", sessionKey, userID)
+}
+
+func invocationCtxFor(appID, sessionKey, userID string) context.Context {
+	inv := &tagent.Invocation{Session: &session.Session{ID: sessionKey, UserID: userID, AppName: appID}}
 	return tagent.NewInvocationContext(context.Background(), inv)
 }
 
@@ -43,7 +47,7 @@ func toolArgs(callID, toolName, jsonArgs string) *ttool.BeforeToolArgs {
 func TestBeforeToolPendsDangerousCall(t *testing.T) {
 	ap, rdb := approverForTest(t)
 	sessionKey := "test:approval:" + t.Name()
-	t.Cleanup(func() { rdb.Del(context.Background(), approvalKey(sessionKey)) })
+	t.Cleanup(func() { rdb.Del(context.Background(), approvalKey(approvalScope{"test-app", sessionKey})) })
 
 	// Safe tools pass through untouched.
 	res, err := ap.BeforeTool(invocationCtx(sessionKey, "u1"), toolArgs("c0", "safe", `{}`))
@@ -59,14 +63,14 @@ func TestBeforeToolPendsDangerousCall(t *testing.T) {
 	if res == nil || res.CustomResult == nil {
 		t.Fatal("dangerous call must be short-circuited with a synthetic result")
 	}
-	p, err := ap.pending(context.Background(), sessionKey)
+	p, err := ap.pending(context.Background(), approvalScope{"test-app", sessionKey})
 	if err != nil || p == nil {
 		t.Fatalf("pending approval not stored: %v %+v", err, p)
 	}
 	if p.ToolName != "op_a" || p.Requester != "u1" || p.CallID != "c1" {
 		t.Fatalf("unexpected pending: %+v", p)
 	}
-	sig, ok := ap.TakeSignal(sessionKey)
+	sig, ok := ap.TakeSignal(approvalScope{"test-app", sessionKey})
 	if !ok || sig.Kind != "created" || !sig.Fresh {
 		t.Fatalf("want fresh created signal, got %+v (ok=%v)", sig, ok)
 	}
@@ -77,7 +81,7 @@ func TestBeforeToolPendsDangerousCall(t *testing.T) {
 	if err != nil || res == nil {
 		t.Fatalf("re-attempt must be blocked, got res=%v err=%v", res, err)
 	}
-	sig, ok = ap.TakeSignal(sessionKey)
+	sig, ok = ap.TakeSignal(approvalScope{"test-app", sessionKey})
 	if !ok || sig.Kind != "created" || sig.Fresh {
 		t.Fatalf("want non-fresh created signal for re-attempt, got %+v", sig)
 	}
@@ -87,7 +91,7 @@ func TestBeforeToolPendsDangerousCall(t *testing.T) {
 	if err != nil || res == nil {
 		t.Fatalf("conflicting call must be blocked, got res=%v err=%v", res, err)
 	}
-	sig, ok = ap.TakeSignal(sessionKey)
+	sig, ok = ap.TakeSignal(approvalScope{"test-app", sessionKey})
 	if !ok || sig.Kind != "conflict" || sig.Pending != "op_a" {
 		t.Fatalf("want conflict signal naming the pending tool, got %+v", sig)
 	}
@@ -96,7 +100,7 @@ func TestBeforeToolPendsDangerousCall(t *testing.T) {
 func TestAnswerConfirmExecutesTool(t *testing.T) {
 	ap, rdb := approverForTest(t)
 	sessionKey := "test:approval:" + t.Name()
-	t.Cleanup(func() { rdb.Del(context.Background(), approvalKey(sessionKey)) })
+	t.Cleanup(func() { rdb.Del(context.Background(), approvalKey(approvalScope{"test-app", sessionKey})) })
 	ctx := context.Background()
 
 	if _, err := ap.BeforeTool(invocationCtx(sessionKey, "u1"), toolArgs("c1", "op_a", `{"x":"1"}`)); err != nil {
@@ -125,7 +129,7 @@ func TestAnswerConfirmExecutesTool(t *testing.T) {
 func TestAnswerReject(t *testing.T) {
 	ap, rdb := approverForTest(t)
 	sessionKey := "test:approval:" + t.Name()
-	t.Cleanup(func() { rdb.Del(context.Background(), approvalKey(sessionKey)) })
+	t.Cleanup(func() { rdb.Del(context.Background(), approvalKey(approvalScope{"test-app", sessionKey})) })
 	ctx := context.Background()
 
 	if _, err := ap.BeforeTool(invocationCtx(sessionKey, "u1"), toolArgs("c1", "op_a", `{"x":"1"}`)); err != nil {
@@ -148,10 +152,10 @@ func TestAnswerReject(t *testing.T) {
 func TestAnswerTimeout(t *testing.T) {
 	ap, rdb := approverForTest(t)
 	sessionKey := "test:approval:" + t.Name()
-	t.Cleanup(func() { rdb.Del(context.Background(), approvalKey(sessionKey)) })
+	t.Cleanup(func() { rdb.Del(context.Background(), approvalKey(approvalScope{"test-app", sessionKey})) })
 
 	// Seed an already-expired pending record.
-	if err := ap.set(context.Background(), sessionKey, PendingApproval{
+	if err := ap.set(context.Background(), approvalScope{"test-app", sessionKey}, PendingApproval{
 		CallID: "c1", ToolName: "op_a", Arguments: []byte(`{"x":"1"}`),
 		Requester: "u1", Deadline: time.Now().Add(-time.Minute),
 	}); err != nil {
@@ -174,7 +178,7 @@ func TestAnswerTimeout(t *testing.T) {
 func TestAnswerGroupOnlyRequester(t *testing.T) {
 	ap, rdb := approverForTest(t)
 	sessionKey := "test:approval:" + t.Name()
-	t.Cleanup(func() { rdb.Del(context.Background(), approvalKey(sessionKey)) })
+	t.Cleanup(func() { rdb.Del(context.Background(), approvalKey(approvalScope{"test-app", sessionKey})) })
 	ctx := context.Background()
 
 	if _, err := ap.BeforeTool(invocationCtx(sessionKey, "u1"), toolArgs("c1", "op_a", `{"x":"1"}`)); err != nil {
@@ -193,7 +197,7 @@ func TestAnswerGroupOnlyRequester(t *testing.T) {
 	if !strings.Contains(out.Text, "发起人") {
 		t.Fatalf("want requester-only notice, got %q", out.Text)
 	}
-	p, _ := ap.pending(ctx, sessionKey)
+	p, _ := ap.pending(ctx, approvalScope{"test-app", sessionKey})
 	if p == nil {
 		t.Fatal("non-requester answer must not consume the pending approval")
 	}
@@ -209,7 +213,7 @@ func TestAnswerGroupOnlyRequester(t *testing.T) {
 func TestNonAnswerDoesNotDisturbPending(t *testing.T) {
 	ap, rdb := approverForTest(t)
 	sessionKey := "test:approval:" + t.Name()
-	t.Cleanup(func() { rdb.Del(context.Background(), approvalKey(sessionKey)) })
+	t.Cleanup(func() { rdb.Del(context.Background(), approvalKey(approvalScope{"test-app", sessionKey})) })
 	ctx := context.Background()
 
 	if _, err := ap.BeforeTool(invocationCtx(sessionKey, "u1"), toolArgs("c1", "op_a", `{"x":"1"}`)); err != nil {
@@ -221,7 +225,7 @@ func TestNonAnswerDoesNotDisturbPending(t *testing.T) {
 	if err != nil || handled {
 		t.Fatalf("non-answer must pass through, got handled=%v err=%v", handled, err)
 	}
-	p, _ := ap.pending(ctx, sessionKey)
+	p, _ := ap.pending(ctx, approvalScope{"test-app", sessionKey})
 	if p == nil {
 		t.Fatal("non-answer message must not disturb the pending approval")
 	}
@@ -233,10 +237,49 @@ func TestNonAnswerDoesNotDisturbPending(t *testing.T) {
 // confirmation.
 func TestApprovalSignalFreshSurvivesRehit(t *testing.T) {
 	ap := NewApprover(nil, testRegistry(), 0)
-	ap.setSignal("s1", Signal{Kind: "created", ToolName: "op_a", Fresh: true})
-	ap.setSignal("s1", Signal{Kind: "created", ToolName: "op_a", Fresh: false}) // retry re-hit
-	sig, ok := ap.TakeSignal("s1")
+	ap.setSignal(approvalScope{"test-app", "s1"}, Signal{Kind: "created", ToolName: "op_a", Fresh: true})
+	ap.setSignal(approvalScope{"test-app", "s1"}, Signal{Kind: "created", ToolName: "op_a", Fresh: false}) // retry re-hit
+	sig, ok := ap.TakeSignal(approvalScope{"test-app", "s1"})
 	if !ok || !sig.Fresh {
 		t.Fatalf("fresh signal must survive the re-hit, got %+v", sig)
+	}
+}
+
+// Approval keys are scoped by (app_id, session_key): the same IM user on two
+// tenants carries the same channel:user session key, and tenant B must neither
+// see nor consume tenant A's pending dangerous call (review P1-6, design
+// 5.3.3). This is the cross-tenant confirmation exploit, regression-tested.
+func TestApprovalCrossAppIsolation(t *testing.T) {
+	ap, rdb := approverForTest(t)
+	ctx := context.Background()
+	sessionKey := "test:approval:" + t.Name()
+	t.Cleanup(func() {
+		rdb.Del(ctx, approvalKey(approvalScope{"app-a", sessionKey}))
+		rdb.Del(ctx, approvalKey(approvalScope{"app-b", sessionKey}))
+	})
+
+	// Tenant A's run pends a dangerous call.
+	if res, err := ap.BeforeTool(invocationCtxFor("app-a", sessionKey, "u1"), toolArgs("c1", "op_a", `{"x":"1"}`)); err != nil || res == nil {
+		t.Fatalf("app-a dangerous call must be pended: res=%v err=%v", res, err)
+	}
+
+	// Tenant B's user sends "确认" for the same session key: no pending record
+	// is visible in B's scope, so the answer passes through untouched.
+	msg := testMsg("确认")
+	msg.AppID = "app-b"
+	msg.SessionKey = sessionKey
+	handled, _, _, err := ap.Answer(ctx, msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if handled {
+		t.Fatal("tenant B's answer must not consume tenant A's pending approval")
+	}
+
+	// B's own dangerous call creates its own pending record instead of
+	// colliding with A's (no conflict).
+	res, err := ap.BeforeTool(invocationCtxFor("app-b", sessionKey, "u1"), toolArgs("c2", "op_b", `{"y":"2"}`))
+	if err != nil || res == nil {
+		t.Fatalf("app-b dangerous call must pend independently: res=%v err=%v", res, err)
 	}
 }

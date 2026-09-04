@@ -52,6 +52,7 @@ func (EchoProcessor) Process(_ context.Context, msg channels.InboundMessage) (ch
 		SessionKey: msg.SessionKey,
 		UserID:     msg.UserID,
 		ChatID:     msg.ChatID,
+		BindingID:  msg.BindingID,
 		Text:       "echo: " + msg.Text,
 		TenantID:   msg.TenantID,
 		TraceID:    msg.TraceID,
@@ -231,7 +232,7 @@ func (w *Worker) handle(ctx context.Context, m storage.Message) {
 	// reply already made it outbound is acked without reprocessing — the LLM
 	// must not run twice and the journal must not get duplicate events.
 	if w.Processed != nil {
-		done, err := w.Processed.IsDone(ctx, msg.Channel, msg.MsgID)
+		done, err := w.Processed.IsDone(ctx, msg.Channel, msg.BindingID, msg.MsgID)
 		if err != nil {
 			plog.Warnf("worker %s done check %s: %v", w.Name, m.ID, err)
 			// Fall through: better to reprocess than to wedge on a Redis hiccup.
@@ -246,14 +247,14 @@ func (w *Worker) handle(ctx context.Context, m storage.Message) {
 	// across replicas. Deferred calls run LIFO: the watchdog stops first,
 	// then the lock is released.
 	if w.Lock != nil {
-		owner, stopWatchdog, ok := w.acquireSession(ctx, m, msg.SessionKey)
+		owner, stopWatchdog, ok := w.acquireSession(ctx, m, msg.AppID, msg.SessionKey)
 		if !ok {
 			return // re-queued or shutting down
 		}
 		defer func() {
 			releaseCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 			defer cancel()
-			if err := w.Lock.Release(releaseCtx, msg.SessionKey, owner); err != nil {
+			if err := w.Lock.Release(releaseCtx, msg.AppID, msg.SessionKey, owner); err != nil {
 				plog.Warnf("worker %s release lock %s: %v", w.Name, msg.SessionKey, err)
 			}
 		}()
@@ -277,7 +278,7 @@ func (w *Worker) handle(ctx context.Context, m storage.Message) {
 	// done, ack, no outbound hop.
 	if out.Text == "" {
 		if w.Processed != nil {
-			if err := w.Processed.MarkDone(ctx, msg.Channel, msg.MsgID); err != nil {
+			if err := w.Processed.MarkDone(ctx, msg.Channel, msg.BindingID, msg.MsgID); err != nil {
 				plog.Warnf("worker %s done mark %s: %v", w.Name, m.ID, err)
 			}
 		}
@@ -307,7 +308,7 @@ func (w *Worker) handle(ctx context.Context, m storage.Message) {
 	// reprocessing (the reply is already queued; the sent: key covers the
 	// sender side).
 	if w.Processed != nil {
-		if err := w.Processed.MarkDone(ctx, msg.Channel, msg.MsgID); err != nil {
+		if err := w.Processed.MarkDone(ctx, msg.Channel, msg.BindingID, msg.MsgID); err != nil {
 			plog.Warnf("worker %s done mark %s: %v", w.Name, m.ID, err)
 		}
 	}
@@ -354,16 +355,16 @@ func (w *Worker) reap(ctx context.Context) {
 // message is re-queued (as a new entry) and the original acked, so a busy
 // session delays the message instead of failing it. The returned stop ends
 // the renewal watchdog.
-func (w *Worker) acquireSession(ctx context.Context, m storage.Message, sessionKey string) (owner string, stop func(), ok bool) {
+func (w *Worker) acquireSession(ctx context.Context, m storage.Message, appID, sessionKey string) (owner string, stop func(), ok bool) {
 	owner = w.Name + ":" + m.ID
 	deadline := time.Now().Add(w.lockWait())
 	for {
-		acquired, err := w.Lock.TryAcquire(ctx, sessionKey, owner, w.lockTTL())
+		acquired, err := w.Lock.TryAcquire(ctx, appID, sessionKey, owner, w.lockTTL())
 		if err != nil {
 			plog.Warnf("worker %s acquire lock %s: %v", w.Name, sessionKey, err)
 		}
 		if acquired {
-			return owner, w.startLockWatchdog(ctx, sessionKey, owner), true
+			return owner, w.startLockWatchdog(ctx, appID, sessionKey, owner), true
 		}
 		if time.Now().After(deadline) {
 			if _, err := w.Stream.Add(ctx, w.inStream(), m.Payload); err != nil {
@@ -388,7 +389,7 @@ func (w *Worker) acquireSession(ctx context.Context, m storage.Message, sessionK
 // and slow generations cannot outlive the lease. A Redis hiccup is retried on
 // the next tick (the TTL has slack for one or two misses); only losing the
 // lock itself (another owner) stops the renewal — the lock is gone anyway.
-func (w *Worker) startLockWatchdog(ctx context.Context, sessionKey, owner string) (stop func()) {
+func (w *Worker) startLockWatchdog(ctx context.Context, appID, sessionKey, owner string) (stop func()) {
 	done := make(chan struct{})
 	go func() {
 		ticker := time.NewTicker(w.lockTTL() / 3)
@@ -400,7 +401,7 @@ func (w *Worker) startLockWatchdog(ctx context.Context, sessionKey, owner string
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				ok, err := w.Lock.Extend(ctx, sessionKey, owner, w.lockTTL())
+				ok, err := w.Lock.Extend(ctx, appID, sessionKey, owner, w.lockTTL())
 				switch {
 				case err != nil:
 					// Transient Redis failure: keep renewing — the lease has

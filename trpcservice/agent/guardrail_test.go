@@ -52,7 +52,7 @@ func (f *fakeAuditor) asyncDecisions() []storage.AuditEvent {
 func testMsg(text string) channels.InboundMessage {
 	return channels.InboundMessage{
 		Channel: "mock", MsgID: "m1", SessionKey: "dm:mock:u1", UserID: "u1",
-		Text: text, TenantID: "t1", TraceID: "trace-1",
+		Text: text, TenantID: "t1", AppID: "test-app", TraceID: "trace-1",
 	}
 }
 
@@ -133,7 +133,7 @@ func TestGuardedPassthroughAuditsAllow(t *testing.T) {
 func TestGuardedSignalReplacesReply(t *testing.T) {
 	aud := &fakeAuditor{}
 	ap := NewApprover(nil, testRegistry(), 0) // nil rdb: store disabled, signals work
-	ap.setSignal("dm:mock:u1", Signal{
+	ap.setSignal(approvalScope{"test-app", "dm:mock:u1"}, Signal{
 		Kind: "created", ToolName: "op_a", Args: `{"x":"1"}`,
 		Deadline: time.Now().Add(5 * time.Minute), Fresh: true,
 	})
@@ -223,7 +223,7 @@ func TestGuardedModelErrorWithPendingSignalDeliversConfirmation(t *testing.T) {
 	// approval is real, so the confirmation notice wins over the busy reply.
 	aud := &fakeAuditor{}
 	ap := NewApprover(nil, testRegistry(), 0)
-	ap.setSignal("dm:mock:u1", Signal{
+	ap.setSignal(approvalScope{"test-app", "dm:mock:u1"}, Signal{
 		Kind: "created", ToolName: "op_a", Args: `{"x":"1"}`,
 		Deadline: time.Now().Add(5 * time.Minute), Fresh: true,
 	})

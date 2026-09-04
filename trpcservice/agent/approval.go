@@ -33,9 +33,12 @@ const approvalKeyGrace = 5 * time.Minute
 const approvalToolTimeout = time.Minute
 
 // PendingApproval is a dangerous tool call waiting for in-band user
-// confirmation. It is stored in Redis (key approval:{session_key}) rather
-// than in framework session.state: same node-shared durability, but with a
-// native TTL and readable without loading the whole session.
+// confirmation. It is stored in Redis (key approval:{app_id}:{session_key})
+// rather than in framework session.state: same node-shared durability, but
+// with a native TTL and readable without loading the whole session. The app
+// dimension matches the session identity (app_id, session_key): two tenants'
+// users carrying the same channel:user session key must never see — let alone
+// confirm — each other's pending dangerous calls (design 5.3.3).
 type PendingApproval struct {
 	CallID    string          `json:"call_id"`
 	ToolName  string          `json:"tool_name"`
@@ -69,7 +72,7 @@ type Approver struct {
 	timeout time.Duration
 
 	mu      sync.Mutex
-	signals map[string]Signal // session_key → signal of the current run
+	signals map[string]Signal // approvalScope key → signal of the current run
 }
 
 // NewApprover creates an Approver. A nil rdb disables the approval store;
@@ -81,7 +84,15 @@ func NewApprover(rdb *redis.Client, tools *tool.Registry, timeout time.Duration)
 	return &Approver{rdb: rdb, tools: tools, timeout: timeout, signals: make(map[string]Signal)}
 }
 
-func approvalKey(sessionKey string) string { return "approval:" + sessionKey }
+// approvalScope is the isolation-scoped key material of one approval/signal:
+// the session's (app, key) pair. Every approval key and the in-process signal
+// map key derive from it, so cross-tenant collisions of the bare session key
+// cannot reach the store.
+type approvalScope struct{ appID, sessionKey string }
+
+func approvalKey(s approvalScope) string {
+	return "approval:" + s.appID + ":" + s.sessionKey
+}
 
 // blockedResult is the synthetic tool result for an intercepted call: it
 // tells the model the call did not execute, so the LLM reply (used only as a
@@ -111,8 +122,9 @@ func (a *Approver) BeforeTool(ctx context.Context, args *ttool.BeforeToolArgs) (
 		return blockedResult("无法确认会话上下文，危险操作被拒绝"), nil
 	}
 	sessionKey := inv.Session.ID
+	scope := approvalScope{appID: inv.Session.AppName, sessionKey: sessionKey}
 
-	existing, err := a.pending(ctx, sessionKey)
+	existing, err := a.pending(ctx, scope)
 	if err != nil {
 		return blockedResult("审批存储读取失败，危险操作被拒绝"), nil
 	}
@@ -121,8 +133,8 @@ func (a *Approver) BeforeTool(ctx context.Context, args *ttool.BeforeToolArgs) (
 	if existing != nil && now.After(existing.Deadline) {
 		// Lazy timeout detection: audit review_timeout via the signal and
 		// drop the stale record. The user must re-issue the operation.
-		_ = a.delete(ctx, sessionKey)
-		a.setSignal(sessionKey, Signal{Kind: "timeout", ToolName: existing.ToolName})
+		_ = a.delete(ctx, scope)
+		a.setSignal(scope, Signal{Kind: "timeout", ToolName: existing.ToolName})
 		return blockedResult("上一个待确认操作已超时作废，请重新向用户说明并等待其再次发起"), nil
 	}
 	if existing != nil {
@@ -130,7 +142,7 @@ func (a *Approver) BeforeTool(ctx context.Context, args *ttool.BeforeToolArgs) (
 			// The same call re-attempted (message redelivery or model retry):
 			// reuse the pending record — no duplicate review audit, the
 			// confirmation message gets re-sent and deduplicated downstream.
-			a.setSignal(sessionKey, Signal{
+			a.setSignal(scope, Signal{
 				Kind: "created", ToolName: existing.ToolName,
 				Args: summarizeArgs(existing.Arguments), Deadline: existing.Deadline,
 			})
@@ -138,7 +150,7 @@ func (a *Approver) BeforeTool(ctx context.Context, args *ttool.BeforeToolArgs) (
 		}
 		// One pending approval per session at a time (design 5.3.3 rule 5):
 		// reject the new call, keep the original pending.
-		a.setSignal(sessionKey, Signal{
+		a.setSignal(scope, Signal{
 			Kind: "conflict", ToolName: args.ToolName, Pending: existing.ToolName,
 		})
 		return blockedResult("当前已有待确认的操作，请先完成该审批"), nil
@@ -151,10 +163,10 @@ func (a *Approver) BeforeTool(ctx context.Context, args *ttool.BeforeToolArgs) (
 		Requester: inv.Session.UserID,
 		Deadline:  now.Add(a.timeout),
 	}
-	if err := a.set(ctx, sessionKey, p); err != nil {
+	if err := a.set(ctx, scope, p); err != nil {
 		return blockedResult("审批存储写入失败，危险操作被拒绝"), nil
 	}
-	a.setSignal(sessionKey, Signal{
+	a.setSignal(scope, Signal{
 		Kind: "created", ToolName: p.ToolName, Args: summarizeArgs(p.Arguments),
 		Deadline: p.Deadline, Fresh: true,
 	})
@@ -172,7 +184,7 @@ func (a *Approver) Answer(ctx context.Context, msg channels.InboundMessage) (han
 	if a == nil || a.rdb == nil {
 		return false, channels.OutboundMessage{}, dec, nil
 	}
-	p, err := a.pending(ctx, msg.SessionKey)
+	p, err := a.pending(ctx, approvalScope{appID: msg.AppID, sessionKey: msg.SessionKey})
 	if err != nil {
 		return false, channels.OutboundMessage{}, dec, fmt.Errorf("read pending approval: %w", err)
 	}
@@ -195,8 +207,9 @@ func (a *Approver) Answer(ctx context.Context, msg channels.InboundMessage) (han
 		return true, reply, dec, nil
 	}
 
+	scope := approvalScope{appID: msg.AppID, sessionKey: msg.SessionKey}
 	if time.Now().After(p.Deadline) {
-		_ = a.delete(ctx, msg.SessionKey)
+		_ = a.delete(ctx, scope)
 		reply.Text = fmt.Sprintf("操作 %s 的确认已超时作废，如需执行请重新发起。", p.ToolName)
 		return true, reply, auditDecision{decision: "review_timeout", toolName: p.ToolName}, nil
 	}
@@ -204,7 +217,7 @@ func (a *Approver) Answer(ctx context.Context, msg channels.InboundMessage) (han
 	// Consume the record BEFORE any execution: a crash after this point loses
 	// the confirmation rather than risking a double execution of a dangerous
 	// tool.
-	if err := a.delete(ctx, msg.SessionKey); err != nil {
+	if err := a.delete(ctx, scope); err != nil {
 		return true, channels.OutboundMessage{}, dec, fmt.Errorf("consume pending approval: %w", err)
 	}
 
@@ -234,31 +247,33 @@ func (a *Approver) Answer(ctx context.Context, msg channels.InboundMessage) (han
 }
 
 // TakeSignal returns and clears the interception signal of the session's
-// current run.
-func (a *Approver) TakeSignal(sessionKey string) (Signal, bool) {
+// current run. The scope must match the one BeforeTool signaled with.
+func (a *Approver) TakeSignal(scope approvalScope) (Signal, bool) {
+	key := approvalKey(scope)
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	s, ok := a.signals[sessionKey]
-	delete(a.signals, sessionKey)
+	s, ok := a.signals[key]
+	delete(a.signals, key)
 	return s, ok
 }
 
-func (a *Approver) setSignal(sessionKey string, s Signal) {
+func (a *Approver) setSignal(scope approvalScope, s Signal) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	key := approvalKey(scope)
 	// A fresh "created" signal (the one carrying the review decision the
 	// guardrail must audit synchronously) must not be overwritten by the
 	// non-fresh re-hit the model's in-run retry produces — losing it would
 	// drop the review audit while the user still gets the confirmation.
-	if existing, ok := a.signals[sessionKey]; ok &&
+	if existing, ok := a.signals[key]; ok &&
 		existing.Kind == "created" && existing.Fresh && s.Kind == "created" && !s.Fresh {
 		return
 	}
-	a.signals[sessionKey] = s
+	a.signals[key] = s
 }
 
-func (a *Approver) pending(ctx context.Context, sessionKey string) (*PendingApproval, error) {
-	data, err := a.rdb.Get(ctx, approvalKey(sessionKey)).Bytes()
+func (a *Approver) pending(ctx context.Context, scope approvalScope) (*PendingApproval, error) {
+	data, err := a.rdb.Get(ctx, approvalKey(scope)).Bytes()
 	if errors.Is(err, redis.Nil) {
 		return nil, nil
 	}
@@ -272,19 +287,19 @@ func (a *Approver) pending(ctx context.Context, sessionKey string) (*PendingAppr
 	return &p, nil
 }
 
-func (a *Approver) set(ctx context.Context, sessionKey string, p PendingApproval) error {
+func (a *Approver) set(ctx context.Context, scope approvalScope, p PendingApproval) error {
 	data, err := json.Marshal(p)
 	if err != nil {
 		return fmt.Errorf("encode approval: %w", err)
 	}
-	if err := a.rdb.Set(ctx, approvalKey(sessionKey), data, a.timeout+approvalKeyGrace).Err(); err != nil {
+	if err := a.rdb.Set(ctx, approvalKey(scope), data, a.timeout+approvalKeyGrace).Err(); err != nil {
 		return fmt.Errorf("set approval: %w", err)
 	}
 	return nil
 }
 
-func (a *Approver) delete(ctx context.Context, sessionKey string) error {
-	if err := a.rdb.Del(ctx, approvalKey(sessionKey)).Err(); err != nil {
+func (a *Approver) delete(ctx context.Context, scope approvalScope) error {
+	if err := a.rdb.Del(ctx, approvalKey(scope)).Err(); err != nil {
 		return fmt.Errorf("delete approval: %w", err)
 	}
 	return nil
@@ -306,6 +321,7 @@ func replyShell(msg channels.InboundMessage) channels.OutboundMessage {
 		SessionKey: msg.SessionKey,
 		UserID:     msg.UserID,
 		ChatID:     msg.ChatID,
+		BindingID:  msg.BindingID,
 		TenantID:   msg.TenantID,
 		TraceID:    msg.TraceID,
 		ReceivedAt: msg.ReceivedAt,

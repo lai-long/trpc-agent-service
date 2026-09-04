@@ -82,7 +82,7 @@ func TestSenderOutboundIdempotency(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitFor(t, func() bool {
-		sent, err := storage.NewSentMarker(rdb).IsSent(ctx, "counting", out.MsgID)
+		sent, err := storage.NewSentMarker(rdb).IsSent(ctx, "counting", "", out.MsgID)
 		return err == nil && sent
 	})
 	time.Sleep(500 * time.Millisecond) // give a buggy duplicate a chance to fire

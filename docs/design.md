@@ -165,7 +165,7 @@ sequenceDiagram
 
   | 模块（代码目录） | 职责 | 改动类型 |
   |---|---|---|
-  | `trpcservice/channels` | Channel Adapter：验签/加解密、消息编解码、调 IM 主动发送接口；企微（`channels/wecom`）先行，微信客服同接口扩展 | 新建，挂在框架 OpenClaw Channel 扩展点 |
+  | `trpcservice/channels` | Channel Adapter：验签/加解密、消息编解码、调 IM 主动发送接口；企微（`channels/wecom`）先行，微信客服同接口扩展；企微智能机器人走 WS 长连接（`channels/wecomws`，5.3.4） | 新建，挂在框架 OpenClaw Channel 扩展点 |
   | `trpcservice/tenant` | 租户模型与路由：租户/应用/绑定的加载与缓存、tenant_id 全链路透传、租户级配置解析 | 新建，平台层核心 |
   | `trpcservice/agent` | Agent 定义与 Runner 装配：按 `agent_app` 配置组装 Agent（prompt/模型/工具），调用 runner.Runner | 基于框架扩展点实现 |
   | `trpcservice/tool` | 平台内置工具注册与租户级工具权限过滤 | 基于框架 Tool 扩展点实现 |
@@ -518,9 +518,10 @@ PG 要求分区键包含在所有唯一约束中，与 `(session_id, event_seq)`
 | Key | 类型 | 示例 | Value | TTL | 说明 |
 |---|---|---|---|---:|---|
 | `stream:inbound` | Stream | `stream:inbound` | 归一化消息 JSON | 队列 MAXLEN 10 万条截断 | Gateway→Worker 入站队列，消费组 `workers` |
-| `stream:outbound` | Stream | `stream:outbound` | 回复消息 JSON | 队列 MAXLEN 10 万条截断 | Worker→Channel Adapter 出站队列，消费组 `senders` |
+| `stream:outbound` | Stream | `stream:outbound` | 回复消息 JSON | 队列 MAXLEN 10 万条截断 | Worker→Channel Adapter 出站队列，消费组 `senders`（webhook 通道）与 `senders-ws`（wecomws，见 5.3.4） |
 | `dedup:{channel}:{msg_id}` | String | `dedup:wecom:msg123` | `1` 或请求 ID | 24 小时 | 消息幂等 |
 | `lock:sess:{session_id}` | String | `lock:sess:8b3c...` | 请求唯一标识 | 5–10 秒 | 防止并发修改同一会话 |
+| `lock:leader:{name}` | String | `lock:leader:wecomws` | owner 标识 | 15 秒（TTL/3 续期） | 平台级单持有者锁（5.3.4 WS 长连接 leader 竞选） |
 | `sent:{channel}:{msg_id}` | String | `sent:wecom:msg123` | IM 返回的消息 ID | 24 小时 | 出站回复幂等，防发送重试造成 IM 侧重复消息。实现注：幂等单元取「入站消息的回复」（一条入站一条回复），比 `{session_id}:{event_seq}` 更贴合出站消费语义，效果等价 |
 
 Session 存储优先复用框架后端（`session/redis` / `session/postgres`），平台不自建会话缓存层。
@@ -645,7 +646,8 @@ Go 并发安全专项（Worker 长进程不泄漏）：
 | 资源 | Worker 并发 session 数、goroutine 数（泄漏监控）、Redis/PG 连接池水位 |
 
 告警规则示例：Stream 积压 >5 万条或最老 pending 停留 >5 分钟；IM 投递成功率 <99%；
-端到端 P95 >15s（突破第 1 节目标）；错误率 >1%；审计批量写连续失败；goroutine 数持续上涨。
+端到端 P95 >15s（突破第 1 节目标）；错误率 >1%；审计批量写连续失败；goroutine 数持续上涨；
+`senders-ws` 消费组积压（5.3.4 风险 R2）。
 
 #### 5.2.5 部署方案
 
@@ -658,6 +660,8 @@ Go 并发安全专项（Worker 长进程不泄漏）：
   - `admin` Deployment 1–2 副本，仅内网可达；
   - PG 主从、Redis 哨兵，OTel Collector 边车或 DaemonSet 收 trace/metrics；
   - KMS 用云厂商服务，Secret Resolver 走短 TTL 缓存。
+  - `wecomws` 通道（5.3.4）启用时 leader 循环内嵌于 gateway 副本（`lock:leader:wecomws` 竞选
+    单持有者），无需改副本数；滚动更新由旧 Pod ctx 取消关连接 + 新 leader 按 TTL 接管。
 
 #### 5.2.6 后端数据迁移
 
@@ -750,6 +754,117 @@ Guardrail 命中需审批的工具调用时走带内确认，不引入带外审�
    不覆盖、不排队，避免审批状态机复杂化。
 6. 群聊场景仅消息发起人（或租户配置的审批人）的确认有效，防止群成员误确认。
 
+#### 5.3.4 企业微信智能机器人（WebSocket 长连接）
+
+企业微信智能机器人（通道名 `wecomws`）是第三类通道形态：与 webhook 回调通道不同，
+平台**主动向企微 WS 网关（`wss://openws.work.weixin.qq.com`）建立长连接**，消息经连接双向收发。
+定位为免公网回调入口的部署形态（内网 / 无域名场景），复用平台全部既有链路。
+
+关键协议事实（以企微官方文档当期说明为准）及设计后果：
+
+| 协议事实 | 设计后果 |
+|---|---|
+| 回复必须透传入站回调帧的 `headers.req_id`（`aibot_respond_msg`） | 归一化消息增加 `ReplyToken` 透传字段，全链路携带（决策 3） |
+| 每个 bot 同时只允许一条连接，新连接踢旧连接（旧端收 `disconnected_event`） | 全局单 leader 持有全部连接（LeaderLock，决策 4） |
+| 入站 WS 无平台重推 | `Handle` 失败必须本地退避重试；语义边界见下文 |
+| markdown 单条 ≤20480 字节 | 分条推送按 2048 字节切（与既有通道体验一致），复用统一分段器 `channels.SplitText` |
+| 每会话限频 30 条/分钟 | 单连接串行发送 + 现有租户级令牌桶兜底（风险 R5） |
+
+与回调通道的差异：
+
+| 维度 | 企微应用（webhook，5.3.1） | 企微智能机器人（WS） |
+|---|---|---|
+| 连接方向 | IM 平台回调平台（入站 HTTP） | 平台主动出站长连接 |
+| 凭据 | `corpid` + `corpsecret` 换 `access_token` | 每 bot 一对 BotID/Secret（subscribe 帧鉴权） |
+| 回复方式 | message/send 主动发送接口 | `aibot_respond_msg` 帧，必须带回调 `req_id` |
+| 多机器人 | 按回调路径区分 | 按 binding 枚举起多条连接（决策 6） |
+| 故障兜底 | 平台重推（≤3 次） | 无重推，本地重试 |
+
+关键决策：
+
+1. **路由复用（Gateway 零改动）**：wecomws 的 binding 约定 `webhook_path = "/wecomws/{bot_id}"`
+   （path 形态、走 `uk_channel_webhook` 唯一约束），入站消息填该值——完全复用 EnqueueHandler
+   的 Resolve / 限流 / dedup / 背压。channel 名 `wecomws`，`dedup:` / `sent:` / `session_key` 形态不变。
+2. **投递归属：独立消费组 + Skip 钩子**。`stream:outbound` 上并存两个消费组：默认 `senders`
+   （webhook 通道）与 `senders-ws`（wecomws）。`Sender` 参数化 `Group` 与
+   `Skip func(OutboundMessage) bool`：主组跳过 wecomws 消息，ws 组只处理 wecomws。
+   **不变量：Skip 命中必须 ack**（不发送、不写 `sent:`、不消耗令牌桶）——不 ack 会被本组
+   reap 抢走、attempts 累加、误入死信。
+3. **出站找连接**：`InboundMessage` / `OutboundMessage` 各加 `BindingID` 与 `ReplyToken`
+   透传字段（processor 组装时原样复制）。Send 按 `BindingID` 定位对应 bot 连接，回复帧透传
+   `ReplyToken`（即回调 `req_id`）；连接查不到或 `ReplyToken` 为空 → 返回 error，
+   留 PEL 由 `senders-ws` 重试。
+4. **Leader 互斥**：新增 `storage.LeaderLock`（key `lock:leader:{name}`，SetNX 带抖动竞选 +
+   TTL/3 watchdog 续期 + Lua owner 校验释放，复用会话锁原语）。全局单 leader 持有全部 WS 连接
+   并运行 `senders-ws` 消费组；失锁（`lost` 关闭）或 ctx 取消立即关连接、停消费，退避后重新竞选。
+   其余 gateway 副本空转待命，任意副本可整组接管。
+5. **回复指令选型：`aibot_respond_msg` + req_id 透传**。否决 `send_msg` 主动推送（单聊 chatid
+   语义不明确）；否决 `msgtype=stream` 真流式（Send 在 LLM 完成后才执行，stream.id 状态机
+   只增加复杂度）。分条替代流式：一条完整回复在 Send 内按 2048 字节分条串行写帧
+   （复用 `SplitText`，UTF-8 不切坏；中间段失败报 partial delivery，语义同 5.3.2），
+   不碰消息模型。
+6. **多机器人**：BotID/Secret 存 `channel_binding.config` jsonb
+   （`{"bot_id":"...","secret_ref":"..."}`，secret 只存引用，每次 connect 时经 SecretResolver
+   解析，轮换重连即生效）。Manager 按 `Resolver.RoutesByChannel("wecomws")` 枚举可服务 binding
+   （binding active + tenant active + app published，与 Resolve 同 TTL / pub-sub 失效语义），
+   15s 对账：新增起连、消失/禁用停连；单个坏 binding 记 warn 跳过，不拖垮其他连接。
+7. **生命周期**：`channels.Starter` 可选接口（`Start(ctx, h) error`，阻塞至 ctx 取消，
+   运行长连接与重连循环），装配层用类型断言探测——mock / wecom / wxkf 零改动。
+   Start 返回前逐连接 cancel 并等全部 run 退出（排干语义，同 Auditor drain）。
+8. **WS 库选型 `github.com/coder/websocket`**：context-first API 与「失锁即关连接」的
+   生命周期契合；测试可用 `httptest` + `websocket.Accept` 起 fake server。
+
+入站自愈与语义边界：
+
+- 读循环内 `Handle` 返回 error（限流 / 背压 / Redis 抖动）时封顶退避重试（1s→…→30s）
+  直至成功；`ErrDuplicate` 视为成功。
+- `disconnected_event`（被新连接踢线）→ 关连接、5s 起退避重连；subscribe 应答 `errcode≠0`
+  视为凭据错误，退避封顶 5min 防坏 secret 自旋；心跳 30s 带新 req_id，下个 tick 前未收到
+  匹配应答即断开重连。
+- **语义边界声明**：WS 入站无平台重投，`Handle` 持续重试期间进程崩溃会丢该条消息——
+  一期接受（窗口小、量级低），二期方向为失败消息落独立 Redis list 重放。
+- 媒体消息一期降级为占位文本（`[图片]（暂不支持媒体消息）`）；`enter_chat` /
+  `template_card_event` 事件记日志跳过。
+
+配置项：
+
+| env | 默认 | 说明 |
+|---|---|---|
+| `TRPC_WECOMWS_ADDR` | `""`（禁用） | 设为 `wss://openws.work.weixin.qq.com` 即启用（缺失即禁用门控，与其他通道一致；测试注入 fake 地址） |
+| `TRPC_WECOMWS_PING_INTERVAL` | 30s | 心跳间隔 |
+| `TRPC_WECOMWS_LEADER_TTL` | 15s | LeaderLock TTL（TTL/3 续期） |
+| `TRPC_WECOMWS_RESYNC_INTERVAL` | 15s | bindings 对账周期 |
+| `TRPC_WECOMWS_SEGMENT_BYTES` | 2048 | 分条上限 |
+
+Admin 校验：`channel == "wecomws"` 的 binding 创建/更新时，`config` 必须解析出非空
+`bot_id` + `secret_ref`（密钥只收引用）；`webhook_path` 必须匹配 `^/wecomws/[A-Za-z0-9_-]+$`
+（WS 入站无 IM 重推，path typo 即路由黑洞，校验前置到写入口）；`token_ref` / `aeskey_ref` 留空。
+
+部署：leader 循环内嵌于 gateway 副本，副本数不变。滚动更新时旧 Pod ctx cancel 关连接，
+新 leader ≤15s（Leader TTL）接管，期间出站消息在 Stream 排队不丢（WS 在途帧的极小窗口除外）。
+
+风险与缓解：
+
+| # | 风险 | 缓解 |
+|---|---|---|
+| R1 | 踢线竞态：失锁瞬间新旧 leader 重连互斗 | Extend 确认易主即关 lost → cancel 全部连接；收到 disconnected_event 也断开；退避抖动收敛。网络分区下 Extend 持续失败的极小概率互斗表现为企微侧反复踢线，可接受并记录 |
+| R2 | `senders-ws` 无消费者积压 | 队列采集器覆盖该组，`stream_pending{group="senders-ws"}` 告警（5.2.4）；leader 竞选结果打显式日志 |
+| R3 | req_id 24h 窗口 vs 出站重试 | 重试路径最长 ~50min ≪ 24h；超窗即不可达，进死信 + 显式 error 日志，不引入 send_msg 回退 |
+| R4 | Handle 重试期间崩溃丢消息 | 见上文语义边界声明，一期接受 |
+| R5 | 30 条/分钟/会话限频 vs 租户级令牌桶 | 单连接串行 + 对话节奏难触顶；errcode≠0 → Send error → 留 PEL 重试；高频租户用 `rate_policy.send_qps` 收紧 |
+| R6 | 出站 attempts 计数器跨组共享（key 不含 group） | 主组对 wecomws 消息 Skip-ack（计数仅 +1），无实质影响；Skip 必须 ack 的不变量见决策 2 |
+| R7 | binding 删除/禁用后存量 PEL 消息循环重试 | 可重试至死信兜底（binding 可能恢复，区别于未知 channel 立即丢弃）；Manager 15s 对账停连，告警可见 |
+
+明确不做（一期）：真流式（打字机）、欢迎语 / 模板卡片 / 卡片更新、`aibot_upload_media_*`
+素材上传与富媒体出站、入站媒体下载解密（降级占位文本）、`send_msg` 主动推送能力。
+
+测试要点：fake WS server（`httptest` + `websocket.Accept`：校验 subscribe 凭据、回 pong、
+注入回调帧、收集 respond 帧、模拟踢线）。覆盖：订阅鉴权失败退避、入站归一化字段
+（BindingID / ReplyToken / SessionKey 单群形态 / WebhookPath）、Handle 失败重试不丢消息、
+心跳超时重连、disconnected_event 重连、req_id 透传与 markdown 分条（UTF-8 不切坏）、
+未知 binding / 空 ReplyToken 异常路径、Sender Skip / Group 语义、RoutesByChannel 过滤与
+坏 binding 跳过、Admin 校验 400、LeaderLock 双 holder 互斥与 TTL 接管。
+
 ### 5.4 Admin API 接口清单
 
 Admin API 仅内网可达，管理端鉴权（网关 mTLS 或 SSO token，按部署环境二选一）；
@@ -765,6 +880,9 @@ Admin API 仅内网可达，管理端鉴权（网关 mTLS 或 SSO token，按部
 | POST | `/admin/tenants/{id}/storage-migrations` | 发起后端迁移（5.2.6 四步流程） |
 | GET | `/admin/storage-migrations/{id}` | 迁移进度与质检结果查询 |
 | GET | `/admin/audit` | 审计查询，按 tenant_id / session_id / trace_id / decision 过滤 |
+
+渠道绑定的写入口按通道类型做配置校验；`wecomws` 绑定必须携带非空 `bot_id` + `secret_ref`、
+`webhook_path` 匹配 `^/wecomws/[A-Za-z0-9_-]+$`（5.3.4），不合规返回 400。
 
 ## 6. 预期效果
 
@@ -854,6 +972,9 @@ Admin API 仅内网可达，管理端鉴权（网关 mTLS 或 SSO token，按部
 | 7 | 企微/微信侧接入依赖（测试号申请、企业认证、接口权限）耗时超预期 | 进度 | IM 联调阻塞整体进度 | 先用 Mock Channel 跑通「回调→Worker→回复」全链路，IM 真实接入与平台开发并行 |
 | 8 | 密钥或敏感信息泄漏进日志/trace | 安全合规 | 触碰第 1 节审计合规红线 | 密钥只存引用（决策三）；日志脱敏中间件；OTel span 属性白名单制；上线前扫描日志样本 |
 | 9 | 租户误改 `storage_config` 导致读写路由到错误后端 | 运维 | 会话/记忆读不到，表现为数据丢失 | 变更走迁移流程（双写过渡、按租户灰度），禁止直接改配置生切；变更操作记审计 |
+| 10 | wecomws 每 bot 仅允许一条连接，多副本重连互斗或 leader 失联 | 技术（并发/可用性） | 企微侧反复踢线，或 WS 通道在 leader 切换窗口内停摆 | `lock:leader:wecomws` 全局单持有者 + 失锁即关连接 + 退避重竞选；`senders-ws` 积压告警（5.3.4 R1/R2） |
+| 11 | WS 入站无平台重推 | 技术（可靠性） | `Handle` 持续失败期间进程崩溃丢消息 | 读循环内封顶退避重试；一期接受极小窗口并在 5.3.4 声明语义边界，二期落 Redis list 重放（5.3.4 R4） |
+| 12 | wecomws 出站回复依赖 `req_id` 时效与分条部分失败 | 技术（外部依赖） | 超窗或中间段失败导致回复缺失/残缺 | 重试路径 ≪24h、超窗死信告警；分段失败报 partial delivery 并留 PEL（5.3.4 R3、决策 5） |
 
 回滚方案：
 

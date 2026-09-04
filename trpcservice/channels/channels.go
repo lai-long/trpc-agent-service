@@ -31,6 +31,7 @@ type InboundMessage struct {
 	Type        string    // Type* constants; empty means TypeText
 	MediaRef    string    // TypeMedia: artifact reference of the fetched media (design 5.3.2)
 	WebhookPath string    // callback path the message arrived on; routes to tenant/app
+	BindingID   string    // channel_binding row serving this callback, stamped by the Gateway; scopes the per-binding idempotency keys (done:/sent:)
 	TenantID    string    // owning tenant UUID, stamped by the Gateway
 	AppID       string    // owning agent app UUID, stamped by the Gateway
 	TraceID     string    // trace ID, spanning callback → Worker → reply
@@ -69,11 +70,12 @@ func LooksMarkdown(s string) bool {
 // delivered through the Channel's Send.
 type OutboundMessage struct {
 	Channel     string // which channel to reply on
-	MsgID       string // the inbound message this replies to (outbound idempotency unit sent:{channel}:{msg_id})
+	MsgID       string // the inbound message this replies to (outbound idempotency unit sent:{channel}:{binding}:{msg_id})
 	SessionKey  string // conversation the reply belongs to
 	UserID      string // recipient (required for direct chats)
 	ChatID      string // recipient group (required for group chats)
 	Text        string
+	BindingID   string // channel_binding row the inbound arrived on, carried for the sent: idempotency key
 	TenantID    string // owning tenant UUID, carried through for sender metrics
 	TraceID     string
 	TraceParent string // W3C traceparent, carried through to the outbound span

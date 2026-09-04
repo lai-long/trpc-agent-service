@@ -11,12 +11,12 @@ func TestSentMarker(t *testing.T) {
 	rdb := redisOrSkip(t)
 	ctx := context.Background()
 	msgID := fmt.Sprintf("sent-test-%d", time.Now().UnixNano())
-	key := sentKey("mock", msgID)
+	key := sentKey("mock", "", msgID)
 	t.Cleanup(func() { rdb.Del(ctx, key) })
 
 	m := NewSentMarker(rdb)
 
-	sent, err := m.IsSent(ctx, "mock", msgID)
+	sent, err := m.IsSent(ctx, "mock", "", msgID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -24,11 +24,11 @@ func TestSentMarker(t *testing.T) {
 		t.Fatal("unmarked message must not report as sent")
 	}
 
-	if err := m.MarkSent(ctx, "mock", msgID, "im-msg-42"); err != nil {
+	if err := m.MarkSent(ctx, "mock", "", msgID, "im-msg-42"); err != nil {
 		t.Fatal(err)
 	}
 
-	sent, err = m.IsSent(ctx, "mock", msgID)
+	sent, err = m.IsSent(ctx, "mock", "", msgID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -42,5 +42,26 @@ func TestSentMarker(t *testing.T) {
 	}
 	if ttl <= 0 || ttl > DedupTTL {
 		t.Errorf("ttl = %v, want (0, %v]", ttl, DedupTTL)
+	}
+}
+
+// The sent key carries the binding dimension: two tenants' replies with the
+// same inbound msg_id must not suppress each other (review P1-6).
+func TestSentMarkerBindingScope(t *testing.T) {
+	rdb := redisOrSkip(t)
+	ctx := context.Background()
+	msgID := fmt.Sprintf("sent-scope-%d", time.Now().UnixNano())
+	t.Cleanup(func() {
+		rdb.Del(ctx, sentKey("mock", "b1", msgID))
+		rdb.Del(ctx, sentKey("mock", "b2", msgID))
+	})
+
+	m := NewSentMarker(rdb)
+	if err := m.MarkSent(ctx, "mock", "b1", msgID, "im-1"); err != nil {
+		t.Fatal(err)
+	}
+	sent, err := m.IsSent(ctx, "mock", "b2", msgID)
+	if err != nil || sent {
+		t.Fatalf("binding b2 must not see b1's marker: sent=%v err=%v", sent, err)
 	}
 }

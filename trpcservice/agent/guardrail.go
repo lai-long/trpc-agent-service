@@ -182,7 +182,7 @@ func (g *Guarded) Process(ctx context.Context, msg channels.InboundMessage) (cha
 	var sig Signal
 	var signaled bool
 	if g.Approver != nil {
-		sig, signaled = g.Approver.TakeSignal(msg.SessionKey)
+		sig, signaled = g.Approver.TakeSignal(approvalScope{appID: msg.AppID, sessionKey: msg.SessionKey})
 	}
 	if err != nil {
 		var mErr *ModelError

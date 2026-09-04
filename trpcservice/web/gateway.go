@@ -96,6 +96,7 @@ func (h EnqueueHandler) Handle(ctx context.Context, msg channels.InboundMessage)
 	}
 	msg.TenantID = route.Tenant.ID
 	msg.AppID = route.App.ID
+	msg.BindingID = route.Binding.ID
 
 	// Per-tenant admission (before dedup: a rejected message must not consume
 	// the dedup key, or the IM's redelivery would be dropped as a duplicate).
@@ -119,7 +120,7 @@ func (h EnqueueHandler) Handle(ctx context.Context, msg channels.InboundMessage)
 	// ErrDuplicate so the channel layer answers 200 and the IM stops
 	// redelivering.
 	if h.Dedup != nil {
-		first, err := h.Dedup.Check(ctx, msg.Channel, msg.MsgID)
+		first, err := h.Dedup.Check(ctx, msg.Channel, msg.BindingID, msg.MsgID)
 		if err != nil {
 			return channels.OutboundMessage{}, fmt.Errorf("dedup check: %w", err)
 		}
@@ -136,7 +137,7 @@ func (h EnqueueHandler) Handle(ctx context.Context, msg channels.InboundMessage)
 		if h.Dedup == nil {
 			return
 		}
-		if err := h.Dedup.Forget(ctx, msg.Channel, msg.MsgID); err != nil {
+		if err := h.Dedup.Forget(ctx, msg.Channel, msg.BindingID, msg.MsgID); err != nil {
 			plog.Warnf("dedup rollback %s/%s: %v", msg.Channel, msg.MsgID, err)
 		}
 	}

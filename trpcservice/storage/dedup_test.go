@@ -11,12 +11,12 @@ func TestDeduper(t *testing.T) {
 	rdb := redisOrSkip(t)
 	ctx := context.Background()
 	msgID := fmt.Sprintf("dedup-test-%d", time.Now().UnixNano())
-	key := fmt.Sprintf("dedup:mock:%s", msgID)
+	key := fmt.Sprintf("dedup:mock::%s", msgID)
 	t.Cleanup(func() { rdb.Del(ctx, key) })
 
 	d := NewDeduper(rdb)
 
-	first, err := d.Check(ctx, "mock", msgID)
+	first, err := d.Check(ctx, "mock", "", msgID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -26,7 +26,7 @@ func TestDeduper(t *testing.T) {
 
 	// Concurrent-style duplicates: same msg_id must be rejected.
 	for i := 0; i < 3; i++ {
-		first, err := d.Check(ctx, "mock", msgID)
+		first, err := d.Check(ctx, "mock", "", msgID)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -45,14 +45,14 @@ func TestDeduper(t *testing.T) {
 	}
 
 	// A different channel namespace must not collide.
-	other, err := d.Check(ctx, "wecom", msgID)
+	other, err := d.Check(ctx, "wecom", "", msgID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !other {
 		t.Error("same msg_id on another channel should pass")
 	}
-	rdb.Del(ctx, fmt.Sprintf("dedup:wecom:%s", msgID))
+	rdb.Del(ctx, fmt.Sprintf("dedup:wecom::%s", msgID))
 }
 
 // Forget reopens a message for redelivery. This is what keeps a failed
@@ -63,18 +63,18 @@ func TestDeduperForget(t *testing.T) {
 	rdb := redisOrSkip(t)
 	ctx := context.Background()
 	msgID := fmt.Sprintf("dedup-forget-%d", time.Now().UnixNano())
-	key := fmt.Sprintf("dedup:mock:%s", msgID)
+	key := fmt.Sprintf("dedup:mock::%s", msgID)
 	t.Cleanup(func() { rdb.Del(ctx, key) })
 
 	d := NewDeduper(rdb)
-	if first, err := d.Check(ctx, "mock", msgID); err != nil || !first {
+	if first, err := d.Check(ctx, "mock", "", msgID); err != nil || !first {
 		t.Fatalf("first arrival should pass, got first=%v err=%v", first, err)
 	}
-	if err := d.Forget(ctx, "mock", msgID); err != nil {
+	if err := d.Forget(ctx, "mock", "", msgID); err != nil {
 		t.Fatal(err)
 	}
 
-	first, err := d.Check(ctx, "mock", msgID)
+	first, err := d.Check(ctx, "mock", "", msgID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -82,7 +82,34 @@ func TestDeduperForget(t *testing.T) {
 		t.Fatal("message must pass again after Forget")
 	}
 	// Forgetting only touches its own key namespace.
-	if n, err := rdb.Exists(ctx, "dedup:wecom:"+msgID).Result(); err != nil || n != 0 {
+	if n, err := rdb.Exists(ctx, "dedup:wecom::"+msgID).Result(); err != nil || n != 0 {
 		t.Fatalf("other channel key must be untouched, n=%d err=%v", n, err)
+	}
+}
+
+// The dedup key carries the binding dimension: msg_id uniqueness is
+// guaranteed by the IM per corp/app only, so the same numeric ID can
+// legitimately arrive on two bindings of one channel (review P1-6).
+func TestDeduperBindingScope(t *testing.T) {
+	rdb := redisOrSkip(t)
+	ctx := context.Background()
+	msgID := fmt.Sprintf("dedup-scope-%d", time.Now().UnixNano())
+	t.Cleanup(func() {
+		rdb.Del(ctx, dedupKey("mock", "b1", msgID))
+		rdb.Del(ctx, dedupKey("mock", "b2", msgID))
+	})
+
+	d := NewDeduper(rdb)
+	first, err := d.Check(ctx, "mock", "b1", msgID)
+	if err != nil || !first {
+		t.Fatalf("first arrival on binding b1 should pass: first=%v err=%v", first, err)
+	}
+	other, err := d.Check(ctx, "mock", "b2", msgID)
+	if err != nil || !other {
+		t.Fatalf("same msg_id on another binding must pass: first=%v err=%v", other, err)
+	}
+	dup, err := d.Check(ctx, "mock", "b1", msgID)
+	if err != nil || dup {
+		t.Fatalf("redelivery on the same binding must be dropped: dup=%v err=%v", dup, err)
 	}
 }

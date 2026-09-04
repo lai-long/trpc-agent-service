@@ -217,7 +217,7 @@ func (s *Sender) handle(ctx context.Context, m storage.Message) {
 
 	// Already delivered (sent but un-acked in a previous life): skip the send.
 	if s.Sent != nil && msg.MsgID != "" {
-		sent, err := s.Sent.IsSent(ctx, msg.Channel, msg.MsgID)
+		sent, err := s.Sent.IsSent(ctx, msg.Channel, msg.BindingID, msg.MsgID)
 		if err != nil {
 			plog.Warnf("sender %s check sent %s: %v", s.Name, m.ID, err)
 			return // Redis hiccup: leave pending, retry later
@@ -282,7 +282,7 @@ func (s *Sender) handle(ctx context.Context, m storage.Message) {
 			float64(time.Since(msg.ReceivedAt).Milliseconds()), e2eAttr(msg))
 	}
 	if s.Sent != nil && msg.MsgID != "" {
-		if err := s.Sent.MarkSent(ctx, msg.Channel, msg.MsgID, ""); err != nil {
+		if err := s.Sent.MarkSent(ctx, msg.Channel, msg.BindingID, msg.MsgID, ""); err != nil {
 			plog.Warnf("sender %s mark sent %s: %v", s.Name, m.ID, err)
 		}
 	}

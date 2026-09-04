@@ -176,7 +176,7 @@ func TestWorkerRequeuesWhenSessionLocked(t *testing.T) {
 
 	// Another worker holds the session lock; it expires on its own (crash).
 	lock := storage.NewLock(rdb)
-	if ok, err := lock.TryAcquire(ctx, lockSess, "crashed-worker", 1500*time.Millisecond); err != nil || !ok {
+	if ok, err := lock.TryAcquire(ctx, "test-app", lockSess, "crashed-worker", 1500*time.Millisecond); err != nil || !ok {
 		t.Fatalf("pre-lock failed: ok=%v err=%v", ok, err)
 	}
 
