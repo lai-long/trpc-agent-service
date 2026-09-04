@@ -375,11 +375,13 @@ func (c *Channel) postMessage(ctx context.Context, token string, msg channels.Ou
 	return result.ErrCode, nil
 }
 
-// sendMsgID builds the unique msgid send_msg requires: the inbound MsgID keeps
-// it traceable, nanotime + segment index keep it unique across segments and
-// retries.
+// sendMsgID builds the msgid send_msg requires. It must be STABLE across
+// retries: the platform dedups send_msg by msgid, so a retry after "request
+// sent but response lost" is absorbed by WeChat instead of double-delivering
+// to the user (review P1-7). Only the segment index varies, distinguishing
+// the pieces of one split reply.
 func sendMsgID(msg channels.OutboundMessage, seg int) string {
-	return fmt.Sprintf("%s-%d-%d", msg.MsgID, time.Now().UnixNano(), seg)
+	return fmt.Sprintf("%s-%d", msg.MsgID, seg)
 }
 
 // getAccessToken returns the cached token, refreshing it when expired.

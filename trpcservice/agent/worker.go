@@ -352,8 +352,8 @@ func (w *Worker) reap(ctx context.Context) {
 }
 
 // acquireSession spins for the session lock until lockWait. On timeout the
-// message is re-queued (as a new entry) and the original acked, so a busy
-// session delays the message instead of failing it. The returned stop ends
+// message is left pending and the reaper takes it over after maxIdle, so a
+// busy session delays the message without failing it. The returned stop ends
 // the renewal watchdog.
 func (w *Worker) acquireSession(ctx context.Context, m storage.Message, appID, sessionKey string) (owner string, stop func(), ok bool) {
 	owner = w.Name + ":" + m.ID
@@ -367,14 +367,12 @@ func (w *Worker) acquireSession(ctx context.Context, m storage.Message, appID, s
 			return owner, w.startLockWatchdog(ctx, appID, sessionKey, owner), true
 		}
 		if time.Now().After(deadline) {
-			if _, err := w.Stream.Add(ctx, w.inStream(), m.Payload); err != nil {
-				plog.Errorf("worker %s re-queue %s: %v", w.Name, m.ID, err)
-				return "", nil, false // stays pending, the reaper will retry
-			}
-			if err := w.Stream.Ack(ctx, w.inStream(), "workers", m.ID); err != nil {
-				plog.Warnf("worker %s ack after re-queue %s: %v", w.Name, m.ID, err)
-			}
-			plog.Infof("worker %s re-queued %s: session %s is busy", w.Name, m.ID, sessionKey)
+			// Leave the entry pending for the reaper instead of re-queueing a
+			// copy: the copy rode a new stream ID whose attempts counter
+			// started at zero, so a wedged session could re-queue forever
+			// and the maxAttempts dead-letter never fired (review P1-8).
+			plog.Infof("worker %s leaves %s pending: session %s is busy, reaper takes over",
+				w.Name, m.ID, sessionKey)
 			return "", nil, false
 		}
 		select {

@@ -387,6 +387,11 @@ func writeSuccess(w http.ResponseWriter) {
 // chats to appchat/send. Long texts are split into sequential segments within
 // this one call, so concurrent senders cannot interleave segments of the same
 // reply (design 5.3.2).
+// Send delivers the reply. The WeCom message/send API accepts no caller
+// idempotency key, so the platform cannot dedup a retried send (unlike the
+// wxkf send_msg msgid): duplicate suppression relies on the sender's sent:
+// marker window, and a crash inside that window can surface a duplicate
+// (design 5.2.2 at-least-once boundary).
 func (c *Channel) Send(ctx context.Context, msg channels.OutboundMessage) error {
 	segments := splitText(msg.Text, maxTextBytes)
 	for i, seg := range segments {

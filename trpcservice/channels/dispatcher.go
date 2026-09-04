@@ -240,8 +240,11 @@ func (s *Sender) handle(ctx context.Context, m storage.Message) {
 	}
 
 	// Pace the send on the {channel, tenant} bucket (design 5.3.2). On
-	// exhaustion the message is re-queued (new entry, original acked) rather
-	// than dropped: the copy retries when the bucket has refilled.
+	// exhaustion the message is left pending for the reaper's takeover: a
+	// re-queue under a new stream ID reset the attempts counter and the
+	// maxAttempts dead-letter could never fire, so sustained rate limiting
+	// re-queued forever (review P1-8). The bucket refills in milliseconds;
+	// the reaper's maxIdle is the outer bound of the delay.
 	if s.Limiter != nil {
 		qps, burst := s.sendQPS(), s.sendBurst()
 		if s.SendPolicyFor != nil && msg.TenantID != "" {
@@ -256,13 +259,9 @@ func (s *Sender) handle(ctx context.Context, m storage.Message) {
 			return // Redis hiccup: leave pending, retry later
 		}
 		if !ok {
-			if _, err := s.Stream.Add(ctx, s.inStream(), m.Payload); err != nil {
-				plog.Errorf("sender %s re-queue %s: %v", s.Name, m.ID, err)
-				return // stays pending
-			}
 			metrics.SendRateLimitedTotal.Add(ctx, 1, rateLimitedAttr(msg))
-			plog.Warnf("sender %s re-queued %s: send bucket %s exhausted", s.Name, m.ID, scope)
-			_ = s.Stream.Ack(ctx, s.inStream(), "senders", m.ID)
+			plog.Warnf("sender %s leaves %s pending: send bucket %s exhausted, reaper takes over",
+				s.Name, m.ID, scope)
 			return
 		}
 	}
@@ -283,7 +282,13 @@ func (s *Sender) handle(ctx context.Context, m storage.Message) {
 	}
 	if s.Sent != nil && msg.MsgID != "" {
 		if err := s.Sent.MarkSent(ctx, msg.Channel, msg.BindingID, msg.MsgID, ""); err != nil {
-			plog.Warnf("sender %s mark sent %s: %v", s.Name, m.ID, err)
+			// The user already has the reply, but the marker that suppresses
+			// the duplicate did not stick: no Ack. The reaper redelivers, the
+			// IsSent check above (or, for wxkf, the platform's msgid dedup)
+			// absorbs the retry instead of the user receiving it twice
+			// (review P1-7).
+			plog.Errorf("sender %s mark sent %s: %v — leaving pending for redelivery", s.Name, m.ID, err)
+			return
 		}
 	}
 	if err := s.Stream.Ack(ctx, s.inStream(), "senders", m.ID); err != nil {
