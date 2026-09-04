@@ -10,13 +10,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/agent"
+	plog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/storage"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/testenv"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/web"
@@ -70,11 +74,15 @@ func TestAdminCreateTenantValidation(t *testing.T) {
 		t.Fatalf("empty name must be rejected, got %q", msg)
 	}
 
+	// A write the database refuses (name overflows varchar(128)) is a 500 that
+	// names the operation and nothing else: never a panic, never a silent drop,
+	// and never the driver's own text — see
+	// TestAdminInternalErrorHidesDriverText.
 	code, out = doJSON(t, mux, http.MethodPost, "/admin/tenants",
 		fmt.Sprintf(`{"name":%q}`, strings.Repeat("x", 129)))
 	wantCode(t, code, http.StatusInternalServerError, out)
-	if msg, _ := out["error"].(string); !strings.Contains(msg, "value too long") {
-		t.Fatalf("varchar overflow must surface as a DB error, got %q", msg)
+	if msg, _ := out["error"].(string); msg != "create_tenant failed" {
+		t.Fatalf("a DB-refused write must name the operation only, got %q", msg)
 	}
 }
 
@@ -551,6 +559,132 @@ func TestAdminDeadPool(t *testing.T) {
 				t.Fatalf("error body must name the failure, got %v", out)
 			}
 		})
+	}
+}
+
+// captureLogs redirects the service logger into a pipe and returns a function
+// yielding everything written to it. plog builds its core against os.Stderr
+// when Init runs, so the swap has to precede the Init; stopping restores
+// os.Stderr and rebuilds the logger at the package's default (info, console)
+// so later tests are unaffected. Idempotent, and always run at cleanup: a test
+// that fails before calling stop must not leave the pipe as the process
+// stderr.
+func captureLogs(t *testing.T) func() string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := os.Stderr
+	os.Stderr = w
+	plog.Init("error", false)
+
+	var (
+		once sync.Once
+		out  string
+	)
+	stop := func() string {
+		once.Do(func() {
+			plog.Sync()
+			os.Stderr = old
+			plog.Init("info", true)
+			_ = w.Close()
+			b, _ := io.ReadAll(r)
+			_ = r.Close()
+			out = string(b)
+		})
+		return out
+	}
+	t.Cleanup(func() { stop() })
+	return stop
+}
+
+// A failure that came from the database must answer with the operation that
+// failed and nothing else. pgx and pgconn text names tables, columns and
+// constraints, quotes the statement and its SQLSTATE, and on a connection
+// failure recites the DSN's host, port, user and database — and an Admin API
+// response body is precisely the text that gets pasted into a ticket. The
+// operator still gets the whole error, from the log.
+func TestAdminInternalErrorHidesDriverText(t *testing.T) {
+	mux, _ := adminTestAPI(t)
+	stop := captureLogs(t)
+
+	// Each of these makes the id column's uuid cast fail, so the handler
+	// answers from its driver-error branch with a real Postgres error behind
+	// it — `ERROR: invalid input syntax for type uuid: "not-a-uuid"
+	// (SQLSTATE 22P02)`, all of which used to reach the caller verbatim.
+	cases := []struct{ method, path, op string }{
+		{http.MethodGet, "/admin/tenants/not-a-uuid", "get_tenant"},
+		{http.MethodPost, "/admin/apps/not-a-uuid/publish", "publish_app"},
+		{http.MethodPost, "/admin/apps/not-a-uuid/rollback", "rollback_app"},
+		{http.MethodGet, "/admin/storage-migrations/not-a-uuid", "get_storage_migration"},
+	}
+	for _, tc := range cases {
+		code, out := doJSON(t, mux, tc.method, tc.path, "")
+		wantCode(t, code, http.StatusInternalServerError, out)
+		msg, _ := out["error"].(string)
+		if want := tc.op + " failed"; msg != want {
+			t.Fatalf("%s %s: body = %q, want %q", tc.method, tc.path, msg, want)
+		}
+	}
+
+	// The genericizing must not swallow the errors this service wrote for the
+	// caller: a judgement keeps its own message and status.
+	code, out := doJSON(t, mux, http.MethodPost, "/admin/apps/"+missingUUID+"/publish", "")
+	wantCode(t, code, http.StatusNotFound, out)
+	if msg, _ := out["error"].(string); msg != "app not found" {
+		t.Fatalf("a 404 judgement must keep its message, got %q", msg)
+	}
+
+	logged := stop()
+	if logged == "" {
+		t.Fatal("hiding an error from the caller must not hide it from the log")
+	}
+	for _, want := range []string{"invalid input syntax", "22P02",
+		"admin get_tenant", "admin publish_app", "admin rollback_app"} {
+		if !strings.Contains(logged, want) {
+			t.Errorf("log must carry the hidden error; no %q in:\n%s", want, logged)
+		}
+	}
+}
+
+// A list query that fails must not answer 200 with an empty array. pgx defers
+// a bind- or execute-time failure past Query, which returns a nil error and a
+// Rows that simply ends, so the failure is only visible on rows.Err() — and
+// every one of these endpoints skipped that check, answering "there is
+// nothing" instead of "the read failed". An empty list is indistinguishable
+// from a genuinely empty table: an ops console shows no apps, no bindings, and
+// an audit query reports no events during exactly the incident that made
+// someone ask.
+//
+// listTenants carries the same check but has no parameter to break, so its
+// branch is only reachable through a connection dropping mid-iteration.
+func TestAdminListFailureIsNotAnEmptyList(t *testing.T) {
+	mux, _ := adminTestAPI(t)
+
+	cases := []struct {
+		path string
+		op   string
+	}{
+		{"/admin/tenants/not-a-uuid/apps", "list_apps"},
+		{"/admin/apps/not-a-uuid/bindings", "list_bindings"},
+		{"/admin/audit?tenant_id=not-a-uuid", "query_audit"},
+	}
+	for _, tc := range cases {
+		// Before the rows.Err() check this answered 200 with `[]`, which is
+		// not even the error shape doJSON decodes into.
+		code, out := doJSON(t, mux, http.MethodGet, tc.path, "")
+		wantCode(t, code, http.StatusInternalServerError, out)
+		msg, _ := out["error"].(string)
+		if want := tc.op + " failed"; msg != want {
+			t.Fatalf("GET %s: body = %q, want %q", tc.path, msg, want)
+		}
+	}
+
+	// A list that succeeds still lists: the check must not turn healthy reads
+	// into failures.
+	if list := doJSONList(t, mux, "/admin/tenants/"+missingUUID+"/apps"); len(list) != 0 {
+		t.Fatalf("a tenant without apps must list empty, got %+v", list)
 	}
 }
 

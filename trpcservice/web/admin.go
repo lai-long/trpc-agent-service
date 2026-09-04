@@ -154,7 +154,7 @@ func (a *AdminAPI) createTenant(w http.ResponseWriter, r *http.Request) {
 		in.Name, rawOrNil(in.ModelConfig), rawOrNil(in.ToolPolicy),
 		rawOrNil(in.AuditPolicy), rawOrNil(in.GuardrailPolicy), rawOrNil(in.RatePolicy), rawOrNil(in.StorageConfig)).Scan(&id)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeOpError(w, "create_tenant", err)
 		return
 	}
 	a.afterWrite(r, "create_tenant", id, nil, in)
@@ -165,7 +165,7 @@ func (a *AdminAPI) listTenants(w http.ResponseWriter, r *http.Request) {
 	rows, err := a.pool.Query(r.Context(),
 		`SELECT id, name, status, created_at, updated_at FROM tenant ORDER BY created_at DESC`)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeOpError(w, "list_tenants", err)
 		return
 	}
 	defer rows.Close()
@@ -174,13 +174,16 @@ func (a *AdminAPI) listTenants(w http.ResponseWriter, r *http.Request) {
 		var id, name, status string
 		var createdAt, updatedAt time.Time
 		if err := rows.Scan(&id, &name, &status, &createdAt, &updatedAt); err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error())
+			writeOpError(w, "list_tenants", err)
 			return
 		}
 		out = append(out, map[string]any{
 			"id": id, "name": name, "status": status,
 			"created_at": createdAt, "updated_at": updatedAt,
 		})
+	}
+	if listFailed(w, "list_tenants", rows) {
+		return
 	}
 	writeJSON(w, http.StatusOK, out)
 }
@@ -200,7 +203,7 @@ func (a *AdminAPI) getTenant(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeOpError(w, "get_tenant", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -275,7 +278,7 @@ func (a *AdminAPI) updateTenant(w http.ResponseWriter, r *http.Request) {
 		fmt.Sprintf(`UPDATE tenant SET %s, updated_at = now() WHERE id = $1`, strings.Join(sets, ", ")),
 		args...)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeOpError(w, "update_tenant", err)
 		return
 	}
 	if tag.RowsAffected() == 0 {
@@ -322,7 +325,7 @@ func (a *AdminAPI) createApp(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusConflict, "concurrent create raced the version; retry")
 			return
 		}
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeOpError(w, "create_app", err)
 		return
 	}
 	a.afterWrite(r, "create_app", tenantID, nil, map[string]any{
@@ -336,7 +339,7 @@ func (a *AdminAPI) listApps(w http.ResponseWriter, r *http.Request) {
 		`SELECT id, name, agent_type, version, status, updated_at FROM agent_app
 		 WHERE tenant_id = $1 ORDER BY name, version DESC`, r.PathValue("id"))
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeOpError(w, "list_apps", err)
 		return
 	}
 	defer rows.Close()
@@ -346,13 +349,16 @@ func (a *AdminAPI) listApps(w http.ResponseWriter, r *http.Request) {
 		var version int
 		var updatedAt time.Time
 		if err := rows.Scan(&id, &name, &agentType, &version, &status, &updatedAt); err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error())
+			writeOpError(w, "list_apps", err)
 			return
 		}
 		out = append(out, map[string]any{
 			"id": id, "name": name, "agent_type": agentType,
 			"version": version, "status": status, "updated_at": updatedAt,
 		})
+	}
+	if listFailed(w, "list_apps", rows) {
+		return
 	}
 	writeJSON(w, http.StatusOK, out)
 }
@@ -379,7 +385,7 @@ func (a *AdminAPI) updateApp(w http.ResponseWriter, r *http.Request) {
 		 WHERE id = $1 AND tenant_id = $2 AND status = 'draft'`,
 		r.PathValue("app"), r.PathValue("id"), []byte(in.Config))
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeOpError(w, "update_app", err)
 		return
 	}
 	if tag.RowsAffected() == 0 {
@@ -397,7 +403,7 @@ func (a *AdminAPI) publishApp(w http.ResponseWriter, r *http.Request) {
 	before := a.rowJSON(r.Context(), "agent_app", "id", r.PathValue("id"))
 	tenantID, err := a.publish(r.Context(), r.PathValue("id"))
 	if err != nil {
-		writeError(w, errStatus(err), err.Error())
+		writeOpError(w, "publish_app", err)
 		return
 	}
 	a.afterWrite(r, "publish_app", tenantID, before, map[string]any{"published": r.PathValue("id")})
@@ -425,7 +431,7 @@ func (a *AdminAPI) rollbackApp(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeOpError(w, "rollback_app", err)
 		return
 	}
 
@@ -436,7 +442,7 @@ func (a *AdminAPI) rollbackApp(w http.ResponseWriter, r *http.Request) {
 			 WHERE tenant_id = $1 AND name = $2 AND version < $3`,
 			tenantID, name, version).Scan(&target)
 		if err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error())
+			writeOpError(w, "rollback_app", err)
 			return
 		}
 	}
@@ -453,11 +459,11 @@ func (a *AdminAPI) rollbackApp(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeOpError(w, "rollback_app", err)
 		return
 	}
 	if _, err := a.publish(ctx, targetID); err != nil {
-		writeError(w, errStatus(err), err.Error())
+		writeOpError(w, "rollback_app", err)
 		return
 	}
 	a.afterWrite(r, "rollback_app", tenantID,
@@ -602,7 +608,7 @@ func (a *AdminAPI) createBinding(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusConflict, "webhook_path already bound")
 			return
 		}
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeOpError(w, "create_binding", err)
 		return
 	}
 	a.afterWrite(r, "create_binding", tenantID, nil, map[string]any{
@@ -687,7 +693,7 @@ func (a *AdminAPI) listBindings(w http.ResponseWriter, r *http.Request) {
 		`SELECT id, channel, webhook_path, token_ref, aeskey_ref, status, created_at
 		 FROM channel_binding WHERE app_id = $1 ORDER BY created_at`, r.PathValue("id"))
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeOpError(w, "list_bindings", err)
 		return
 	}
 	defer rows.Close()
@@ -697,7 +703,7 @@ func (a *AdminAPI) listBindings(w http.ResponseWriter, r *http.Request) {
 		var tokenRef, aeskeyRef *string
 		var createdAt time.Time
 		if err := rows.Scan(&id, &channel, &path, &tokenRef, &aeskeyRef, &status, &createdAt); err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error())
+			writeOpError(w, "list_bindings", err)
 			return
 		}
 		out = append(out, map[string]any{
@@ -705,6 +711,9 @@ func (a *AdminAPI) listBindings(w http.ResponseWriter, r *http.Request) {
 			"token_ref": tokenRef, "aeskey_ref": aeskeyRef,
 			"status": status, "created_at": createdAt,
 		})
+	}
+	if listFailed(w, "list_bindings", rows) {
+		return
 	}
 	writeJSON(w, http.StatusOK, out)
 }
@@ -715,7 +724,7 @@ func (a *AdminAPI) deleteBinding(w http.ResponseWriter, r *http.Request) {
 		`DELETE FROM channel_binding WHERE id = $1 AND app_id = $2`,
 		r.PathValue("binding"), r.PathValue("id"))
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeOpError(w, "delete_binding", err)
 		return
 	}
 	if tag.RowsAffected() == 0 {
@@ -757,7 +766,7 @@ func (a *AdminAPI) addKnowledgeDocument(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeOpError(w, "add_knowledge_document", err)
 		return
 	}
 
@@ -770,7 +779,7 @@ func (a *AdminAPI) addKnowledgeDocument(w http.ResponseWriter, r *http.Request) 
 		},
 	}
 	if err := a.Knowledge.AddSource(r.Context(), src); err != nil {
-		writeError(w, http.StatusInternalServerError, fmt.Sprintf("ingest document: %v", err))
+		writeOpError(w, "ingest document", err)
 		return
 	}
 	// The document content can be large; the audit records the metadata only.
@@ -812,7 +821,7 @@ func (a *AdminAPI) createMigration(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeOpError(w, "create_storage_migration", err)
 		return
 	}
 	from := a.DefaultSessionBackend
@@ -837,7 +846,7 @@ func (a *AdminAPI) createMigration(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusConflict, "an active migration already exists for this tenant/resource")
 			return
 		}
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeOpError(w, "create_storage_migration", err)
 		return
 	}
 	a.afterWrite(r, "create_storage_migration", tenantID, nil, map[string]any{
@@ -862,7 +871,7 @@ func (a *AdminAPI) getMigration(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeOpError(w, "get_storage_migration", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -909,7 +918,7 @@ func (a *AdminAPI) queryAudit(w http.ResponseWriter, r *http.Request) {
 		 ORDER BY created_at DESC LIMIT $5`,
 		q.Get("tenant_id"), q.Get("session_id"), q.Get("trace_id"), q.Get("decision"), limit)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeOpError(w, "query_audit", err)
 		return
 	}
 	defer rows.Close()
@@ -921,7 +930,7 @@ func (a *AdminAPI) queryAudit(w http.ResponseWriter, r *http.Request) {
 		var createdAt time.Time
 		if err := rows.Scan(&id, &tenantID, &channel, &userID, &sessionID, &toolName,
 			&decision, &errorType, &latency, &traceID, &detail, &createdAt); err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error())
+			writeOpError(w, "query_audit", err)
 			return
 		}
 		out = append(out, map[string]any{
@@ -930,6 +939,9 @@ func (a *AdminAPI) queryAudit(w http.ResponseWriter, r *http.Request) {
 			"error_type": errorType, "latency_ms": latency, "trace_id": traceID,
 			"detail": jsonOrNull(detail), "created_at": createdAt,
 		})
+	}
+	if listFailed(w, "query_audit", rows) {
+		return
 	}
 	writeJSON(w, http.StatusOK, out)
 }
@@ -1015,12 +1027,42 @@ func errBadRequest(msg string) error {
 	return httpError{http.StatusBadRequest, msg}
 }
 
-func errStatus(err error) int {
+// writeOpError answers a failure at the end of an admin operation. An
+// httpError is a judgement this service made and phrased for the caller — a
+// missing row, a conflict, a refused config — so its message passes through.
+//
+// Anything else reached us from the database or the knowledge store, and its
+// text is not ours to hand out: pgx and pgconn errors name tables, columns and
+// constraints, quote the statement that failed with its SQLSTATE, and on a
+// connection failure recite the DSN's host, port, user and database. Callers
+// of this API are operators, but a response body is the one artifact that gets
+// pasted verbatim into a ticket or a chat, and the same endpoint is worth
+// probing for anyone holding a leaked token. So the whole error goes to the
+// log, where the operator can find it, and the response names the operation
+// that failed — the vocabulary the audit log's tool_name already uses.
+func writeOpError(w http.ResponseWriter, op string, err error) {
 	var he httpError
 	if errors.As(err, &he) {
-		return he.status
+		writeError(w, he.status, he.msg)
+		return
 	}
-	return http.StatusInternalServerError
+	plog.Errorf("admin %s: %v", op, err)
+	writeError(w, http.StatusInternalServerError, op+" failed")
+}
+
+// listFailed reports the failure pgx defers past Query: a statement that fails
+// at bind or execute time still returns a nil error and a usable Rows, so the
+// iteration simply ends — after zero rows, or after however many were read
+// before a connection dropped. Read off rows.Err() or the handler answers 200
+// with an empty list, which is the worst possible answer to "what do we have":
+// an ops console shows no tenants, and an audit query reports no events during
+// exactly the incident that made someone ask.
+func listFailed(w http.ResponseWriter, op string, rows pgx.Rows) bool {
+	if err := rows.Err(); err != nil {
+		writeOpError(w, op, err)
+		return true
+	}
+	return false
 }
 
 func decodeBody(w http.ResponseWriter, r *http.Request, v any) bool {
