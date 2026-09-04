@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net"
 	"net/url"
 	"strings"
 	"sync"
@@ -69,8 +68,9 @@ func DefaultModelHosts() []string { return []string{"api.deepseek.com"} }
 // the full conversation content — including session history replayed into
 // every run — at a host of its choosing.
 //
-// An empty base_url is valid: it inherits the platform default. Plain http is
-// accepted only for loopback hosts, where the traffic never leaves the host.
+// An empty base_url is valid: it inherits the platform default. The scheme
+// requirement has no loopback exception — a tenant config may only ever
+// point at an allowlisted https endpoint, full stop.
 func ValidateModelSpec(spec ModelSpec, allowed []string) error {
 	if spec.BaseURL == "" {
 		return nil
@@ -79,10 +79,10 @@ func ValidateModelSpec(spec ModelSpec, allowed []string) error {
 	if err != nil || u.Hostname() == "" {
 		return fmt.Errorf("model.base_url %q is not a valid URL", spec.BaseURL)
 	}
-	host := strings.ToLower(u.Hostname())
-	if u.Scheme != "https" && !isLoopbackHost(host) {
-		return fmt.Errorf("model.base_url %q must use https (plain http is only allowed for loopback hosts)", spec.BaseURL)
+	if u.Scheme != "https" {
+		return fmt.Errorf("model.base_url %q must use https", spec.BaseURL)
 	}
+	host := strings.ToLower(u.Hostname())
 	if len(allowed) == 0 {
 		allowed = DefaultModelHosts()
 	}
@@ -92,13 +92,6 @@ func ValidateModelSpec(spec ModelSpec, allowed []string) error {
 		}
 	}
 	return fmt.Errorf("model.base_url host %q is not in the platform allowlist %v", host, allowed)
-}
-
-func isLoopbackHost(host string) bool {
-	if ip := net.ParseIP(host); ip != nil {
-		return ip.IsLoopback()
-	}
-	return host == "localhost"
 }
 
 // ValidateModelConfig validates tenant.model_config JSON against the
