@@ -2,6 +2,14 @@
 # a run with skips > 0 or coverage below baseline fails. Skips are visible
 # failures here, not green shrugs — the platforms' core paths (PG session/
 # memory, stream redelivery, locks, migration, S3, admin) must execute.
+#
+# Gate inventory: gofmt, go vet, golangci-lint, go mod tidy cleanliness,
+# the full suite under -race, zero skips, total coverage floor, and (on PRs)
+# diff coverage of the changed lines.
+#
+# The vendored wxbizmsgcrypt module (Tencent's official callback crypto
+# library) is deliberately out of scope for vet/lint: patching it would
+# diverge from upstream.
 name: test
 
 on:
@@ -53,22 +61,51 @@ jobs:
       TRPC_TEST_S3_ENDPOINT: localhost:9000
     steps:
       - uses: actions/checkout@v4
+        with:
+          # the diff-coverage gate diffs against origin/<base_ref>
+          fetch-depth: 0
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
 
+      - name: "Gate: gofmt"
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::files not gofmt-clean:"
+            echo "$unformatted"
+            exit 1
+          fi
+
       - name: Vet
         run: go vet ./...
+
+      - name: Lint
+        uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.13.2
+          # goinstall compiles golangci-lint with the workflow's own Go
+          # toolchain: the prebuilt binaries lag the repo's go directive and
+          # then refuse to typecheck it (export data version mismatch).
+          install-mode: goinstall
+
+      - name: "Gate: go mod tidy"
+        run: |
+          go mod tidy
+          if ! git diff --exit-code go.mod go.sum; then
+            echo "::error::go.mod/go.sum are not tidy - run 'go mod tidy'"
+            exit 1
+          fi
 
       - name: Init DB schema
         run: |
           psql "$TRPC_TEST_PG_DSN" -v ON_ERROR_STOP=1 -f deploy/db/init.sql
           psql "$TRPC_TEST_PG_DSN" -v ON_ERROR_STOP=1 -f deploy/db/seed.sql
 
-      - name: Test (integration deps live)
+      - name: Test (integration deps live, race detector on)
         run: |
           set -o pipefail
-          go test ./... -count=1 -v -coverprofile=coverage.out 2>&1 | tee test.log
+          go test ./... -count=1 -race -v -coverprofile=coverage.out 2>&1 | tee test.log
           if grep -qE '^FAIL' test.log; then
             echo "::error::test failure"
             exit 1
@@ -84,11 +121,27 @@ jobs:
           fi
 
       - name: "Gate: coverage baseline"
+        # 只升不降 (ratchet): the floor is the target, not the current state —
+        # never lower it. Current coverage is ~62%; this gate stays red until
+        # the suite reaches 85%.
         run: |
           total=$(go tool cover -func=coverage.out | tail -1 | awk '{print $3}' | tr -d '%')
           echo "total coverage: ${total}%"
-          awk -v t="$total" 'BEGIN { exit !(t >= 40) }' || {
-            echo "::error::coverage ${total}% below baseline 40%"; exit 1; }
+          if ! awk -v t="$total" 'BEGIN { exit !(t >= 85) }'; then
+            echo "::error::coverage ${total}% below baseline 85%"
+            exit 1
+          fi
+
+      - name: "Gate: diff coverage >= 85% (PR only)"
+        # push-to-main has no base ref to diff against, so the gate is PR-only.
+        if: github.event_name == 'pull_request'
+        run: |
+          go install github.com/boumenot/gocover-cobertura@v1.4.0
+          "$(go env GOPATH)/bin/gocover-cobertura" < coverage.out > coverage.xml
+          python3 -m pip install --user 'diff-cover==9.7.2'
+          diff-cover coverage.xml \
+            --compare-branch="origin/${{ github.base_ref }}" \
+            --fail-under=85
 
       - name: Coverage report
         run: go tool cover -func=coverage.out | tail -1
