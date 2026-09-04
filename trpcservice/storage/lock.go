@@ -46,12 +46,18 @@ else
   return 0
 end`)
 
-// Release frees the lock if and only if we still own it.
-func (l *Lock) Release(ctx context.Context, appID, sessionID, owner string) error {
-	if err := releaseScript.Run(ctx, l.rdb, []string{lockKey(appID, sessionID)}, owner).Err(); err != nil {
-		return fmt.Errorf("lock release %s: %w", sessionID, err)
+// releaseKey deletes the key only when the value still belongs to us, so a
+// lock that expired and was re-acquired by someone else is never deleted.
+func releaseKey(ctx context.Context, rdb *redis.Client, key, owner string) error {
+	if err := releaseScript.Run(ctx, rdb, []string{key}, owner).Err(); err != nil {
+		return fmt.Errorf("lock release %s: %w", key, err)
 	}
 	return nil
+}
+
+// Release frees the lock if and only if we still own it.
+func (l *Lock) Release(ctx context.Context, appID, sessionID, owner string) error {
+	return releaseKey(ctx, l.rdb, lockKey(appID, sessionID), owner)
 }
 
 // extendScript refreshes the TTL only when we still own the lock.
@@ -62,12 +68,18 @@ else
   return 0
 end`)
 
+// extendKey refreshes the TTL only when we still own the lock; ok=false means
+// it is no longer ours (expired or taken over).
+func extendKey(ctx context.Context, rdb *redis.Client, key, owner string, ttl time.Duration) (bool, error) {
+	n, err := extendScript.Run(ctx, rdb, []string{key}, owner, ttl.Milliseconds()).Int()
+	if err != nil {
+		return false, fmt.Errorf("lock extend %s: %w", key, err)
+	}
+	return n == 1, nil
+}
+
 // Extend renews the TTL; ok=false means the lock is no longer ours (expired
 // or taken over) and the caller should consider the session unprotected.
 func (l *Lock) Extend(ctx context.Context, appID, sessionID, owner string, ttl time.Duration) (bool, error) {
-	n, err := extendScript.Run(ctx, l.rdb, []string{lockKey(appID, sessionID)}, owner, ttl.Milliseconds()).Int()
-	if err != nil {
-		return false, fmt.Errorf("lock extend %s: %w", sessionID, err)
-	}
-	return n == 1, nil
+	return extendKey(ctx, l.rdb, lockKey(appID, sessionID), owner, ttl)
 }

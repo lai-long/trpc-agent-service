@@ -90,6 +90,13 @@ func (r *Resolver) Resolve(ctx context.Context, webhookPath string) (Route, erro
 	if !ok {
 		return Route{}, fmt.Errorf("%w: %s", ErrUnknownBinding, webhookPath)
 	}
+	return r.resolveBinding(b)
+}
+
+// resolveBinding applies the serving checks shared by Resolve and
+// RoutesByChannel to one snapshot binding: binding active + tenant exists and
+// active + app exists and published. Callers must hold r.mu.
+func (r *Resolver) resolveBinding(b ChannelBinding) (Route, error) {
 	if b.Status != StatusActive {
 		return Route{}, fmt.Errorf("%w: binding %s status %q", ErrInactive, b.ID, b.Status)
 	}
@@ -112,6 +119,34 @@ func (r *Resolver) Resolve(ctx context.Context, webhookPath string) (Route, erro
 		return Route{}, fmt.Errorf("%w: app %s status %q", ErrInactive, app.ID, app.Status)
 	}
 	return Route{Tenant: t, App: app, Binding: b}, nil
+}
+
+// RoutesByChannel returns the currently servable routes for one channel type
+// (binding active + tenant active + app published), with the same TTL and
+// pub-sub invalidation semantics as Resolve. A binding whose checks fail is
+// logged at warn and skipped — one broken binding must not drag down the
+// other connections of the same channel. The only error is a failed first
+// snapshot load.
+func (r *Resolver) RoutesByChannel(ctx context.Context, channel string) ([]Route, error) {
+	if err := r.refresh(ctx); err != nil {
+		return nil, err
+	}
+
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	var routes []Route
+	for _, b := range r.bindingsByID {
+		if b.Channel != channel {
+			continue
+		}
+		route, err := r.resolveBinding(b)
+		if err != nil {
+			plog.Warnf("resolver: skipping %s binding %s (%s): %v", channel, b.ID, b.WebhookPath, err)
+			continue
+		}
+		routes = append(routes, route)
+	}
+	return routes, nil
 }
 
 // Invalidate drops the cached snapshot; the next Resolve reloads.
