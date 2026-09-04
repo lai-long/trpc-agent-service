@@ -473,7 +473,7 @@ func TestBuildProcessorFull(t *testing.T) {
 
 func TestStartWecom(t *testing.T) {
 	secrets := config.NewFileResolver(testSecretsDir(t))
-	if wc := startWecom(config.Config{}, nil, secrets); wc != nil {
+	if wc := startWecom(config.Config{}, nil, secrets, nil); wc != nil {
 		t.Fatal("unset TRPC_WECOM_CORP_ID must disable the channel")
 	}
 	base := config.Config{
@@ -483,14 +483,14 @@ func TestStartWecom(t *testing.T) {
 	for _, agentID := range []string{"not-a-number", "0", ""} {
 		cfg := base
 		cfg.WecomAgentID = agentID
-		if wc := startWecom(cfg, nil, secrets); wc != nil {
+		if wc := startWecom(cfg, nil, secrets, nil); wc != nil {
 			t.Fatalf("invalid TRPC_WECOM_AGENT_ID %q must disable the channel", agentID)
 		}
 	}
 	if wc := startWecom(config.Config{
 		WecomCorpID: "corp", WecomAgentID: "1000002",
 		WecomTokenRef: "missing", WecomAESKeyRef: "missing",
-	}, nil, config.NewFileResolver(t.TempDir())); wc != nil {
+	}, nil, config.NewFileResolver(t.TempDir()), nil); wc != nil {
 		t.Fatal("unresolvable secrets must disable the channel")
 	}
 
@@ -498,7 +498,7 @@ func TestStartWecom(t *testing.T) {
 		WecomCorpID: "corp", WecomAgentID: "1000002",
 		WecomTokenRef: "wecom-token", WecomAESKeyRef: "wecom-aeskey",
 		WecomAPIBase: "http://127.0.0.1:1",
-	}, nil, secrets)
+	}, nil, secrets, nil)
 	if wc == nil {
 		t.Fatal("valid config must enable the wecom channel")
 	}
@@ -509,16 +509,16 @@ func TestStartWecom(t *testing.T) {
 
 func TestStartWxkf(t *testing.T) {
 	secrets := config.NewFileResolver(testSecretsDir(t))
-	if ch := startWxkf(config.Config{}, secrets); ch != nil {
+	if ch := startWxkf(config.Config{}, secrets, nil); ch != nil {
 		t.Fatal("unset wxkf env must disable the channel")
 	}
-	if ch := startWxkf(config.Config{WxkfCorpID: "corp"}, secrets); ch != nil {
+	if ch := startWxkf(config.Config{WxkfCorpID: "corp"}, secrets, nil); ch != nil {
 		t.Fatal("missing KF account must disable the channel")
 	}
 	if ch := startWxkf(config.Config{
 		WxkfCorpID: "corp", WxkfKfAccount: "wk0001",
 		WxkfTokenRef: "missing", WxkfAESKeyRef: "missing",
-	}, config.NewFileResolver(t.TempDir())); ch != nil {
+	}, config.NewFileResolver(t.TempDir()), nil); ch != nil {
 		t.Fatal("unresolvable secrets must disable the channel")
 	}
 
@@ -527,7 +527,7 @@ func TestStartWxkf(t *testing.T) {
 		WxkfTokenRef: "wxkf-token", WxkfAESKeyRef: "wxkf-aeskey",
 		WxkfAPIBase: "http://127.0.0.1:1",
 	}
-	ch := startWxkf(cfg, secrets)
+	ch := startWxkf(cfg, secrets, nil)
 	if ch == nil {
 		t.Fatal("valid config must enable the wxkf channel")
 	}

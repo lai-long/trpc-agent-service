@@ -18,7 +18,9 @@ import (
 	"trpc.group/trpc-go/trpc-agent-go/knowledge"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/agent"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/channels/wecom"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels/wecomws"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/channels/wxkf"
 	plog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/storage"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
@@ -536,9 +538,24 @@ func (a *AdminAPI) createBinding(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "channel is required")
 		return
 	}
-	if in.Channel == wecomws.ChannelName {
+	// Per-channel binding validation at create time: a config jsonb the
+	// adapter cannot parse would otherwise fail every send under this
+	// binding later (the adapters fail closed on an unreadable config
+	// rather than silently replying under the env-global identity).
+	switch in.Channel {
+	case wecomws.ChannelName:
 		if msg := validateWecomwsBinding(in.WebhookPath, in.Config, in.TokenRef, in.AESKeyRef); msg != "" {
 			writeError(w, http.StatusBadRequest, msg)
+			return
+		}
+	case wecom.ChannelName:
+		if err := wecom.ValidateBindingConfig(in.Config); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	case wxkf.ChannelName:
+		if err := wxkf.ValidateBindingConfig(in.Config); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 	}

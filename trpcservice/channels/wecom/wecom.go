@@ -33,6 +33,10 @@ import (
 	plog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
 )
 
+// ChannelName is the channel identifier, stamped on every message this
+// channel serves and keyed by in the channel_binding rows.
+const ChannelName = "wecom"
+
 // callbackPath is the webhook path mounted on the platform mux; it must match
 // the channel_binding.webhook_path row for tenant routing.
 const callbackPath = "/wecom/callback"
@@ -51,6 +55,9 @@ const tokenExpiryMargin = 5 * time.Minute
 // growth under repeated key rotation.
 const maxCryptCacheEntries = 32
 
+// maxTokenCacheEntries bounds the identity-keyed access_token cache.
+const maxTokenCacheEntries = 32
+
 // Config holds the WeCom channel configuration. Secret material is carried
 // as references and resolved through the SecretResolver, never logged.
 type Config struct {
@@ -63,6 +70,10 @@ type Config struct {
 	// Media stores fetched media_id content; nil degrades
 	// media messages to a placeholder text.
 	Media channels.MediaStore
+	// Bindings resolves the per-binding outbound identity (corp/agent/
+	// secret) at Send time; nil keeps every reply on the env-global identity
+	// above — the legacy single-binding deployment's path.
+	Bindings channels.BindingProvider
 }
 
 // Channel is the WeCom implementation of channels.Channel.
@@ -73,6 +84,9 @@ type Channel struct {
 	// media is the artifact store for inbound media_id fetches; nil degrades
 	// media messages to a placeholder text.
 	media channels.MediaStore
+	// bindings resolves the outbound identity of a binding-scoped reply; nil
+	// (legacy single-binding deployment) keeps the env-global identity.
+	bindings channels.BindingProvider
 
 	// crypts caches one WXBizMsgCrypt per credential set
 	// (corp|tokenRef|aesKeyRef): multi-tenant callbacks arrive with
@@ -82,9 +96,21 @@ type Channel struct {
 	cryptMu sync.Mutex
 	crypts  map[string]*wxbizmsgcrypt.WXBizMsgCrypt
 
-	tokenMu     sync.Mutex
-	accessToken string
-	tokenExpiry time.Time
+	// tokens caches one access_token per (corpID, secretRef) identity:
+	// bindings of different corps — or different self-built apps within one
+	// corp — each authenticate with their own secret, and a single global
+	// entry would send every reply under the env identity. Keyed by REF, not
+	// the resolved secret: the send hot path stays off the secret resolver,
+	// and a rotation behind a ref is picked up when the cached token expires
+	// or the platform rejects it (40014/42001 invalidates just that entry).
+	tokenMu sync.Mutex
+	tokens  map[string]tokenEntry
+}
+
+// tokenEntry is one cached access_token and its refresh deadline.
+type tokenEntry struct {
+	token  string
+	expiry time.Time
 }
 
 // New creates the channel: the env callback token and AES key are resolved
@@ -106,12 +132,84 @@ func New(cfg Config, resolver config.SecretResolver) (*Channel, error) {
 		return nil, fmt.Errorf("wecom: resolve aes key: %w", err)
 	}
 	return &Channel{
-		cfg:    cfg,
-		secret: resolver,
-		client: &http.Client{Timeout: 10 * time.Second},
-		media:  cfg.Media,
-		crypts: map[string]*wxbizmsgcrypt.WXBizMsgCrypt{},
+		cfg:      cfg,
+		secret:   resolver,
+		client:   &http.Client{Timeout: 10 * time.Second},
+		media:    cfg.Media,
+		bindings: cfg.Bindings,
+		crypts:   map[string]*wxbizmsgcrypt.WXBizMsgCrypt{},
+		tokens:   map[string]tokenEntry{},
 	}, nil
+}
+
+// bindingConfig is the optional per-binding outbound identity in
+// channel_binding.config: a binding whose replies must go out under its own
+// corp / self-built app carries them here. Every field falls back to the
+// env-global Config when absent, so an empty (or corp_id-only) config keeps
+// the legacy single-identity behavior. corp_id doubles as the inbound crypt
+// receiver id the dispatcher reads.
+type bindingConfig struct {
+	CorpID    string `json:"corp_id"`
+	AgentID   int    `json:"agent_id"`
+	SecretRef string `json:"secret_ref"`
+}
+
+// ValidateBindingConfig is the admin API's write gate for wecom binding
+// config. Every field is optional, but unknown fields are refused: the
+// config jsonb lands verbatim in audit details, so e.g. a "secret" key would
+// smuggle plaintext credentials into the audit trail while being silently
+// ignored by the channel.
+func ValidateBindingConfig(raw json.RawMessage) error {
+	if len(raw) == 0 {
+		return nil
+	}
+	var cfg bindingConfig
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&cfg); err != nil {
+		return fmt.Errorf("wecom binding config only accepts corp_id, agent_id and secret_ref: %w", err)
+	}
+	return nil
+}
+
+// outboundID is the IM identity one reply goes out under.
+type outboundID struct {
+	corpID    string
+	secretRef string
+	agentID   int
+}
+
+// outboundIDFor resolves the identity for msg: the binding's own config when
+// the message is binding-scoped, field by field falling back to the
+// env-global identity (the legacy env path, and bindings that predate
+// per-binding outbound config). An unresolvable binding or config fails the
+// send — replying under the global identity instead could deliver one
+// tenant's message as another corp's bot.
+func (c *Channel) outboundIDFor(ctx context.Context, msg channels.OutboundMessage) (outboundID, error) {
+	id := outboundID{corpID: c.cfg.CorpID, secretRef: c.cfg.SecretRef, agentID: c.cfg.AgentID}
+	if msg.BindingID == "" || c.bindings == nil {
+		return id, nil
+	}
+	b, err := c.bindings.BindingByID(ctx, msg.BindingID)
+	if err != nil {
+		return outboundID{}, fmt.Errorf("wecom: resolve binding %s for outbound identity: %w", msg.BindingID, err)
+	}
+	var cfg bindingConfig
+	if len(b.Config) > 0 {
+		if err := json.Unmarshal(b.Config, &cfg); err != nil {
+			return outboundID{}, fmt.Errorf("wecom: binding %s config: %w", msg.BindingID, err)
+		}
+	}
+	if cfg.CorpID != "" {
+		id.corpID = cfg.CorpID
+	}
+	if cfg.SecretRef != "" {
+		id.secretRef = cfg.SecretRef
+	}
+	if cfg.AgentID != 0 {
+		id.agentID = cfg.AgentID
+	}
+	return id, nil
 }
 
 // cryptFor resolves the credential set and returns its crypt. The cache is
@@ -156,7 +254,7 @@ func (c *Channel) cryptFor(corpID, tokenRef, aesKeyRef string) (*wxbizmsgcrypt.W
 }
 
 // Name implements channels.Channel.
-func (c *Channel) Name() string { return "wecom" }
+func (c *Channel) Name() string { return ChannelName }
 
 // RegisterRoutes implements channels.Channel: GET verifies the callback URL,
 // POST receives encrypted messages. The path is the env-configured
@@ -331,11 +429,15 @@ func (c *Channel) receiveMedia(r *http.Request, w http.ResponseWriter, h channel
 }
 
 // fetchMedia downloads media via the platform media/get API and stores it.
+// Inbound media still fetches under the env-global identity: the callback path
+// carries the binding's token/AES refs but not its outbound secret_ref, so a
+// multi-corp deployment's media fetch stays on the global corp until that is
+// threaded through BindingCredentials.
 func (c *Channel) fetchMedia(ctx context.Context, cm *callbackMessage) (string, error) {
 	if c.media == nil {
 		return "", errors.New("media store not configured")
 	}
-	token, err := c.getAccessToken(ctx)
+	token, err := c.getAccessToken(ctx, c.cfg.CorpID, c.cfg.SecretRef)
 	if err != nil {
 		return "", err
 	}
@@ -416,9 +518,15 @@ func writeSuccess(w http.ResponseWriter) {
 // wxkf send_msg msgid): duplicate suppression relies on the sender's sent:
 // marker window, and a crash inside that window can surface a duplicate.
 func (c *Channel) Send(ctx context.Context, msg channels.OutboundMessage) error {
+	// One identity lookup for the whole reply: every segment of one message
+	// goes out under the same binding identity.
+	id, err := c.outboundIDFor(ctx, msg)
+	if err != nil {
+		return err
+	}
 	segments := splitText(msg.Text, maxTextBytes)
 	for i, seg := range segments {
-		if err := c.sendSegment(ctx, msg, seg); err != nil {
+		if err := c.sendSegment(ctx, id, msg, seg); err != nil {
 			if i > 0 {
 				return fmt.Errorf("send segment %d/%d (partial delivery): %w", i+1, len(segments), err)
 			}
@@ -428,21 +536,21 @@ func (c *Channel) Send(ctx context.Context, msg channels.OutboundMessage) error 
 	return nil
 }
 
-func (c *Channel) sendSegment(ctx context.Context, msg channels.OutboundMessage, text string) error {
-	token, err := c.getAccessToken(ctx)
+func (c *Channel) sendSegment(ctx context.Context, id outboundID, msg channels.OutboundMessage, text string) error {
+	token, err := c.getAccessToken(ctx, id.corpID, id.secretRef)
 	if err != nil {
 		return err
 	}
-	errcode, err := c.postMessage(ctx, token, msg, text)
+	errcode, err := c.postMessage(ctx, token, id.agentID, msg, text)
 	if err != nil {
 		return err
 	}
 	if errcode == 40014 || errcode == 42001 { // token expired/invalid: refresh once and retry
-		c.invalidateToken()
-		if token, err = c.getAccessToken(ctx); err != nil {
+		c.invalidateToken(id.corpID, id.secretRef)
+		if token, err = c.getAccessToken(ctx, id.corpID, id.secretRef); err != nil {
 			return err
 		}
-		errcode, err = c.postMessage(ctx, token, msg, text)
+		errcode, err = c.postMessage(ctx, token, id.agentID, msg, text)
 		if err != nil {
 			return err
 		}
@@ -455,8 +563,9 @@ func (c *Channel) sendSegment(ctx context.Context, msg channels.OutboundMessage,
 
 // postMessage calls the send API and returns the platform errcode. Markdown
 // replies use the markdown msgtype (WeCom renders it; channels without
-// markdown downgrade upstream via channels.RenderPlain).
-func (c *Channel) postMessage(ctx context.Context, token string, msg channels.OutboundMessage, text string) (int, error) {
+// markdown downgrade upstream via channels.RenderPlain). agentID is the
+// resolved outbound identity's app, not necessarily the env-global one.
+func (c *Channel) postMessage(ctx context.Context, token string, agentID int, msg channels.OutboundMessage, text string) (int, error) {
 	msgType, contentKey := "text", "text"
 	if msg.TextType == "markdown" {
 		msgType, contentKey = "markdown", "markdown"
@@ -475,7 +584,7 @@ func (c *Channel) postMessage(ctx context.Context, token string, msg channels.Ou
 		payload = map[string]any{
 			"touser":   msg.UserID,
 			"msgtype":  msgType,
-			"agentid":  c.cfg.AgentID,
+			"agentid":  agentID,
 			contentKey: map[string]string{"content": text},
 		}
 	}
@@ -507,18 +616,24 @@ func (c *Channel) postMessage(ctx context.Context, token string, msg channels.Ou
 	return result.ErrCode, nil
 }
 
-// getAccessToken returns the cached token, refreshing it when expired.
-func (c *Channel) getAccessToken(ctx context.Context) (string, error) {
+// getAccessToken returns the cached token for one (corpID, secretRef)
+// identity, refreshing it when expired. The cache is keyed by the secret REF,
+// not its resolved value: the send hot path stays off the secret resolver, and
+// a rotation behind a ref is picked up when the cached token expires or the
+// platform rejects it (sendSegment invalidates just that entry on
+// 40014/42001).
+func (c *Channel) getAccessToken(ctx context.Context, corpID, secretRef string) (string, error) {
+	key := corpID + "|" + secretRef
 	c.tokenMu.Lock()
 	defer c.tokenMu.Unlock()
-	if c.accessToken != "" && time.Now().Before(c.tokenExpiry) {
-		return c.accessToken, nil
+	if e, ok := c.tokens[key]; ok && time.Now().Before(e.expiry) {
+		return e.token, nil
 	}
-	secret, err := c.secret.Resolve(ctx, c.cfg.SecretRef)
+	secret, err := c.secret.Resolve(ctx, secretRef)
 	if err != nil {
 		return "", fmt.Errorf("wecom: resolve corpsecret: %w", err)
 	}
-	apiURL := c.cfg.APIBase + "/cgi-bin/gettoken?corpid=" + url.QueryEscape(c.cfg.CorpID) +
+	apiURL := c.cfg.APIBase + "/cgi-bin/gettoken?corpid=" + url.QueryEscape(corpID) +
 		"&corpsecret=" + url.QueryEscape(secret)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
 	if err != nil {
@@ -545,16 +660,19 @@ func (c *Channel) getAccessToken(ctx context.Context) (string, error) {
 	if ttl <= 0 {
 		ttl = time.Hour
 	}
-	c.accessToken = result.AccessToken
-	c.tokenExpiry = time.Now().Add(ttl)
-	return c.accessToken, nil
+	if len(c.tokens) >= maxTokenCacheEntries {
+		// Bindings come and go; a wholesale reset bounds the map without
+		// correctness impact (the next send per identity re-authenticates).
+		c.tokens = map[string]tokenEntry{}
+	}
+	c.tokens[key] = tokenEntry{token: result.AccessToken, expiry: time.Now().Add(ttl)}
+	return result.AccessToken, nil
 }
 
-func (c *Channel) invalidateToken() {
+func (c *Channel) invalidateToken(corpID, secretRef string) {
 	c.tokenMu.Lock()
 	defer c.tokenMu.Unlock()
-	c.accessToken = ""
-	c.tokenExpiry = time.Time{}
+	delete(c.tokens, corpID+"|"+secretRef)
 }
 
 // splitText breaks s into segments of at most n bytes, on rune boundaries.

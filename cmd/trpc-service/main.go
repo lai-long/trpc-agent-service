@@ -237,11 +237,19 @@ func serve(role string) error {
 		if s3, ok := artifacts.(*storage.S3ArtifactService); ok {
 			mediaSink = s3
 		}
-		if wc := startWecom(cfg, mediaSink, secrets); wc != nil {
+		// Per-binding outbound identity: binding-scoped replies resolve their
+		// own corp/agent/KF credentials through the resolver's cached
+		// snapshot. Without tenant routing the adapters stay on the
+		// env-global identity (a nil interface, not a typed-nil wrapper).
+		var outboundBindings channels.BindingProvider
+		if resolver != nil {
+			outboundBindings = bindingProvider{resolver}
+		}
+		if wc := startWecom(cfg, mediaSink, secrets, outboundBindings); wc != nil {
 			wc.RegisterRoutes(mux, enqueue)
 			channelSet[wc.Name()] = wc
 		}
-		if kf := startWxkf(cfg, secrets); kf != nil {
+		if kf := startWxkf(cfg, secrets, outboundBindings); kf != nil {
 			kf.RegisterRoutes(mux, enqueue)
 			channelSet[kf.Name()] = kf
 		}
@@ -533,8 +541,10 @@ func startPGConsumers(ctx context.Context, cfg config.Config) (*storage.Auditor,
 // startWecom builds the WeCom channel from env config; it returns nil (with a
 // warning) when the channel is not configured or its secrets are missing, so
 // the rest of the platform keeps serving the other channels. media is the
-// artifact store for inbound media_id fetches (nil degrades to placeholders).
-func startWecom(cfg config.Config, media channels.MediaStore, secrets config.SecretResolver) *wecom.Channel {
+// artifact store for inbound media_id fetches (nil degrades to placeholders);
+// bindings resolves the per-binding outbound identity at Send time (nil keeps
+// every reply on the env-global identity).
+func startWecom(cfg config.Config, media channels.MediaStore, secrets config.SecretResolver, bindings channels.BindingProvider) *wecom.Channel {
 	if cfg.WecomCorpID == "" {
 		return nil
 	}
@@ -551,6 +561,7 @@ func startWecom(cfg config.Config, media channels.MediaStore, secrets config.Sec
 		SecretRef: cfg.WecomSecretRef,
 		APIBase:   cfg.WecomAPIBase,
 		Media:     media,
+		Bindings:  bindings,
 	}, secrets)
 	if err != nil {
 		plog.Warnf("wecom channel disabled: %v", err)
@@ -562,7 +573,7 @@ func startWecom(cfg config.Config, media channels.MediaStore, secrets config.Sec
 
 // startWxkf builds the WeChat KF channel from env config;
 // same degradation rule as startWecom.
-func startWxkf(cfg config.Config, secrets config.SecretResolver) *wxkf.Channel {
+func startWxkf(cfg config.Config, secrets config.SecretResolver, bindings channels.BindingProvider) *wxkf.Channel {
 	if cfg.WxkfCorpID == "" || cfg.WxkfKfAccount == "" {
 		return nil
 	}
@@ -573,6 +584,7 @@ func startWxkf(cfg config.Config, secrets config.SecretResolver) *wxkf.Channel {
 		AESKeyRef: cfg.WxkfAESKeyRef,
 		SecretRef: cfg.WxkfSecretRef,
 		APIBase:   cfg.WxkfAPIBase,
+		Bindings:  bindings,
 	}, secrets)
 	if err != nil {
 		plog.Warnf("wxkf channel disabled: %v", err)
@@ -624,6 +636,20 @@ func (w wsRoutes) RoutesByChannel(ctx context.Context, channel string) ([]wecomw
 		})
 	}
 	return out, nil
+}
+
+// bindingProvider projects the tenant resolver onto the outbound binding
+// lookup: the adapters only need the binding id and config jsonb to resolve
+// the per-binding outbound identity at Send time. The resolver is
+// cache-backed, so the per-send lookup is a snapshot read.
+type bindingProvider struct{ r *tenant.Resolver }
+
+func (b bindingProvider) BindingByID(ctx context.Context, id string) (channels.OutboundBinding, error) {
+	binding, err := b.r.BindingByID(ctx, id)
+	if err != nil {
+		return channels.OutboundBinding{}, err
+	}
+	return channels.OutboundBinding{ID: binding.ID, Config: binding.Config}, nil
 }
 
 // Re-campaign pacing: the base wait doubles per consecutive quick failure

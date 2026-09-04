@@ -9,6 +9,7 @@ package channels
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -257,6 +258,25 @@ type BindingAware interface {
 	// references could not be resolved — the caller answers 5xx and the IM
 	// redelivers.
 	CallbackHandler(h Handler, creds BindingCredentials) (http.HandlerFunc, error)
+}
+
+// OutboundBinding is the slice of a channel_binding row an adapter needs to
+// send a reply under the binding's own IM identity: the config jsonb carries
+// the per-binding corp/agent/secret references (each adapter defines its own
+// schema), and the ID scopes cache entries and error messages.
+type OutboundBinding struct {
+	ID     string
+	Config json.RawMessage
+}
+
+// BindingProvider answers binding-id → OutboundBinding for the outbound path.
+// Inbound credentials ride BindingCredentials through the dispatcher; a reply
+// only carries the BindingID, so the adapter resolves the row itself. main.go
+// adapts the tenant resolver (cache-backed, no per-send DB hit); a nil
+// provider keeps the adapter on its env-global identity — the legacy
+// single-binding deployment's path.
+type BindingProvider interface {
+	BindingByID(ctx context.Context, id string) (OutboundBinding, error)
 }
 
 // ScrubError strips credentials from *url.Error values before they reach a

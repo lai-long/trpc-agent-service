@@ -699,9 +699,16 @@ Go 并发安全专项（Worker 长进程不泄漏）：
 `channel_binding` 行，将请求连同该绑定的 `token_ref` / `aeskey_ref`（corp_id 可经
 `config.corp_id` 覆盖）交给适配器，验签按绑定各自的密钥进行，之后再进入共享的
 路由/限流/护栏管线；启动后新建绑定经快照刷新（TTL + 失效广播）即时可达，无需重启。
-env 配置的 `/{channel}/callback` 旧路径保留为单绑定默认。已知限制：出站发送侧的
-corpsecret 仍取 env 全局配置（适配器无绑定级发送密钥），同一通道多 corp 的回复触达
-为下一步项。
+env 配置的 `/{channel}/callback` 旧路径保留为单绑定默认。
+
+出站同样按绑定身份发送（实现注）：回复只携带 `binding_id`，适配器据此取该行
+`config` 解析自己的发送身份——企微 `{corp_id, agent_id, secret_ref}`、微信客服
+`{corp_id, kf_account, secret_ref}`，逐字段回退 env 全局配置（空配置即旧单企业
+行为）；`access_token` 缓存键为 `(corp_id, secret_ref)`，40014/42001 只失效对应
+维度的条目；绑定查不到或 config 不可解析时发送直接失败，不回退全局身份——否则
+一个租户的消息会以另一企业的机器人发出。密钥仍只存引用，经 SecretResolver 解析。
+已知限制：企微入站素材拉取（`media/get`）仍用 env 全局 token——回调侧只透传
+`token_ref` / `aeskey_ref`，未携带绑定级发送密钥引用。
 
 | 维度 | 企业微信 | 微信客服 |
 |---|---|---|
@@ -897,7 +904,10 @@ updateApp / publish 事务内）与 Worker 装配时双重校验——会话原�
 | GET | `/admin/audit` | 审计查询，按 tenant_id / session_id / trace_id / decision 过滤 |
 
 渠道绑定的写入口按通道类型做配置校验；`wecomws` 绑定必须携带非空 `bot_id` + `secret_ref`、
-`webhook_path` 匹配 `^/wecomws/[A-Za-z0-9_-]+$`（5.3.4），不合规返回 400。
+`webhook_path` 匹配 `^/wecomws/[A-Za-z0-9_-]+$`（5.3.4），不合规返回 400。`wecom` /
+`wxkf` 绑定的 `config` 按各自出站身份 schema 校验：字段全部可选（缺省回退 env 全局），
+未知字段一律拒绝返回 400——`config` 原样写入审计明细，一个未被通道识别的键（如明文
+`secret`）会既进审计又不生效。
 
 ## 6. 预期效果
 
