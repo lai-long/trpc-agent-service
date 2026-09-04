@@ -1,7 +1,6 @@
 package web
 
 import (
-	"bytes"
 	"context"
 	"crypto/subtle"
 	"encoding/json"
@@ -19,6 +18,7 @@ import (
 	"trpc.group/trpc-go/trpc-agent-go/knowledge"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/agent"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/channels/wecomws"
 	plog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/storage"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
@@ -536,7 +536,7 @@ func (a *AdminAPI) createBinding(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "channel is required")
 		return
 	}
-	if in.Channel == "wecomws" {
+	if in.Channel == wecomws.ChannelName {
 		if msg := validateWecomwsBinding(in.WebhookPath, in.Config, in.TokenRef, in.AESKeyRef); msg != "" {
 			writeError(w, http.StatusBadRequest, msg)
 			return
@@ -587,36 +587,30 @@ func (a *AdminAPI) createBinding(w http.ResponseWriter, r *http.Request) {
 // /wecomws/{bot_id}. WS inbound has no IM redelivery, so a typo'd path would
 // not surface as a routing error — it would silently blackhole every message
 // the bot receives.
-var wecomwsPathPattern = regexp.MustCompile(`^/wecomws/[A-Za-z0-9_-]+$`)
+var wecomwsPathPattern = regexp.MustCompile(`^/wecomws/([A-Za-z0-9_-]+)$`)
 
 // validateWecomwsBinding enforces the wecomws binding shape; a non-empty
-// return value is the 400 message. The config jsonb must carry a non-empty
-// bot_id and a secret_ref (the secret itself is only ever a reference,
-// resolved at connect time), and unlike the webhook channels the callback
-// path is part of the contract, not auto-filled: the bot's messages arrive
-// with it as the routing key. token_ref/aeskey_ref stay empty — the WS
-// channel authenticates per-bot with secret_ref, not per-callback crypt keys.
+// return value is the 400 message. The config schema is validated by the
+// channel itself (wecomws.ValidateBindingConfig: non-empty bot_id and
+// secret_ref, unknown fields refused). Unlike the webhook channels the
+// callback path is part of the contract, not auto-filled: the bot's messages
+// arrive with it as the routing key. token_ref/aeskey_ref stay empty — the
+// WS channel authenticates per-bot with secret_ref, not per-callback crypt
+// keys.
 func validateWecomwsBinding(webhookPath string, config json.RawMessage, tokenRef, aesKeyRef string) string {
-	if !wecomwsPathPattern.MatchString(webhookPath) {
+	m := wecomwsPathPattern.FindStringSubmatch(webhookPath)
+	if m == nil {
 		return "wecomws webhook_path must match /wecomws/{bot_id} (bot_id: [A-Za-z0-9_-]+)"
 	}
-	var cfg struct {
-		BotID     string `json:"bot_id"`
-		SecretRef string `json:"secret_ref"`
+	botID, err := wecomws.ValidateBindingConfig(config)
+	if err != nil {
+		return err.Error()
 	}
-	if len(config) == 0 {
-		return "wecomws binding requires a config with non-empty bot_id and secret_ref"
-	}
-	// Unknown fields are refused: the config jsonb lands verbatim in audit
-	// details, so e.g. a "secret" key would smuggle plaintext credentials
-	// into the audit trail while being silently ignored by the channel.
-	dec := json.NewDecoder(bytes.NewReader(config))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&cfg); err != nil {
-		return "wecomws binding config only accepts bot_id and secret_ref: " + err.Error()
-	}
-	if cfg.BotID == "" || cfg.SecretRef == "" {
-		return "wecomws binding config requires non-empty bot_id and secret_ref"
+	// The path suffix is the routing key the bot's inbound messages carry;
+	// if it names a different bot than the config connects as, every message
+	// resolves to the wrong binding and is silently blackholed.
+	if m[1] != botID {
+		return "wecomws webhook_path bot_id (" + m[1] + ") must equal config bot_id (" + botID + ")"
 	}
 	if tokenRef != "" || aesKeyRef != "" {
 		return "wecomws bindings must leave token_ref/aeskey_ref empty (credentials ride config.secret_ref)"

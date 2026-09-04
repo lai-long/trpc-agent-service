@@ -1,6 +1,7 @@
 package wecomws
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -30,6 +31,27 @@ type RoutesProvider interface {
 type bindingConfig struct {
 	BotID     string `json:"bot_id"`
 	SecretRef string `json:"secret_ref"`
+}
+
+// ValidateBindingConfig is the admin API's write gate: the strict version of
+// parseBindingConfig, returning the bot_id. Unknown fields are refused — the
+// config jsonb lands verbatim in audit details, so e.g. a "secret" key would
+// smuggle plaintext credentials into the audit trail while being silently
+// ignored by the channel.
+func ValidateBindingConfig(raw json.RawMessage) (botID string, err error) {
+	if len(raw) == 0 {
+		return "", errors.New("wecomws binding requires a config with non-empty bot_id and secret_ref")
+	}
+	var cfg bindingConfig
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&cfg); err != nil {
+		return "", fmt.Errorf("wecomws binding config only accepts bot_id and secret_ref: %w", err)
+	}
+	if cfg.BotID == "" || cfg.SecretRef == "" {
+		return "", errors.New("wecomws binding config requires non-empty bot_id and secret_ref")
+	}
+	return cfg.BotID, nil
 }
 
 // parseBindingConfig enforces the two required fields; the admin API already

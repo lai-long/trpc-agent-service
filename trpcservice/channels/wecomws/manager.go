@@ -1,6 +1,7 @@
 package wecomws
 
 import (
+	"bytes"
 	"context"
 	"sync"
 
@@ -25,9 +26,12 @@ func (m *manager) byBinding(id string) *botConn {
 	return m.conns[id]
 }
 
-// reconcile converges the connections onto the servable binding set. A
-// binding whose config cannot be parsed is skipped with a warning — one
-// broken row must not drag down the other connections.
+// reconcile converges the connections onto the servable binding set: starts
+// connections for new bindings, and stops (cancel + drain) connections whose
+// binding disappeared, was disabled, or changed (edited config/webhook_path
+// restarts the connection so the new values take effect). A binding whose
+// config cannot be parsed is skipped with a warning — one broken row must not
+// drag down the other connections.
 func (m *manager) reconcile(ctx context.Context, h channels.Handler) error {
 	bindings, err := m.parent.routes.RoutesByChannel(ctx, m.parent.Name())
 	if err != nil {
@@ -40,6 +44,27 @@ func (m *manager) reconcile(ctx context.Context, h channels.Handler) error {
 
 	m.mu.Lock()
 	var stopped []*botConn
+	for id, bc := range m.conns {
+		b, ok := want[id]
+		if ok && b.WebhookPath == bc.binding.WebhookPath && bytes.Equal(b.Config, bc.binding.Config) {
+			continue
+		}
+		bc.cancel()
+		delete(m.conns, id)
+		stopped = append(stopped, bc)
+	}
+	m.mu.Unlock()
+
+	// Drain before starting replacements: the platform allows one connection
+	// per bot, so an overlap would make the old and new sockets kick each
+	// other.
+	for _, bc := range stopped {
+		<-bc.done
+		plog.Infof("wecomws: connection stopped (bot %s, binding %s)", bc.cfg.BotID, bc.binding.ID)
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	for id, b := range want {
 		if _, ok := m.conns[id]; ok {
 			continue
@@ -60,20 +85,6 @@ func (m *manager) reconcile(ctx context.Context, h channels.Handler) error {
 		m.conns[id] = bc
 		go bc.run(connCtx, h)
 		plog.Infof("wecomws: connection started (bot %s, binding %s, path %s)", cfg.BotID, b.ID, b.WebhookPath)
-	}
-	for id, bc := range m.conns {
-		if _, ok := want[id]; ok {
-			continue
-		}
-		bc.cancel()
-		delete(m.conns, id)
-		stopped = append(stopped, bc)
-	}
-	m.mu.Unlock()
-
-	for _, bc := range stopped {
-		<-bc.done
-		plog.Infof("wecomws: connection stopped (bot %s, binding %s)", bc.cfg.BotID, bc.binding.ID)
 	}
 	return nil
 }
