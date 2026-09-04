@@ -32,7 +32,7 @@ func leaderKey(name string) string { return "lock:leader:" + name }
 
 // Acquire blocks until leadership is won or ctx is done, retrying the SetNX
 // roughly every second with jitter. While held, a watchdog renews the lease
-// every ttl/3 (the worker's startLockWatchdog pattern): a Redis hiccup is
+// every ttl/3: a Redis hiccup is
 // retried on the next tick (the TTL has slack for one or two misses), only
 // actually losing the lock — another holder took over after expiry — closes
 // lost. release is idempotent and frees the key only if we still own it.
