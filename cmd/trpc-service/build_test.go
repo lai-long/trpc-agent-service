@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -87,8 +88,11 @@ func newTestRedis(t *testing.T) *redis.Client {
 
 func TestBuildSecretResolverFileBackend(t *testing.T) {
 	dir := testSecretsDir(t)
-	r := buildSecretResolver(context.Background(),
+	r, err := buildSecretResolver(context.Background(),
 		config.Config{SecretsDir: dir, SecretCacheTTL: "30s"})
+	if err != nil {
+		t.Fatal(err)
+	}
 	got, err := r.Resolve(context.Background(), "model-key")
 	if err != nil || got != "sk-model-test" {
 		t.Fatalf("file backend resolve: got %q, %v", got, err)
@@ -112,35 +116,50 @@ func TestBuildSecretResolverKMSBackend(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	r := buildSecretResolver(context.Background(), config.Config{
+	r, err := buildSecretResolver(context.Background(), config.Config{
 		SecretsDir:         dir,
 		SecretResolverType: "kms",
 		KMSEndpoint:        srv.URL,
 		KMSTokenRef:        "kms-token",
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	got, err := r.Resolve(context.Background(), "db-password")
 	if err != nil || got != "pg-pa55" {
 		t.Fatalf("kms backend resolve: got %q, %v", got, err)
 	}
 }
 
-// TestBuildSecretResolverKMSFallback pins the degradation rule: an
-// unavailable KMS (missing bootstrap token or endpoint) falls back to the
-// file resolver instead of failing startup.
-func TestBuildSecretResolverKMSFallback(t *testing.T) {
+// TestBuildSecretResolverKMSFailsClosed pins the refusal: a KMS backend that
+// cannot be built stops startup instead of degrading to the file resolver. Both
+// cases are configuration errors that retrying cannot fix, and the old fallback
+// spent the whole process lifetime resolving plaintext secrets from disk behind
+// one warn line — including credentials already rotated away in the KMS.
+func TestBuildSecretResolverKMSFailsClosed(t *testing.T) {
 	dir := testSecretsDir(t)
-	cfgs := []config.Config{
-		{SecretsDir: dir, SecretResolverType: "kms",
-			KMSTokenRef: "no-such-token", KMSEndpoint: "http://127.0.0.1:1"},
-		{SecretsDir: dir, SecretResolverType: "kms",
-			KMSTokenRef: "kms-token", KMSEndpoint: ""},
+	cases := []struct {
+		name string
+		cfg  config.Config
+		want string
+	}{
+		{"missing bootstrap token", config.Config{SecretsDir: dir, SecretResolverType: "kms",
+			KMSTokenRef: "no-such-token", KMSEndpoint: "http://127.0.0.1:1"}, "kms bootstrap token"},
+		{"empty endpoint", config.Config{SecretsDir: dir, SecretResolverType: "kms",
+			KMSTokenRef: "kms-token", KMSEndpoint: ""}, "kms resolver"},
 	}
-	for i, cfg := range cfgs {
-		r := buildSecretResolver(context.Background(), cfg)
-		got, err := r.Resolve(context.Background(), "model-key")
-		if err != nil || got != "sk-model-test" {
-			t.Fatalf("case %d: expected file fallback, got %q, %v", i, got, err)
-		}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r, err := buildSecretResolver(context.Background(), tc.cfg)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("want an error naming %q, got %v", tc.want, err)
+			}
+			if r != nil {
+				// The point of the refusal: nothing may serve the plaintext
+				// files after kms was asked for.
+				t.Fatal("a refused KMS backend must not hand back a file-backed resolver")
+			}
+		})
 	}
 }
 

@@ -105,7 +105,10 @@ func serve(role string) error {
 
 	// One secret resolver per process: file backend for local
 	// dev, KMS sidecar when configured, always behind the short-TTL cache.
-	secrets := buildSecretResolver(ctx, cfg)
+	secrets, err := buildSecretResolver(ctx, cfg)
+	if err != nil {
+		return err
+	}
 
 	// Tracing goes up before anything that emits spans. Endpoint comes from
 	// OTEL_EXPORTER_OTLP_ENDPOINT; the platform adds spans around the callback,
@@ -982,21 +985,30 @@ func adminTLSConfig(cfg config.Config) (*tls.Config, error) {
 // resolver for local development, the KMS sidecar when TRPC_SECRET_RESOLVER=kms
 // (its bearer token bootstraps from the file resolver), and in both cases the
 // short-TTL cache that absorbs a KMS blip.
-func buildSecretResolver(ctx context.Context, cfg config.Config) config.SecretResolver {
+//
+// A misconfigured KMS fails startup rather than falling back to files — the
+// rule checkAdminToken applies above. Both failures here are configuration (an
+// unreadable bootstrap token, an empty endpoint), so retrying cannot fix them,
+// and degrading would spend the whole process lifetime on plaintext-on-disk
+// secrets behind one warn line: whoever set kms asked for the secrets not to
+// live on this disk, and a deployment keeping a plaintext copy anyway would
+// keep resolving through it, credentials rotated away included.
+func buildSecretResolver(ctx context.Context, cfg config.Config) (config.SecretResolver, error) {
 	file := config.NewFileResolver(cfg.SecretsDir)
 	base := config.SecretResolver(file)
 	if cfg.SecretResolverType == "kms" {
 		token, err := file.Resolve(ctx, cfg.KMSTokenRef)
 		if err != nil {
-			plog.Warnf("KMS token %q unavailable (%v), falling back to file resolver", cfg.KMSTokenRef, err)
-		} else if kms, err := config.NewKMSResolver(cfg.KMSEndpoint, token); err != nil {
-			plog.Warnf("KMS resolver unavailable (%v), falling back to file resolver", err)
-		} else {
-			base = kms
-			plog.Infof("secret resolver: kms (%s)", cfg.KMSEndpoint)
+			return nil, fmt.Errorf("kms bootstrap token %q: %w", cfg.KMSTokenRef, err)
 		}
+		kms, err := config.NewKMSResolver(cfg.KMSEndpoint, token)
+		if err != nil {
+			return nil, fmt.Errorf("kms resolver: %w", err)
+		}
+		base = kms
+		plog.Infof("secret resolver: kms (%s)", cfg.KMSEndpoint)
 	}
-	return config.NewCachedResolver(base, parseDuration(cfg.SecretCacheTTL, time.Minute))
+	return config.NewCachedResolver(base, parseDuration(cfg.SecretCacheTTL, time.Minute)), nil
 }
 
 // buildEmbedder builds the OpenAI-compatible embeddings client shared by
