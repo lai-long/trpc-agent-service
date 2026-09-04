@@ -11,6 +11,7 @@ import (
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/storage"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/testenv"
 )
 
 // redisSessionService builds the framework redis session service on the
@@ -29,7 +30,7 @@ func redisSessionService(t *testing.T) session.Service {
 
 // A redis→postgres session migration must walk dual_write → backfilling →
 // observing → done, copy the sessions, and flip tenant.storage_config at the
-// read switch (design 5.2.6).
+// read switch.
 func TestMigratorRedisToPostgres(t *testing.T) {
 	_, pool := pgSessionService(t) // ensures the test tenant/app rows
 	ctx := context.Background()
@@ -119,7 +120,7 @@ func TestMigratorRedisToPostgres(t *testing.T) {
 
 // migrateTestRedisAddr is the compose redis (storage_test.go's copy is in
 // the internal test package and not visible here).
-const migrateTestRedisAddr = "localhost:6380"
+var migrateTestRedisAddr = testenv.RedisAddr()
 
 // redisOrSkipForMigrate returns the raw compose redis client (used by the
 // migrator for key enumeration), skipping when unreachable.

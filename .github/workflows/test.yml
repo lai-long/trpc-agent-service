@@ -67,9 +67,12 @@ jobs:
 
       - name: Test (integration deps live)
         run: |
+          set -o pipefail
           go test ./... -count=1 -v -coverprofile=coverage.out 2>&1 | tee test.log
-          grep -E "^(FAIL|ok)" test.log | grep -q FAIL && {
-            echo "::error::test failure"; exit 1; }
+          if grep -qE '^FAIL' test.log; then
+            echo "::error::test failure"
+            exit 1
+          fi
 
       - name: "Gate: zero skips"
         run: |
