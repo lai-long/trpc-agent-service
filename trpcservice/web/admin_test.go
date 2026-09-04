@@ -228,7 +228,7 @@ func TestAdminLifecycle(t *testing.T) {
 	bindingID, _ = out["id"].(string)
 	// Empty webhook_path: the canonical binding-scoped callback path is
 	// derived from the DB-generated id in the same statement, so the route
-	// the dispatcher resolves is self-consistent (design 5.3.1).
+	// the dispatcher resolves is self-consistent.
 	code, out = doJSON(t, mux, http.MethodPost, "/admin/apps/"+appV1+"/bindings",
 		`{"channel":"wecom","token_ref":"wecom-token"}`)
 	if code != http.StatusCreated {
@@ -536,5 +536,88 @@ func TestAdminStorageMigration(t *testing.T) {
 	code, out = doJSON(t, mux, http.MethodGet, "/admin/storage-migrations/"+migID, "")
 	if code != http.StatusOK || out["from_backend"] != "redis" || out["to_backend"] != "postgres" {
 		t.Fatalf("get migration: %d %v", code, out)
+	}
+}
+
+// wecomws bindings are validated up front (path shape + config credentials +
+// no webhook-channel refs): WS inbound has no IM redelivery, so a typo'd
+// binding would silently blackhole the bot's messages instead of erroring.
+func TestValidateWecomwsBinding(t *testing.T) {
+	mux, pool := adminTestAPI(t)
+	ctx := context.Background()
+
+	code, out := doJSON(t, mux, http.MethodPost, "/admin/tenants", `{"name":"wecomws-validate"}`)
+	if code != http.StatusCreated {
+		t.Fatalf("create tenant: %d", code)
+	}
+	tenantID, _ := out["id"].(string)
+	var appID string
+	t.Cleanup(func() {
+		if appID != "" {
+			_, _ = pool.Exec(ctx, `DELETE FROM channel_binding WHERE app_id = $1`, appID)
+			_, _ = pool.Exec(ctx, `DELETE FROM agent_app WHERE id = $1`, appID)
+		}
+		_, _ = pool.Exec(ctx, `DELETE FROM tenant WHERE id = $1`, tenantID)
+	})
+
+	code, out = doJSON(t, mux, http.MethodPost, "/admin/tenants/"+tenantID+"/apps",
+		`{"name":"bot","agent_type":"llm","config":{"prompt":"p"}}`)
+	if code != http.StatusCreated {
+		t.Fatalf("create app: %d %v", code, out)
+	}
+	appID, _ = out["id"].(string)
+	if code, _ = doJSON(t, mux, http.MethodPost, "/admin/apps/"+appID+"/publish", ""); code != http.StatusOK {
+		t.Fatalf("publish app: %d", code)
+	}
+	bindPath := "/admin/apps/" + appID + "/bindings"
+
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"missing bot_id", `{"channel":"wecomws","webhook_path":"/wecomws/bot1","config":{"secret_ref":"s"}}`},
+		{"missing secret_ref", `{"channel":"wecomws","webhook_path":"/wecomws/bot1","config":{"bot_id":"bot1"}}`},
+		{"empty config", `{"channel":"wecomws","webhook_path":"/wecomws/bot1"}`},
+		{"config not an object", `{"channel":"wecomws","webhook_path":"/wecomws/bot1","config":"not-json"}`},
+		{"bad path", `{"channel":"wecomws","webhook_path":"/callback/wecomws/bot1","config":{"bot_id":"bot1","secret_ref":"s"}}`},
+		{"empty path", `{"channel":"wecomws","config":{"bot_id":"bot1","secret_ref":"s"}}`},
+		{"token_ref set", `{"channel":"wecomws","webhook_path":"/wecomws/bot1","config":{"bot_id":"bot1","secret_ref":"s"},"token_ref":"wecom-token"}`},
+		{"aeskey_ref set", `{"channel":"wecomws","webhook_path":"/wecomws/bot1","config":{"bot_id":"bot1","secret_ref":"s"},"aeskey_ref":"wecom-aes"}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			code, out := doJSON(t, mux, http.MethodPost, bindPath, tc.body)
+			if code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400 (body %v)", code, out)
+			}
+		})
+	}
+
+	// A valid wecomws binding is accepted, config and all.
+	code, out = doJSON(t, mux, http.MethodPost, bindPath,
+		`{"channel":"wecomws","webhook_path":"/wecomws/bot1","config":{"bot_id":"bot1","secret_ref":"wecomws/bot1/secret"}}`)
+	if code != http.StatusCreated {
+		t.Fatalf("valid wecomws binding: %d %v", code, out)
+	}
+	if got, _ := out["webhook_path"].(string); got != "/wecomws/bot1" {
+		t.Fatalf("webhook_path = %q, want /wecomws/bot1", got)
+	}
+	var stored []byte
+	if err := pool.QueryRow(ctx,
+		`SELECT config FROM channel_binding WHERE id = $1`, out["id"]).Scan(&stored); err != nil {
+		t.Fatal(err)
+	}
+	var cfg map[string]any
+	if err := json.Unmarshal(stored, &cfg); err != nil ||
+		cfg["bot_id"] != "bot1" || cfg["secret_ref"] != "wecomws/bot1/secret" {
+		t.Fatalf("config jsonb round trip failed: %s (%v)", stored, err)
+	}
+
+	// Other channels keep their rules: the same payload shape without the
+	// wecomws channel is not subject to the /wecomws/ path contract.
+	code, _ = doJSON(t, mux, http.MethodPost, bindPath,
+		`{"channel":"mock","webhook_path":"/mock/any-shape","config":{"bot_id":"ignored"}}`)
+	if code != http.StatusCreated {
+		t.Fatalf("non-wecomws binding must skip the wecomws validation: %d", code)
 	}
 }

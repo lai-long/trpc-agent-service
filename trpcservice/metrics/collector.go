@@ -53,6 +53,9 @@ func StartStreamCollector(ctx context.Context, stats StreamStats, interval time.
 	targets := []struct{ stream, group string }{
 		{"stream:inbound", "workers"},
 		{"stream:outbound", "senders"},
+		// The wecomws leader's consumer group: without this target a wedged
+		// or leaderless senders-ws backlog would be invisible to the alerts.
+		{"stream:outbound", "senders-ws"},
 		{"stream:deadletter", ""},
 	}
 	collect := func() {

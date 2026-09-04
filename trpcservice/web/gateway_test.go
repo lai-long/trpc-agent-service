@@ -64,7 +64,7 @@ func TestEnqueueStampsTenant(t *testing.T) {
 		InStream: inbound,
 	}
 	msgID := fmt.Sprintf("test-gw-%d", time.Now().UnixNano())
-	t.Cleanup(func() { rdb.Del(context.Background(), "dedup:mock:"+msgID) })
+	t.Cleanup(func() { rdb.Del(context.Background(), "dedup:mock:b1:"+msgID) })
 	if _, err := h.Handle(ctx, channels.InboundMessage{
 		Channel: "mock", MsgID: msgID, SessionKey: "dm:mock:u1", UserID: "u1",
 		Text: "hi", WebhookPath: "/mock/callback",
@@ -107,7 +107,7 @@ func TestEnqueueRollsBackDedupOnFailure(t *testing.T) {
 	}
 
 	msgID := fmt.Sprintf("test-gw-rollback-%d", time.Now().UnixNano())
-	dedupKey := "dedup:mock:" + msgID
+	dedupKey := "dedup:mock:b1:" + msgID
 	t.Cleanup(func() { rdb.Del(context.Background(), dedupKey) })
 
 	h := web.EnqueueHandler{
@@ -163,7 +163,7 @@ func TestEnqueueRateLimited(t *testing.T) {
 	}
 	id1 := fmt.Sprintf("rl-1-%d", time.Now().UnixNano())
 	id2 := fmt.Sprintf("rl-2-%d", time.Now().UnixNano())
-	t.Cleanup(func() { rdb.Del(context.Background(), "dedup:mock:"+id1) })
+	t.Cleanup(func() { rdb.Del(context.Background(), "dedup:mock:b1:"+id1) })
 	if _, err := h.Handle(ctx, mk(id1)); err != nil {
 		t.Fatalf("first message must pass: %v", err)
 	}
@@ -172,7 +172,7 @@ func TestEnqueueRateLimited(t *testing.T) {
 		t.Fatalf("want ErrOverloaded, got %v", err)
 	}
 	// The rejection happened before dedup: no key was consumed for id2.
-	if n, _ := rdb.Exists(ctx, "dedup:mock:"+id2).Result(); n != 0 {
+	if n, _ := rdb.Exists(ctx, "dedup:mock:b1:"+id2).Result(); n != 0 {
 		t.Fatal("rate-limited message must not consume its dedup key")
 	}
 }
@@ -201,14 +201,14 @@ func TestEnqueueBackpressure(t *testing.T) {
 	}
 	id1 := fmt.Sprintf("bp-1-%d", time.Now().UnixNano())
 	id2 := fmt.Sprintf("bp-2-%d", time.Now().UnixNano())
-	t.Cleanup(func() { rdb.Del(context.Background(), "dedup:mock:"+id1, "dedup:mock:"+id2) })
+	t.Cleanup(func() { rdb.Del(context.Background(), "dedup:mock:b1:"+id1, "dedup:mock:b1:"+id2) })
 	if _, err := h.Handle(ctx, mk(id1)); err != nil {
 		t.Fatalf("empty queue must accept: %v", err)
 	}
 	if _, err := h.Handle(ctx, mk(id2)); !errors.Is(err, web.ErrOverloaded) {
 		t.Fatalf("full queue must reject with ErrOverloaded, got %v", err)
 	}
-	if n, _ := rdb.Exists(ctx, "dedup:mock:"+id2).Result(); n != 0 {
+	if n, _ := rdb.Exists(ctx, "dedup:mock:b1:"+id2).Result(); n != 0 {
 		t.Fatal("backpressure rejection must roll back the dedup key")
 	}
 }

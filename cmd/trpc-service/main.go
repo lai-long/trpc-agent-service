@@ -25,6 +25,7 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels/mock"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels/wecom"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/channels/wecomws"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels/wxkf"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/config"
 	plog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
@@ -130,6 +131,11 @@ func serve(role string) error {
 		return err
 	}
 	if err := stream.EnsureGroup(ctx, storage.StreamOutbound, "senders"); err != nil {
+		return err
+	}
+	// wecomws replies ride the same outbound stream but are delivered by the
+	// wecomws leader's dedicated consumer group; the main sender skips them.
+	if err := stream.EnsureGroup(ctx, storage.StreamOutbound, "senders-ws"); err != nil {
 		return err
 	}
 
@@ -239,6 +245,27 @@ func serve(role string) error {
 			kf.RegisterRoutes(mux, enqueue)
 			channelSet[kf.Name()] = kf
 		}
+		// wecomws has no HTTP callback (WebSocket long connection); it only
+		// joins the registry for the senders, and needs tenant routing to
+		// enumerate its bindings.
+		var wsStarter channels.Starter
+		if resolver == nil {
+			// Silent degradation here would black-hole every wecomws message
+			// (Send fails, retry, dead-letter) with nothing in the logs.
+			plog.Warnf("wecomws channel disabled: tenant routing (resolver) unavailable, " +
+				"bindings cannot be enumerated")
+		} else if ws := startWecomws(cfg, secrets, wsRoutes{resolver}); ws != nil {
+			// Only channels owning long-lived connections get started; a
+			// Starter that a regular adapter never implements leaves
+			// mock/wecom/wxkf untouched.
+			if st, ok := any(ws).(channels.Starter); ok {
+				channelSet[ws.Name()] = ws
+				wsStarter = st
+			} else {
+				plog.Errorf("wecomws channel does not implement channels.Starter — " +
+					"not registered (its replies could never be delivered)")
+			}
+		}
 
 		// Multi-tenant callback paths:
 		// /callback/{channel}/{binding_id} dispatches to the owning adapter
@@ -283,18 +310,11 @@ func serve(role string) error {
 			return srv.Shutdown(shutdownCtx)
 		})
 
-		sender := &channels.Sender{
-			Stream:    stream,
-			Sent:      storage.NewSentMarker(rdb),
-			Channels:  channelSet,
-			Name:      consumer + "-s",
-			Limiter:   storage.NewLimiter(rdb),
-			SendQPS:   parseFloat(cfg.SendRateQPS, 20),
-			SendBurst: parseInt(cfg.SendRateBurst, 40),
-		}
-		// Per-tenant send pacing override (tenant.rate_policy send_qps/burst).
+		// Per-tenant send pacing override (tenant.rate_policy send_qps/burst),
+		// shared by both sender groups; nil leaves the platform default.
+		var sendPolicyFor func(ctx context.Context, tenantID string) (float64, int, bool)
 		if resolver != nil {
-			sender.SendPolicyFor = func(ctx context.Context, tenantID string) (float64, int, bool) {
+			sendPolicyFor = func(ctx context.Context, tenantID string) (float64, int, bool) {
 				t, err := resolver.TenantByID(ctx, tenantID)
 				if err != nil {
 					return 0, 0, false
@@ -303,7 +323,43 @@ func serve(role string) error {
 				return rl.SendQPS, rl.SendBurst, rl.SendQPS > 0 && rl.SendBurst > 0
 			}
 		}
+
+		sender := &channels.Sender{
+			Stream:        stream,
+			Sent:          storage.NewSentMarker(rdb),
+			Channels:      channelSet,
+			Name:          consumer + "-s",
+			Limiter:       storage.NewLimiter(rdb),
+			SendQPS:       parseFloat(cfg.SendRateQPS, 20),
+			SendBurst:     parseInt(cfg.SendRateBurst, 40),
+			SendPolicyFor: sendPolicyFor,
+			// wecomws messages belong to the leader's senders-ws group: ack
+			// and step aside here — no send, no rate token, no sent: marker.
+			Skip: func(m channels.OutboundMessage) bool { return m.Channel == "wecomws" },
+		}
 		g.Go(func() error { return sender.Run(gctx) })
+
+		// wecomws: connections and their dedicated outbound consumer group
+		// are owned by the platform-wide leader; other replicas idle until
+		// the lease handover.
+		if wsStarter != nil {
+			wsSender := &channels.Sender{
+				Stream:        stream,
+				Sent:          storage.NewSentMarker(rdb),
+				Channels:      map[string]channels.Channel{wsStarter.Name(): wsStarter},
+				Name:          consumer + "-sws",
+				Group:         "senders-ws",
+				Limiter:       storage.NewLimiter(rdb),
+				SendQPS:       parseFloat(cfg.SendRateQPS, 20),
+				SendBurst:     parseInt(cfg.SendRateBurst, 40),
+				SendPolicyFor: sendPolicyFor,
+				Skip:          func(m channels.OutboundMessage) bool { return m.Channel != "wecomws" },
+			}
+			g.Go(func() error {
+				return runWecomwsLeader(gctx, storage.NewLeaderLock(rdb), wsStarter, wsSender, enqueue,
+					consumer, parseDuration(cfg.WecomwsLeaderTTL, 15*time.Second))
+			})
+		}
 	}
 
 	// --- Worker role: consume, run agents, drain on shutdown ----------------
@@ -530,6 +586,113 @@ func startWxkf(cfg config.Config, secrets config.SecretResolver) *wxkf.Channel {
 	}
 	plog.Infof("wxkf channel enabled (callback: POST /wxkf/callback)")
 	return ch
+}
+
+// startWecomws builds the WeCom smart-bot WebSocket channel from env config;
+// nil (silently) when TRPC_WECOMWS_ADDR is unset — same missing-key gating
+// as startWecom. Bots and their secret references live in channel_binding
+// rows enumerated through the routes adapter.
+func startWecomws(cfg config.Config, secrets config.SecretResolver, routes wecomws.RoutesProvider) *wecomws.Channel {
+	if cfg.WecomwsAddr == "" {
+		return nil
+	}
+	ws, err := wecomws.New(secrets,
+		wecomws.WithAddr(cfg.WecomwsAddr),
+		wecomws.WithRoutes(routes),
+		wecomws.WithPingInterval(parseDuration(cfg.WecomwsPingInterval, 30*time.Second)),
+		wecomws.WithSegmentBytes(parseInt(cfg.WecomwsSegmentBytes, 2048)),
+		wecomws.WithResyncInterval(parseDuration(cfg.WecomwsResyncInterval, 15*time.Second)),
+	)
+	if err != nil {
+		plog.Warnf("wecomws channel disabled: %v", err)
+		return nil
+	}
+	plog.Infof("wecomws channel enabled (addr %s, leader ttl %s)", cfg.WecomwsAddr,
+		parseDuration(cfg.WecomwsLeaderTTL, 15*time.Second))
+	return ws
+}
+
+// wsRoutes projects the tenant resolver onto the wecomws binding source: the
+// channel only needs the binding id, webhook path and config jsonb.
+type wsRoutes struct{ r *tenant.Resolver }
+
+func (w wsRoutes) RoutesByChannel(ctx context.Context, channel string) ([]wecomws.Binding, error) {
+	routes, err := w.r.RoutesByChannel(ctx, channel)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]wecomws.Binding, 0, len(routes))
+	for _, route := range routes {
+		out = append(out, wecomws.Binding{
+			ID:          route.Binding.ID,
+			WebhookPath: route.Binding.WebhookPath,
+			Config:      route.Binding.Config,
+		})
+	}
+	return out, nil
+}
+
+// runWecomwsLeader campaigns for the platform-wide wecomws leadership and,
+// while held, runs the bot connections and the senders-ws consumer group.
+// Losing the lease (another replica took over and kicked our connections)
+// or a child failure tears everything down; the loop re-campaigns until ctx
+// is done, so the whole group can take over after a leader crash.
+func runWecomwsLeader(ctx context.Context, leader *storage.LeaderLock, starter channels.Starter, wsSender *channels.Sender, h channels.Handler, owner string, ttl time.Duration) error {
+	for ctx.Err() == nil {
+		release, lost, err := leader.Acquire(ctx, "wecomws", owner, ttl)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			plog.Warnf("wecomws leader acquire: %v", err)
+			if !sleepFor(ctx, 2*time.Second) {
+				return nil
+			}
+			continue
+		}
+		plog.Infof("wecomws leadership acquired (owner %s)", owner)
+		runCtx, cancel := context.WithCancel(ctx)
+		inner, innerCtx := errgroup.WithContext(runCtx)
+		inner.Go(func() error { return starter.Start(innerCtx, h) })
+		inner.Go(func() error { return wsSender.Run(innerCtx) })
+		var innerErr error
+		innerDone := make(chan struct{})
+		go func() {
+			innerErr = inner.Wait()
+			close(innerDone)
+		}()
+		select {
+		case <-lost:
+			plog.Warnf("wecomws leadership lost (owner %s): stopping connections and senders-ws", owner)
+		case <-ctx.Done():
+		case <-innerDone:
+		}
+		cancel()
+		release()
+		<-innerDone // drain: children stopped, run loops returned
+		if innerErr != nil && ctx.Err() == nil {
+			plog.Errorf("wecomws leader role failed, re-campaigning: %v", innerErr)
+		}
+		if ctx.Err() != nil {
+			return nil
+		}
+		if !sleepFor(ctx, 2*time.Second) {
+			return nil
+		}
+	}
+	return nil
+}
+
+// sleepFor waits for d; false when ctx is done first.
+func sleepFor(ctx context.Context, d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
 }
 
 // buildSessionServices builds one session service per supported backend

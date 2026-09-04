@@ -230,3 +230,55 @@ func TestTwoTenantCallbackRouting(t *testing.T) {
 		t.Fatalf("per-tenant routing broken: %+v", got)
 	}
 }
+
+// legacyChannel implements channels.Channel without BindingAware: it keeps
+// serving its env-configured legacy path only, so a binding-style dispatch
+// is a 404 rather than a silent fallback onto the env credentials.
+type legacyChannel struct{}
+
+func (legacyChannel) Name() string                                        { return "legacy" }
+func (legacyChannel) RegisterRoutes(_ *http.ServeMux, _ channels.Handler) {}
+func (legacyChannel) Send(_ context.Context, _ channels.OutboundMessage) error {
+	return nil
+}
+
+func TestBindingDispatcherLegacyChannel(t *testing.T) {
+	ch := &fakeBindingChannel{}
+	d := web.BindingDispatcher{
+		Channels: map[string]channels.Channel{
+			"legacy": legacyChannel{},
+			"fake":   ch,
+		},
+		Bindings: fakeBindings{
+			// Malformed config jsonb: the corp-id override must degrade to
+			// empty (with a warning), never fail the dispatch.
+			"b1": {ID: "b1", TenantID: "t1", Channel: "fake", AppID: "a1",
+				WebhookPath: "/callback/fake/b1", TokenRef: "tok-b1",
+				Config: []byte(`{not-json`), Status: "active"},
+		},
+		Handler: channels.HandlerFunc(func(context.Context, channels.InboundMessage) (channels.OutboundMessage, error) {
+			return channels.OutboundMessage{}, nil
+		}),
+	}
+	do := func(channel, binding string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/callback/"+channel+"/"+binding, nil)
+		req.SetPathValue("channel", channel)
+		req.SetPathValue("binding", binding)
+		rec := httptest.NewRecorder()
+		d.ServeHTTP(rec, req)
+		return rec
+	}
+
+	if rec := do("legacy", "b1"); rec.Code != http.StatusNotFound {
+		t.Fatalf("binding dispatch to a non-BindingAware channel must 404, got %d", rec.Code)
+	}
+
+	// Unparseable config: dispatch still works, corp id is just empty.
+	if rec := do("fake", "b1"); rec.Code != http.StatusOK || !ch.called {
+		t.Fatalf("bad config jsonb must not fail the dispatch: status=%d called=%v",
+			rec.Code, ch.called)
+	}
+	if ch.gotCreds.CorpID != "" {
+		t.Fatalf("unparseable config must yield an empty corp id, got %q", ch.gotCreds.CorpID)
+	}
+}

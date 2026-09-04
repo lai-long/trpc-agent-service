@@ -85,6 +85,16 @@ type Config struct {
 	WxkfSecretRef string // TRPC_WXKF_SECRET_REF
 	WxkfAPIBase   string // TRPC_WXKF_API_BASE
 
+	// WeCom smart-bot WebSocket channel: enabled when TRPC_WECOMWS_ADDR is
+	// set (wss://openws.work.weixin.qq.com); unset keeps the channel off
+	// without touching the other channels. Bots and their secrets live in
+	// channel_binding.config (bot_id + secret_ref), not in env.
+	WecomwsAddr           string // TRPC_WECOMWS_ADDR
+	WecomwsPingInterval   string // TRPC_WECOMWS_PING_INTERVAL: heartbeat cadence (30s)
+	WecomwsLeaderTTL      string // TRPC_WECOMWS_LEADER_TTL: leader lease (15s, renewed every ttl/3)
+	WecomwsResyncInterval string // TRPC_WECOMWS_RESYNC_INTERVAL: bindings reconciliation cadence (15s)
+	WecomwsSegmentBytes   string // TRPC_WECOMWS_SEGMENT_BYTES: per-frame reply cap (2048)
+
 	// MockChannel enables the built-in mock channel (demo/dev). It is off by
 	// default: the mock callback is an unauthenticated message injector, so
 	// a deployment must opt in explicitly (internal network only).
@@ -193,6 +203,12 @@ func Load() Config {
 		WxkfAESKeyRef: getenv("TRPC_WXKF_AESKEY_REF", "wxkf-aeskey"),
 		WxkfSecretRef: getenv("TRPC_WXKF_SECRET_REF", "wxkf-secret"),
 		WxkfAPIBase:   getenv("TRPC_WXKF_API_BASE", "https://qyapi.weixin.qq.com"),
+
+		WecomwsAddr:           getenv("TRPC_WECOMWS_ADDR", ""),
+		WecomwsPingInterval:   getenv("TRPC_WECOMWS_PING_INTERVAL", "30s"),
+		WecomwsLeaderTTL:      getenv("TRPC_WECOMWS_LEADER_TTL", "15s"),
+		WecomwsResyncInterval: getenv("TRPC_WECOMWS_RESYNC_INTERVAL", "15s"),
+		WecomwsSegmentBytes:   getenv("TRPC_WECOMWS_SEGMENT_BYTES", "2048"),
 
 		MockChannel: getenv("TRPC_MOCK_CHANNEL", "false"),
 

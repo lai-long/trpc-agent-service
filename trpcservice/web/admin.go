@@ -1,12 +1,14 @@
 package web
 
 import (
+	"bytes"
 	"context"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -534,12 +536,18 @@ func (a *AdminAPI) createBinding(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "channel is required")
 		return
 	}
+	if in.Channel == "wecomws" {
+		if msg := validateWecomwsBinding(in.WebhookPath, in.Config, in.TokenRef, in.AESKeyRef); msg != "" {
+			writeError(w, http.StatusBadRequest, msg)
+			return
+		}
+	}
 	var id, tenantID, webhookPath string
 	// Only a published app is bindable: binding a draft would route traffic
 	// around the gray-release flow.
 	//
 	// An empty webhook_path is filled with the canonical binding-scoped
-	// callback path /callback/{channel}/{binding_id} (design 5.3.1): the id
+	// callback path /callback/{channel}/{binding_id}; the id
 	// is generated in the same statement that writes the row, so the path
 	// the dispatcher resolves is self-consistent — the caller cannot know a
 	// DB-generated id up front, which made the binding-scoped path
@@ -573,6 +581,47 @@ func (a *AdminAPI) createBinding(w http.ResponseWriter, r *http.Request) {
 		"token_ref": in.TokenRef, "aeskey_ref": in.AESKeyRef, "config": in.Config,
 	})
 	writeJSON(w, http.StatusCreated, map[string]any{"id": id, "webhook_path": webhookPath})
+}
+
+// wecomwsPathPattern is the webhook_path shape a wecomws binding must carry:
+// /wecomws/{bot_id}. WS inbound has no IM redelivery, so a typo'd path would
+// not surface as a routing error — it would silently blackhole every message
+// the bot receives.
+var wecomwsPathPattern = regexp.MustCompile(`^/wecomws/[A-Za-z0-9_-]+$`)
+
+// validateWecomwsBinding enforces the wecomws binding shape; a non-empty
+// return value is the 400 message. The config jsonb must carry a non-empty
+// bot_id and a secret_ref (the secret itself is only ever a reference,
+// resolved at connect time), and unlike the webhook channels the callback
+// path is part of the contract, not auto-filled: the bot's messages arrive
+// with it as the routing key. token_ref/aeskey_ref stay empty — the WS
+// channel authenticates per-bot with secret_ref, not per-callback crypt keys.
+func validateWecomwsBinding(webhookPath string, config json.RawMessage, tokenRef, aesKeyRef string) string {
+	if !wecomwsPathPattern.MatchString(webhookPath) {
+		return "wecomws webhook_path must match /wecomws/{bot_id} (bot_id: [A-Za-z0-9_-]+)"
+	}
+	var cfg struct {
+		BotID     string `json:"bot_id"`
+		SecretRef string `json:"secret_ref"`
+	}
+	if len(config) == 0 {
+		return "wecomws binding requires a config with non-empty bot_id and secret_ref"
+	}
+	// Unknown fields are refused: the config jsonb lands verbatim in audit
+	// details, so e.g. a "secret" key would smuggle plaintext credentials
+	// into the audit trail while being silently ignored by the channel.
+	dec := json.NewDecoder(bytes.NewReader(config))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&cfg); err != nil {
+		return "wecomws binding config only accepts bot_id and secret_ref: " + err.Error()
+	}
+	if cfg.BotID == "" || cfg.SecretRef == "" {
+		return "wecomws binding config requires non-empty bot_id and secret_ref"
+	}
+	if tokenRef != "" || aesKeyRef != "" {
+		return "wecomws bindings must leave token_ref/aeskey_ref empty (credentials ride config.secret_ref)"
+	}
+	return ""
 }
 
 func (a *AdminAPI) listBindings(w http.ResponseWriter, r *http.Request) {
