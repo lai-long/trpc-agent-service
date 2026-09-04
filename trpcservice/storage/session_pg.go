@@ -23,8 +23,9 @@ import (
 // state snapshot" two-layer store:
 //
 //   - session_event is append-only; the UNIQUE (session_id, event_seq)
-//     constraint keeps events ordered and is the last-resort duplicate
-//     backstop. Execution-layer idempotency for Stream redeliveries lives
+//     constraint keeps events ordered and gapless, and violating it fails the
+//     whole append transaction so the journal and the state snapshot can never
+//     drift apart. Execution-layer idempotency for Stream redeliveries lives
 //     one level up, in the worker's done:{channel}:{msg_id} marker — a
 //     redelivered message re-runs the model and produces NEW framework event
 //     IDs, so the constraint alone could never catch it (see
@@ -194,6 +195,76 @@ func (s *PGSessionService) GetSession(ctx context.Context, key session.Key, opts
 	return sess, nil
 }
 
+// fullJournalTables is a session's complete journal: the hot table plus the
+// rows the monthly sweep moved to the archive, in the one event_seq order the
+// append path keeps monotonic across both.
+const fullJournalTables = `
+	SELECT event_seq, event FROM session_event WHERE session_id = $1
+	UNION ALL
+	SELECT event_seq, event FROM session_event_archive WHERE session_id = $1`
+
+// FullJournal reads every event of the session in event_seq order, ignoring the
+// summary cursor and the archive boundary. GetSession deliberately returns only
+// what the model should see again — the events after the summary, and only
+// those still hot — which is right for a runner and wrong for anything that has
+// to reproduce the journal, a migration above all: copying that truncated tail
+// leaves the summarized and archived history behind.
+func (s *PGSessionService) FullJournal(ctx context.Context, key session.Key) ([]event.Event, error) {
+	if err := key.CheckSessionKey(); err != nil {
+		return nil, err
+	}
+	sessID, err := s.sessionID(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	if sessID == "" {
+		return nil, nil
+	}
+	rows, err := s.pool.Query(ctx,
+		`SELECT event FROM (`+fullJournalTables+`) journal ORDER BY event_seq`, sessID)
+	if err != nil {
+		return nil, fmt.Errorf("query full journal: %w", err)
+	}
+	defer rows.Close()
+
+	var out []event.Event
+	for rows.Next() {
+		var raw []byte
+		if err := rows.Scan(&raw); err != nil {
+			return nil, fmt.Errorf("scan event: %w", err)
+		}
+		var evt event.Event
+		if err := json.Unmarshal(raw, &evt); err != nil {
+			return nil, fmt.Errorf("decode event: %w", err)
+		}
+		out = append(out, evt)
+	}
+	return out, rows.Err()
+}
+
+// CountFullJournal is FullJournal's length without materializing the events:
+// the migration's consistency check compares counts, and a session whose
+// history the sweep has been archiving for a year holds far more than the
+// runner ever loads.
+func (s *PGSessionService) CountFullJournal(ctx context.Context, key session.Key) (int, error) {
+	if err := key.CheckSessionKey(); err != nil {
+		return 0, err
+	}
+	sessID, err := s.sessionID(ctx, key)
+	if err != nil {
+		return 0, err
+	}
+	if sessID == "" {
+		return 0, nil
+	}
+	var n int
+	if err := s.pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM (`+fullJournalTables+`) journal`, sessID).Scan(&n); err != nil {
+		return 0, fmt.Errorf("count full journal: %w", err)
+	}
+	return n, nil
+}
+
 // ListSessions implements session.Service.
 func (s *PGSessionService) ListSessions(ctx context.Context, userKey session.UserKey, opts ...session.Option) ([]*session.Session, error) {
 	if err := userKey.CheckUserKey(); err != nil {
@@ -273,8 +344,11 @@ func (s *PGSessionService) DeleteSession(ctx context.Context, key session.Key, _
 // AppendEvent implements session.Service: the canonical in-memory update runs
 // first (framework semantics), then event + snapshot persist in one
 // transaction. The session row is locked FOR UPDATE so concurrent appends
-// serialize and event_seq stays gapless; the unique constraint is the
-// last-resort backstop if the session lock is ever lost.
+// serialize, and the next event_seq is taken across the hot table and the
+// archive so it stays monotonic for the whole life of the session — archival
+// must not rewind it. If the lock is ever lost the unique constraint aborts
+// the transaction instead of letting the snapshot advance past a dropped
+// event.
 func (s *PGSessionService) AppendEvent(ctx context.Context, sess *session.Session, e *event.Event, opts ...session.Option) error {
 	if sess == nil || e == nil {
 		return errors.New("pg session: nil session or event")
@@ -309,16 +383,32 @@ func (s *PGSessionService) AppendEvent(ctx context.Context, sess *session.Sessio
 	}
 	if journal {
 		var seq int64
+		// The archive counts too. The monthly sweep moves old events out of the
+		// hot table, so a session whose events were all archived — a user
+		// returning after the retention window — would restart at 1 and reuse
+		// seqs that still exist in session_event_archive. Reused seqs are
+		// invisible to the replay cursor (event_seq > afterSeq), and the next
+		// archive pass would violate uk_session_event_archive_seq, a conflict
+		// the copy's ON CONFLICT (id) cannot absorb — wedging every later
+		// sweep. The FOR UPDATE on the session row keeps the result gapless.
 		if err := tx.QueryRow(ctx,
-			`SELECT COALESCE(MAX(event_seq), 0) + 1 FROM session_event WHERE session_id = $1`,
+			`SELECT COALESCE(MAX(event_seq), 0) + 1 FROM (
+				SELECT event_seq FROM session_event WHERE session_id = $1
+				UNION ALL
+				SELECT event_seq FROM session_event_archive WHERE session_id = $1
+			) journal`,
 			sessID).Scan(&seq); err != nil {
 			return fmt.Errorf("next event_seq: %w", err)
 		}
+		// No ON CONFLICT: a collision now means an invariant broke (a writer
+		// outside the session lock), and DO NOTHING used to drop the live event
+		// while the snapshot below still advanced, leaving the state ahead of
+		// the journal. Failing rolls both back, so they move together and the
+		// redelivery re-appends under a fresh seq.
 		if _, err := tx.Exec(ctx,
-			`INSERT INTO session_event (session_id, event_seq, event) VALUES ($1, $2, $3)
-			 ON CONFLICT (session_id, event_seq) DO NOTHING`,
+			`INSERT INTO session_event (session_id, event_seq, event) VALUES ($1, $2, $3)`,
 			sessID, seq, eventJSON); err != nil {
-			return fmt.Errorf("append event: %w", err)
+			return fmt.Errorf("append event (seq %d): %w", seq, err)
 		}
 	}
 	if _, err := tx.Exec(ctx,

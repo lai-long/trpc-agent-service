@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -43,11 +44,20 @@ type Migrator struct {
 
 // migrationProgress is the progress jsonb payload.
 type migrationProgress struct {
-	SessionsTotal int       `json:"sessions_total"`
-	SessionsDone  int       `json:"sessions_done"`
-	Cursor        string    `json:"cursor,omitempty"`     // last copied session_key (PG source pagination)
-	Mismatches    []string  `json:"mismatches,omitempty"` // consistency check failures
-	ObserveUntil  time.Time `json:"observe_until,omitempty"`
+	SessionsTotal int `json:"sessions_total"`
+	SessionsDone  int `json:"sessions_done"`
+	// CursorApp/Cursor are the two halves of the pagination position: the
+	// (app_id, session_key) of the last session copied. session_key alone is
+	// not unique — uk_session_app_key is (app_id, session_key) — so a
+	// single-dimension cursor steps over the second of two apps that share a
+	// session_key and never migrates it. A progress row written before this
+	// split carries only Cursor; CursorApp then reads empty, which restarts
+	// enumeration from the beginning — safe, because copySession skips the
+	// event prefix the target already holds.
+	CursorApp    string    `json:"cursor_app,omitempty"`
+	Cursor       string    `json:"cursor,omitempty"`
+	Mismatches   []string  `json:"mismatches,omitempty"` // consistency check failures
+	ObserveUntil time.Time `json:"observe_until,omitempty"`
 }
 
 // NewMigrator creates the executor. backends maps "redis"/"postgres" to the
@@ -161,7 +171,7 @@ func (m *Migrator) backfill(ctx context.Context, tx pgx.Tx, mig migrationRow) er
 		return fmt.Errorf("backend pair %s→%s not both available", mig.From, mig.To)
 	}
 
-	sessions, err := m.enumerate(ctx, mig, mig.Progress.Cursor)
+	sessions, err := m.enumerate(ctx, mig, cursorOf(mig.Progress))
 	if err != nil {
 		return err
 	}
@@ -169,6 +179,7 @@ func (m *Migrator) backfill(ctx context.Context, tx pgx.Tx, mig migrationRow) er
 		if err := m.copySession(ctx, mig, src, dst, key); err != nil {
 			return fmt.Errorf("copy session %s: %w", key.SessionID, err)
 		}
+		mig.Progress.CursorApp = key.AppName
 		mig.Progress.Cursor = key.SessionID
 		mig.Progress.SessionsDone++
 	}
@@ -226,21 +237,61 @@ func (m *Migrator) readSwitch(ctx context.Context, tx pgx.Tx, mig migrationRow) 
 	return nil
 }
 
+// enumCursor is the pagination position: the (app_id, session_key) of the last
+// session copied. Both halves are needed because session_key is only unique
+// per app, so ordering by it alone leaves ties whose second member a
+// "session_key > cursor" page steps over permanently.
+type enumCursor struct{ appID, sessionKey string }
+
+func cursorOf(p migrationProgress) enumCursor {
+	return enumCursor{appID: p.CursorApp, sessionKey: p.Cursor}
+}
+
+// after reports whether k sorts strictly after the cursor in the
+// (app_id, session_key) order both enumerators page by.
+func (c enumCursor) after(k session.Key) bool {
+	if k.AppName != c.appID {
+		return k.AppName > c.appID
+	}
+	return k.SessionID > c.sessionKey
+}
+
+// keyOrder is the same order as a comparator, for sorting the Redis scan
+// (SCAN returns keys in no particular order, so pagination needs a total one).
+func keyOrder(a, b session.Key) int {
+	if c := strings.Compare(a.AppName, b.AppName); c != 0 {
+		return c
+	}
+	return strings.Compare(a.SessionID, b.SessionID)
+}
+
 // enumerate lists one batch of the tenant's sessions on the source backend,
 // after the cursor.
-func (m *Migrator) enumerate(ctx context.Context, mig migrationRow, cursor string) ([]session.Key, error) {
+func (m *Migrator) enumerate(ctx context.Context, mig migrationRow, cursor enumCursor) ([]session.Key, error) {
 	if mig.From == "postgres" {
 		return m.enumeratePG(ctx, mig.TenantID, cursor)
 	}
 	return m.enumerateRedis(ctx, mig.TenantID, cursor)
 }
 
-// enumeratePG pages the session table by session_key.
-func (m *Migrator) enumeratePG(ctx context.Context, tenantID, cursor string) ([]session.Key, error) {
+// zeroAppID sorts below every real app_id, so it is the first page's cursor.
+// Binding "" instead would not merely sort low: app_id is a uuid and Postgres
+// rejects the empty string outright.
+const zeroAppID = "00000000-0000-0000-0000-000000000000"
+
+// enumeratePG pages the session table by (app_id, session_key); the row
+// comparison and the ORDER BY must agree, or the page boundary skips or
+// repeats rows.
+func (m *Migrator) enumeratePG(ctx context.Context, tenantID string, cursor enumCursor) ([]session.Key, error) {
+	cursorApp := cursor.appID
+	if cursorApp == "" {
+		cursorApp = zeroAppID
+	}
 	rows, err := m.pool.Query(ctx,
 		`SELECT app_id, session_key, user_id FROM session
-		 WHERE tenant_id = $1 AND session_key > $2 ORDER BY session_key LIMIT $3`,
-		tenantID, cursor, m.BatchSize)
+		 WHERE tenant_id = $1 AND (app_id, session_key) > ($2, $3)
+		 ORDER BY app_id, session_key LIMIT $4`,
+		tenantID, cursorApp, cursor.sessionKey, m.BatchSize)
 	if err != nil {
 		return nil, fmt.Errorf("enumerate pg sessions: %w", err)
 	}
@@ -259,8 +310,8 @@ func (m *Migrator) enumeratePG(ctx context.Context, tenantID, cursor string) ([]
 // enumerateRedis scans the framework's hashidx session keys
 // (hashidx:meta:{app}:{user}:{sess}, the default storage layout of
 // session/redis v1.11) for the tenant's apps. The cursor is the last copied
-// session key; enumeration re-scans and skips up to it.
-func (m *Migrator) enumerateRedis(ctx context.Context, tenantID, cursor string) ([]session.Key, error) {
+// session; enumeration re-scans and skips everything up to it.
+func (m *Migrator) enumerateRedis(ctx context.Context, tenantID string, cursor enumCursor) ([]session.Key, error) {
 	appIDs, err := m.tenantApps(ctx, tenantID)
 	if err != nil {
 		return nil, err
@@ -284,15 +335,13 @@ func (m *Migrator) enumerateRedis(ctx context.Context, tenantID, cursor string) 
 			return nil, fmt.Errorf("scan redis sessions: %w", err)
 		}
 	}
-	// Deterministic order + cursor skip.
-	for i := 1; i < len(all); i++ { // insertion sort; batches are small
-		for j := i; j > 0 && all[j].SessionID < all[j-1].SessionID; j-- {
-			all[j], all[j-1] = all[j-1], all[j]
-		}
-	}
+	// Deterministic order + cursor skip, in the same (app_id, session_key)
+	// order enumeratePG pages by: the two backends must agree, or a migration
+	// resumes at a different place than it stopped.
+	slices.SortFunc(all, keyOrder)
 	var out []session.Key
 	for _, k := range all {
-		if k.SessionID > cursor {
+		if cursor.after(k) {
 			out = append(out, k)
 		}
 	}
@@ -314,6 +363,17 @@ func (m *Migrator) copySession(ctx context.Context, mig migrationRow, src, dst s
 	if srcSess == nil {
 		return nil // vanished between enumerate and copy
 	}
+	// A postgres source has to be read past GetSession: that returns only the
+	// events after the summary and only those the archive sweep has not moved
+	// out, so copying through it silently leaves the summarized and archived
+	// history behind — for a long-lived session it copies nothing at all.
+	events := srcSess.Events
+	if pg, ok := src.(*PGSessionService); ok {
+		if events, err = pg.FullJournal(ctx, key); err != nil {
+			return fmt.Errorf("read source journal: %w", err)
+		}
+	}
+
 	dstSess, err := dst.GetSession(ctx, key)
 	if err != nil {
 		return fmt.Errorf("read target: %w", err)
@@ -324,14 +384,12 @@ func (m *Migrator) copySession(ctx context.Context, mig migrationRow, src, dst s
 	}
 
 	if mig.To == "postgres" {
-		return m.writeSessionToPG(ctx, mig.TenantID, srcSess)
+		return m.writeSessionToPG(ctx, mig.TenantID, srcSess, events)
 	}
 	// Redis target: create (idempotent) then append the missing tail.
-	// AppendEvent mutates the carrier session's event list, so the events are
-	// snapshotted first (otherwise the loop's slice grows under the iteration
-	// and never terminates) and the destination's own session object is the
-	// carrier.
-	events := append([]event.Event(nil), srcSess.Events...)
+	// AppendEvent mutates the carrier session's event list, so the destination's
+	// own session object is the carrier and the loop indexes a slice it does not
+	// grow.
 	dstSessNew, err := dst.CreateSession(ctx, key, srcSess.State)
 	if err != nil {
 		return fmt.Errorf("create target session: %w", err)
@@ -345,9 +403,11 @@ func (m *Migrator) copySession(ctx context.Context, mig migrationRow, src, dst s
 	return nil
 }
 
-// writeSessionToPG writes the session row + all events with their original
-// order as event_seq, idempotently (ON CONFLICT DO NOTHING on both tables).
-func (m *Migrator) writeSessionToPG(ctx context.Context, tenantID string, sess *session.Session) error {
+// writeSessionToPG writes the session row + the given journal with its original
+// order as event_seq, idempotently (ON CONFLICT DO NOTHING on both tables). The
+// events are a parameter rather than sess.Events because the caller may have
+// read them past GetSession's summary/archive truncation.
+func (m *Migrator) writeSessionToPG(ctx context.Context, tenantID string, sess *session.Session, events []event.Event) error {
 	tx, err := m.pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -368,7 +428,7 @@ func (m *Migrator) writeSessionToPG(ctx context.Context, tenantID string, sess *
 	if err != nil {
 		return fmt.Errorf("upsert session: %w", err)
 	}
-	for i, evt := range sess.Events {
+	for i, evt := range events {
 		raw, err := json.Marshal(evt)
 		if err != nil {
 			return fmt.Errorf("marshal event %d: %w", i, err)
@@ -401,7 +461,8 @@ func (m *Migrator) checkConsistency(ctx context.Context, mig migrationRow, src, 
 			return nil, err
 		}
 		if srcCount != dstCount {
-			mismatches = append(mismatches, fmt.Sprintf("%s(%d!=%d)", key.SessionID, srcCount, dstCount))
+			mismatches = append(mismatches,
+				fmt.Sprintf("%s/%s(%d!=%d)", key.AppName, key.SessionID, srcCount, dstCount))
 		}
 	}
 	return mismatches, nil
@@ -411,7 +472,7 @@ func (m *Migrator) checkConsistency(ctx context.Context, mig migrationRow, src, 
 // comparison is full.
 func (m *Migrator) enumerateAll(ctx context.Context, mig migrationRow) ([]session.Key, error) {
 	var all []session.Key
-	cursor := ""
+	cursor := enumCursor{}
 	for {
 		batch, err := m.enumerate(ctx, mig, cursor)
 		if err != nil {
@@ -421,12 +482,19 @@ func (m *Migrator) enumerateAll(ctx context.Context, mig migrationRow) ([]sessio
 			return all, nil
 		}
 		all = append(all, batch...)
-		cursor = batch[len(batch)-1].SessionID
+		last := batch[len(batch)-1]
+		cursor = enumCursor{appID: last.AppName, sessionKey: last.SessionID}
 	}
 }
 
-// countEvents reads the session and counts journaled events.
+// countEvents reports how many events a backend holds for the session. A
+// postgres backend is counted through its full journal: GetSession reports only
+// the post-summary tail, so comparing it against a target that received the
+// complete copy would fail a migration that did its job.
 func countEvents(ctx context.Context, svc session.Service, key session.Key) (int, error) {
+	if pg, ok := svc.(*PGSessionService); ok {
+		return pg.CountFullJournal(ctx, key)
+	}
 	sess, err := svc.GetSession(ctx, key)
 	if err != nil {
 		return 0, err
@@ -446,7 +514,7 @@ func (m *Migrator) countTenantSessions(ctx context.Context, mig migrationRow) (i
 		}
 		return n, nil
 	}
-	keys, err := m.enumerateRedis(ctx, mig.TenantID, "")
+	keys, err := m.enumerateRedis(ctx, mig.TenantID, enumCursor{})
 	if err != nil {
 		return 0, err
 	}

@@ -84,3 +84,95 @@ func TestArchiverMovesOldRows(t *testing.T) {
 		t.Fatalf("second sweep must be a no-op, got %d/%d", events, audits)
 	}
 }
+
+// A session quiet long enough for the sweep to archive every one of its events
+// must still continue its sequence when the user comes back. Deriving the next
+// event_seq from the hot table alone restarted it at 1, reusing seqs that still
+// exist in session_event_archive: the replay cursor (event_seq > afterSeq) then
+// skips the new events, and the next sweep violates uk_session_event_archive_seq
+// — a conflict the copy's ON CONFLICT (id) cannot absorb — which fails the batch
+// transaction and wedges every sweep after it.
+func TestEventSeqSurvivesFullArchive(t *testing.T) {
+	svc, pool := pgSessionService(t)
+	ctx := context.Background()
+	key := testKey(t.Name())
+	cleanupSession(t, pool, key)
+	t.Cleanup(func() { cleanupSession(t, pool, key) })
+	// cleanupSession leaves the archive alone, and archived rows outlive their
+	// session row (the archive tables drop the FKs): registered last so it runs
+	// first, while the session row is still there to resolve the id.
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(),
+			`DELETE FROM session_event_archive WHERE session_id IN
+			   (SELECT id FROM session WHERE app_id=$1 AND session_key=$2)`,
+			key.AppName, key.SessionID)
+	})
+
+	sess, err := svc.CreateSession(ctx, key, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"seq-1", "seq-2"} {
+		if err := svc.AppendEvent(ctx, sess, textEvent(id, "user", "旧消息")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var sessID string
+	if err := pool.QueryRow(ctx,
+		`SELECT id FROM session WHERE app_id=$1 AND session_key=$2`,
+		key.AppName, key.SessionID).Scan(&sessID); err != nil {
+		t.Fatal(err)
+	}
+
+	old := time.Now().Add(-40 * 24 * time.Hour)
+	backdate := func() {
+		t.Helper()
+		if _, err := pool.Exec(ctx,
+			`UPDATE session_event SET created_at = $1 WHERE session_id = $2`, old, sessID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	a := storage.NewArchiver(pool, 30*24*time.Hour, time.Hour)
+
+	// Archive both events, leaving this session with an empty hot journal.
+	backdate()
+	if _, _, err := a.ArchiveOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var hot int
+	if err := pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM session_event WHERE session_id=$1`, sessID).Scan(&hot); err != nil {
+		t.Fatal(err)
+	}
+	if hot != 0 {
+		t.Fatalf("the sweep must have emptied the hot journal, got %d rows", hot)
+	}
+
+	// The user returns: the next event continues at 3, it does not restart at 1.
+	if err := svc.AppendEvent(ctx, sess, textEvent("seq-3", "user", "我回来了")); err != nil {
+		t.Fatal(err)
+	}
+	var seq int64
+	if err := pool.QueryRow(ctx,
+		`SELECT event_seq FROM session_event WHERE session_id=$1`, sessID).Scan(&seq); err != nil {
+		t.Fatal(err)
+	}
+	if seq != 3 {
+		t.Fatalf("event_seq must continue past the archived events, got %d, want 3", seq)
+	}
+
+	// And the new event is itself archivable: no uk_session_event_archive_seq
+	// violation, all three rows end up in the archive.
+	backdate()
+	if _, _, err := a.ArchiveOnce(ctx); err != nil {
+		t.Fatalf("re-archiving a continued sequence must not conflict: %v", err)
+	}
+	var archived int
+	if err := pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM session_event_archive WHERE session_id=$1`, sessID).Scan(&archived); err != nil {
+		t.Fatal(err)
+	}
+	if archived != 3 {
+		t.Fatalf("want all 3 events archived, got %d", archived)
+	}
+}
