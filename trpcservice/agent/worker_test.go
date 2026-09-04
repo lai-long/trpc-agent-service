@@ -11,6 +11,7 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels/mock"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/storage"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/testenv"
 )
 
 // End to end: inbound enqueue → Worker(echo) → outbound enqueue → Sender →
@@ -20,10 +21,7 @@ func TestWorkerSenderRoundTrip(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	rdb, err := storage.NewRedis(ctx, "localhost:6380")
-	if err != nil {
-		t.Skipf("redis unavailable (%v), skipping integration test", err)
-	}
+	rdb := testenv.Redis(t)
 	defer func() { _ = rdb.Close() }()
 
 	stream := storage.NewStream(rdb)
@@ -104,10 +102,7 @@ func TestWorkerSkipsOutboundForEmptyReply(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	rdb, err := storage.NewRedis(ctx, "localhost:6380")
-	if err != nil {
-		t.Skipf("redis unavailable (%v), skipping integration test", err)
-	}
+	rdb := testenv.Redis(t)
 	t.Cleanup(func() { _ = rdb.Close() })
 
 	stream := storage.NewStream(rdb)
@@ -161,10 +156,7 @@ func TestWorkerSkipsProcessedMessages(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	rdb, err := storage.NewRedis(ctx, "localhost:6380")
-	if err != nil {
-		t.Skipf("redis unavailable (%v), skipping integration test", err)
-	}
+	rdb := testenv.Redis(t)
 	t.Cleanup(func() { _ = rdb.Close() })
 
 	stream := storage.NewStream(rdb)

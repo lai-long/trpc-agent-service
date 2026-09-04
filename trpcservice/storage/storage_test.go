@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"fmt"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/testenv"
 	"testing"
 	"time"
 
@@ -10,18 +11,18 @@ import (
 )
 
 // The integration tests need the real services from compose (docker compose
-// up -d); they skip when unreachable instead of failing in Docker-less
-// environments.
-const (
-	testRedisAddr = "localhost:6380"
-	testPGDSN     = "postgres://trpc:trpc-dev-only@localhost:5432/trpc?sslmode=disable"
+// up -d, or the CI services); they gate on TRPC_TEST_* variables (review
+// P0-4) and skip with the variable named when unreachable.
+var (
+	testRedisAddr = testenv.RedisAddr()
+	testPGDSN     = testenv.PGDSN()
 )
 
 func redisOrSkip(t *testing.T) *redis.Client {
 	t.Helper()
 	rdb, err := NewRedis(context.Background(), testRedisAddr)
 	if err != nil {
-		t.Skipf("redis unavailable (%v), skipping integration test", err)
+		t.Skipf("redis unavailable (%v) — set TRPC_TEST_REDIS_ADDR (default %s), skipping integration test", err, testRedisAddr)
 	}
 	t.Cleanup(func() { _ = rdb.Close() })
 	return rdb
@@ -117,7 +118,7 @@ func TestStreamPendingRedeliver(t *testing.T) {
 func TestNewPGAndSchema(t *testing.T) {
 	pool, err := NewPG(context.Background(), testPGDSN)
 	if err != nil {
-		t.Skipf("postgres unavailable (%v), skipping integration test", err)
+		t.Skipf("postgres unavailable (%v) — set TRPC_TEST_PG_DSN (default %s), skipping integration test", err, testPGDSN)
 	}
 	defer pool.Close()
 

@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/liuzengh/trpc-agent-service/trpcservice/storage"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/testenv"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 )
 
@@ -165,10 +165,7 @@ func TestWatchInvalidations(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	rdb, err := storage.NewRedis(ctx, "localhost:6380")
-	if err != nil {
-		t.Skipf("redis unavailable (%v), skipping integration test", err)
-	}
+	rdb := testenv.Redis(t)
 	defer func() { _ = rdb.Close() }()
 
 	store := &fakeStore{data: testData()}

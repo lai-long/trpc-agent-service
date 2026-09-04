@@ -16,6 +16,7 @@ import (
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/agent"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/storage"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/testenv"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/web"
 )
 
@@ -23,11 +24,7 @@ import (
 // Rows created by the test are cleaned up.
 func adminTestAPI(t *testing.T) (*http.ServeMux, *pgxpool.Pool) {
 	t.Helper()
-	ctx := context.Background()
-	pool, err := storage.NewPG(ctx, "postgres://trpc:trpc-dev-only@localhost:5432/trpc?sslmode=disable")
-	if err != nil {
-		t.Skipf("postgres unavailable (%v), skipping integration test", err)
-	}
+	pool := testenv.PG(t)
 	t.Cleanup(func() { pool.Close() })
 
 	mux := http.NewServeMux()
@@ -271,10 +268,7 @@ func TestAdminLifecycle(t *testing.T) {
 
 func TestAdminKnowledgeIngestion(t *testing.T) {
 	ctx := context.Background()
-	pool, err := storage.NewPG(ctx, "postgres://trpc:trpc-dev-only@localhost:5432/trpc?sslmode=disable")
-	if err != nil {
-		t.Skipf("postgres unavailable (%v), skipping integration test", err)
-	}
+	pool := testenv.PG(t)
 	t.Cleanup(func() { pool.Close() })
 
 	// Fixture app to ingest into.
@@ -350,10 +344,7 @@ func (f fakeEmbedder) GetDimensions() int { return f.dim }
 
 func TestAdminAuthAndAuditQuery(t *testing.T) {
 	ctx := context.Background()
-	pool, err := storage.NewPG(ctx, "postgres://trpc:trpc-dev-only@localhost:5432/trpc?sslmode=disable")
-	if err != nil {
-		t.Skipf("postgres unavailable (%v), skipping integration test", err)
-	}
+	pool := testenv.PG(t)
 	// Cleanup is LIFO: registered first, runs last — after row deletions.
 	t.Cleanup(func() { pool.Close() })
 
@@ -400,10 +391,7 @@ func TestAdminAuthAndAuditQuery(t *testing.T) {
 // creation payload.
 func TestAdminAuditDetail(t *testing.T) {
 	ctx := context.Background()
-	pool, err := storage.NewPG(ctx, "postgres://trpc:trpc-dev-only@localhost:5432/trpc?sslmode=disable")
-	if err != nil {
-		t.Skipf("postgres unavailable (%v), skipping integration test", err)
-	}
+	pool := testenv.PG(t)
 	t.Cleanup(func() { pool.Close() })
 
 	auditor := storage.NewAuditor(pool)

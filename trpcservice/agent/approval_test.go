@@ -11,18 +11,14 @@ import (
 	"trpc.group/trpc-go/trpc-agent-go/session"
 	ttool "trpc.group/trpc-go/trpc-agent-go/tool"
 
-	"github.com/liuzengh/trpc-agent-service/trpcservice/storage"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/testenv"
 )
 
 // approverForTest connects to the compose Redis (localhost:6380) and returns
 // an Approver plus cleanup; skips the test when Redis is unreachable.
 func approverForTest(t *testing.T) (*Approver, *redis.Client) {
 	t.Helper()
-	ctx := context.Background()
-	rdb, err := storage.NewRedis(ctx, "localhost:6380")
-	if err != nil {
-		t.Skipf("redis unavailable (%v), skipping integration test", err)
-	}
+	rdb := testenv.Redis(t)
 	t.Cleanup(func() { _ = rdb.Close() })
 	return NewApprover(rdb, testRegistry(), time.Minute), rdb
 }

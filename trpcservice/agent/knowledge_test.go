@@ -8,7 +8,7 @@ import (
 	"trpc.group/trpc-go/trpc-agent-go/knowledge"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/agent"
-	"github.com/liuzengh/trpc-agent-service/trpcservice/storage"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/testenv"
 )
 
 // fakeEmbedder produces deterministic bag-of-runes vectors: texts sharing
@@ -37,10 +37,7 @@ func (f fakeEmbedder) GetDimensions() int { return f.dim }
 // skips when unreachable.
 func TestKnowledgeBaseRoundTrip(t *testing.T) {
 	ctx := context.Background()
-	pool, err := storage.NewPG(ctx, "postgres://trpc:trpc-dev-only@localhost:5432/trpc?sslmode=disable")
-	if err != nil {
-		t.Skipf("postgres unavailable (%v), skipping integration test", err)
-	}
+	pool := testenv.PG(t)
 	defer pool.Close()
 
 	const dim = 64

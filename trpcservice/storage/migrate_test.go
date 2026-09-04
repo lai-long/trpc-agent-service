@@ -21,7 +21,7 @@ func redisSessionService(t *testing.T) session.Service {
 		sessionredis.WithRedisClientURL("redis://" + migrateTestRedisAddr),
 	)
 	if err != nil {
-		t.Skipf("redis unavailable (%v), skipping integration test", err)
+		t.Skipf("redis unavailable (%v) — set TRPC_TEST_REDIS_ADDR (default %s), skipping integration test", err, migrateTestRedisAddr)
 	}
 	t.Cleanup(func() { _ = svc.Close() })
 	return svc
@@ -127,7 +127,7 @@ func redisOrSkipForMigrate(t *testing.T) *redis.Client {
 	t.Helper()
 	rdb, err := storage.NewRedis(context.Background(), migrateTestRedisAddr)
 	if err != nil {
-		t.Skipf("redis unavailable (%v), skipping integration test", err)
+		t.Skipf("redis unavailable (%v) — set TRPC_TEST_REDIS_ADDR (default %s), skipping integration test", err, migrateTestRedisAddr)
 	}
 	t.Cleanup(func() { _ = rdb.Close() })
 	return rdb

@@ -14,6 +14,7 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels/mock"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/storage"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/testenv"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/web"
 )
@@ -150,10 +151,7 @@ func TestBindingCorpIDOverride(t *testing.T) {
 // (dedup + stream) is the real one.
 func TestTwoTenantCallbackRouting(t *testing.T) {
 	ctx := context.Background()
-	rdb, err := storage.NewRedis(ctx, "localhost:6380")
-	if err != nil {
-		t.Skipf("redis unavailable (%v), skipping integration test", err)
-	}
+	rdb := testenv.Redis(t)
 	t.Cleanup(func() { _ = rdb.Close() })
 
 	// Two tenants, two apps, two bindings on the same "mock" channel.

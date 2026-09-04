@@ -10,6 +10,7 @@ import (
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/storage"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/testenv"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/web"
 )
@@ -44,10 +45,7 @@ func TestEnqueueRejectsUnknownRoute(t *testing.T) {
 // (localhost:6380); skips when unreachable.
 func TestEnqueueStampsTenant(t *testing.T) {
 	ctx := context.Background()
-	rdb, err := storage.NewRedis(ctx, "localhost:6380")
-	if err != nil {
-		t.Skipf("redis unavailable (%v), skipping integration test", err)
-	}
+	rdb := testenv.Redis(t)
 	defer func() { _ = rdb.Close() }()
 
 	stream := storage.NewStream(rdb)
@@ -97,10 +95,7 @@ func TestEnqueueStampsTenant(t *testing.T) {
 // the full 24h TTL — the message would be lost instead of delayed.
 func TestEnqueueRollsBackDedupOnFailure(t *testing.T) {
 	ctx := context.Background()
-	rdb, err := storage.NewRedis(ctx, "localhost:6380")
-	if err != nil {
-		t.Skipf("redis unavailable (%v), skipping integration test", err)
-	}
+	rdb := testenv.Redis(t)
 	defer func() { _ = rdb.Close() }()
 
 	// Occupy the queue key with a plain string so XADD fails with WRONGTYPE:
@@ -142,10 +137,7 @@ func TestEnqueueRollsBackDedupOnFailure(t *testing.T) {
 // dedup key — the redelivery must still be admissible.
 func TestEnqueueRateLimited(t *testing.T) {
 	ctx := context.Background()
-	rdb, err := storage.NewRedis(ctx, "localhost:6380")
-	if err != nil {
-		t.Skipf("redis unavailable (%v), skipping integration test", err)
-	}
+	rdb := testenv.Redis(t)
 	defer func() { _ = rdb.Close() }()
 	// Start from a clean slate: bucket keys outlive a crashed test run
 	// (10min TTL), and a stale empty bucket would reject even the first
@@ -175,7 +167,7 @@ func TestEnqueueRateLimited(t *testing.T) {
 	if _, err := h.Handle(ctx, mk(id1)); err != nil {
 		t.Fatalf("first message must pass: %v", err)
 	}
-	_, err = h.Handle(ctx, mk(id2))
+	_, err := h.Handle(ctx, mk(id2))
 	if !errors.Is(err, web.ErrOverloaded) {
 		t.Fatalf("want ErrOverloaded, got %v", err)
 	}
@@ -189,10 +181,7 @@ func TestEnqueueRateLimited(t *testing.T) {
 // the dedup key: refusing beats silent MAXLEN truncation (design 5.1.4).
 func TestEnqueueBackpressure(t *testing.T) {
 	ctx := context.Background()
-	rdb, err := storage.NewRedis(ctx, "localhost:6380")
-	if err != nil {
-		t.Skipf("redis unavailable (%v), skipping integration test", err)
-	}
+	rdb := testenv.Redis(t)
 	defer func() { _ = rdb.Close() }()
 
 	inbound := "test:inbound-bp:" + t.Name()

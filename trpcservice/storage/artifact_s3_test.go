@@ -9,13 +9,15 @@ import (
 
 	"github.com/minio/minio-go/v7"
 	"trpc.group/trpc-go/trpc-agent-go/artifact"
+
+	"github.com/liuzengh/trpc-agent-service/trpcservice/testenv"
 )
 
 // The integration tests need the MinIO service from compose (docker compose
 // up -d minio); they skip when unreachable instead of failing in Docker-less
 // environments.
-const (
-	testS3Endpoint = "localhost:9000"
+var (
+	testS3Endpoint = testenv.S3Endpoint()
 	testS3Bucket   = "artifacts"
 )
 
@@ -48,7 +50,7 @@ func s3OrSkip(t *testing.T) *S3ArtifactService {
 		},
 	})
 	if err != nil {
-		t.Skipf("minio unavailable (%v), skipping integration test", err)
+		t.Skipf("minio unavailable (%v) — set TRPC_TEST_S3_ENDPOINT (default %s), skipping integration test", err, testS3Endpoint)
 	}
 	t.Cleanup(func() { cleanupS3Prefix(svc) })
 	return svc

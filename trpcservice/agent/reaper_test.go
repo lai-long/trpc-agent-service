@@ -12,6 +12,7 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels/mock"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/storage"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/testenv"
 )
 
 // fastWorker builds a Worker on dedicated streams with reaping tuned for tests.
@@ -30,10 +31,7 @@ func TestWorkerTakesOverOrphanedMessage(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	rdb, err := storage.NewRedis(ctx, "localhost:6380")
-	if err != nil {
-		t.Skipf("redis unavailable (%v), skipping integration test", err)
-	}
+	rdb := testenv.Redis(t)
 	defer func() { _ = rdb.Close() }()
 
 	stream := storage.NewStream(rdb)
@@ -95,10 +93,7 @@ func TestWorkerDeadLettersPoisonMessage(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	rdb, err := storage.NewRedis(ctx, "localhost:6380")
-	if err != nil {
-		t.Skipf("redis unavailable (%v), skipping integration test", err)
-	}
+	rdb := testenv.Redis(t)
 	defer func() { _ = rdb.Close() }()
 
 	stream := storage.NewStream(rdb)
@@ -155,10 +150,7 @@ func TestWorkerRequeuesWhenSessionLocked(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	rdb, err := storage.NewRedis(ctx, "localhost:6380")
-	if err != nil {
-		t.Skipf("redis unavailable (%v), skipping integration test", err)
-	}
+	rdb := testenv.Redis(t)
 	defer func() { _ = rdb.Close() }()
 
 	stream := storage.NewStream(rdb)

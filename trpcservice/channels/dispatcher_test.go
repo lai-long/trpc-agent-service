@@ -11,6 +11,7 @@ import (
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/storage"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/testenv"
 )
 
 // countingChannel records how many times Send was called.
@@ -39,10 +40,7 @@ func TestSenderOutboundIdempotency(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	rdb, err := storage.NewRedis(ctx, "localhost:6380")
-	if err != nil {
-		t.Skipf("redis unavailable (%v), skipping integration test", err)
-	}
+	rdb := testenv.Redis(t)
 	// Cleanups run LIFO; register Close first so the Del cleanup runs while
 	// the client is still open.
 	t.Cleanup(func() { _ = rdb.Close() })
@@ -109,10 +107,7 @@ func TestSenderRateLimitedRequeues(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	rdb, err := storage.NewRedis(ctx, "localhost:6380")
-	if err != nil {
-		t.Skipf("redis unavailable (%v), skipping integration test", err)
-	}
+	rdb := testenv.Redis(t)
 	t.Cleanup(func() { _ = rdb.Close() })
 
 	stream := storage.NewStream(rdb)
@@ -178,10 +173,7 @@ func TestSenderTenantRateOverride(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	rdb, err := storage.NewRedis(ctx, "localhost:6380")
-	if err != nil {
-		t.Skipf("redis unavailable (%v), skipping integration test", err)
-	}
+	rdb := testenv.Redis(t)
 	t.Cleanup(func() { _ = rdb.Close() })
 
 	stream := storage.NewStream(rdb)
@@ -240,10 +232,7 @@ func TestSenderReapsOrphanedPending(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	rdb, err := storage.NewRedis(ctx, "localhost:6380")
-	if err != nil {
-		t.Skipf("redis unavailable (%v), skipping integration test", err)
-	}
+	rdb := testenv.Redis(t)
 	t.Cleanup(func() { _ = rdb.Close() })
 
 	stream := storage.NewStream(rdb)
