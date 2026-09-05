@@ -375,3 +375,93 @@ func TestValidateBindingConfig(t *testing.T) {
 		})
 	}
 }
+
+// tokenTestChannel builds a channel against the identity fake with one
+// shared secret ref every corp accepts.
+func tokenTestChannel(t *testing.T, f *identityFake) *Channel {
+	t.Helper()
+	srv := httptest.NewServer(f.handler())
+	t.Cleanup(srv.Close)
+	c, err := New(Config{
+		CorpID: testCorpID, KfAccount: testKfAccount,
+		TokenRef: "tok", AESKeyRef: "aes", SecretRef: "secret", APIBase: srv.URL,
+	}, mapResolver{"tok": testToken, "aes": testAESKey, "secret": "s"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c
+}
+
+// A token refresh runs off the cache lock and is deduplicated per identity:
+// N concurrent misses for one corp issue exactly one gettoken call, instead
+// of N platform calls or N waiters serialized behind a channel-wide lock.
+func TestGetAccessTokenConcurrentRefreshIsSingleFlight(t *testing.T) {
+	f := newIdentityFake()
+	f.secrets["corpS"] = "s"
+	c := tokenTestChannel(t, f)
+
+	const workers = 8
+	errs := make(chan error, workers)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			tok, err := c.getAccessToken(context.Background(), "corpS", "secret")
+			if err != nil {
+				errs <- err
+				return
+			}
+			if tok != "tok-corpS" {
+				t.Errorf("token mismatch: %q", tok)
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	if err := <-errs; err != nil {
+		t.Fatalf("concurrent refresh failed: %v", err)
+	}
+	if got := f.tokens("corpS"); got != 1 {
+		t.Fatalf("concurrent misses must share one gettoken call, got %d", got)
+	}
+}
+
+// The identity cache evicts least-recently-used entries instead of resetting
+// wholesale: a touched identity survives the next insertion, the cold one is
+// re-authenticated on its next use.
+func TestGetAccessTokenEvictsLeastRecentlyUsed(t *testing.T) {
+	f := newIdentityFake()
+	c := tokenTestChannel(t, f)
+
+	f.secrets["cold"] = "s"
+	f.secrets["hot"] = "s"
+	ctx := context.Background()
+	get := func(corp string) {
+		t.Helper()
+		if _, err := c.getAccessToken(ctx, corp, "secret"); err != nil {
+			t.Fatalf("gettoken %s: %v", corp, err)
+		}
+	}
+	for i := 0; i < maxTokenCacheEntries-1; i++ {
+		f.secrets[fmt.Sprintf("filler-%02d", i)] = "s"
+		get(fmt.Sprintf("filler-%02d", i))
+	}
+	get("cold") // cache now full (32), cold sits at the LRU back
+	get("hot")  // evicts the coldest filler, cold keeps its entry
+	get("cold") // still cached: no new gettoken
+	if got := f.tokens("cold"); got != 1 {
+		t.Fatalf("a touched identity must survive eviction, gettoken calls = %d", got)
+	}
+	if got := f.tokens("hot"); got != 1 {
+		t.Fatalf("the newest identity must be cached, gettoken calls = %d", got)
+	}
+	// The evicted filler re-authenticates on its next use.
+	get("filler-00")
+	if got := f.tokens("filler-00"); got != 2 {
+		t.Fatalf("the evicted identity must re-authenticate, gettoken calls = %d", got)
+	}
+	if len(c.tokens) > maxTokenCacheEntries {
+		t.Fatalf("cache must stay bounded, got %d entries", len(c.tokens))
+	}
+}

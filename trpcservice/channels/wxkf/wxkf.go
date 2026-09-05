@@ -18,6 +18,7 @@ package wxkf
 
 import (
 	"bytes"
+	"container/list"
 	"context"
 	"encoding/json"
 	"errors"
@@ -30,6 +31,7 @@ import (
 
 	"github.com/sbzhu/weworkapi_golang/wxbizmsgcrypt"
 	"go.uber.org/zap"
+	"golang.org/x/sync/singleflight"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/config"
@@ -103,14 +105,22 @@ type Channel struct {
 	// the resolved secret: the send hot path stays off the secret resolver,
 	// and a rotation behind a ref is picked up when the cached token expires
 	// or the platform rejects it (40014/42001 invalidates just that entry).
-	tokenMu sync.Mutex
-	tokens  map[string]tokenEntry
+	tokenMu    sync.Mutex
+	tokens     map[string]tokenEntry
+	tokenOrder *list.List // front = most recently used identity
+	// tokenFlights collapses concurrent misses for one identity into a
+	// single gettoken call, taken off the cache lock: the HTTP call takes
+	// seconds and a channel-wide mutex held across it would stall every
+	// identity's sends.
+	tokenFlights singleflight.Group
 }
 
-// tokenEntry is one cached access_token and its refresh deadline.
+// tokenEntry is one cached access_token, its refresh deadline, and its
+// position in the LRU order.
 type tokenEntry struct {
 	token  string
 	expiry time.Time
+	elem   *list.Element
 }
 
 // New creates the channel: the env callback token and AES key are resolved
@@ -132,12 +142,13 @@ func New(cfg Config, resolver config.SecretResolver) (*Channel, error) {
 		return nil, fmt.Errorf("wxkf: resolve aes key: %w", err)
 	}
 	return &Channel{
-		cfg:      cfg,
-		secret:   resolver,
-		client:   &http.Client{Timeout: 10 * time.Second},
-		bindings: cfg.Bindings,
-		crypts:   map[string]*wxbizmsgcrypt.WXBizMsgCrypt{},
-		tokens:   map[string]tokenEntry{},
+		cfg:        cfg,
+		secret:     resolver,
+		client:     &http.Client{Timeout: 10 * time.Second},
+		bindings:   cfg.Bindings,
+		crypts:     map[string]*wxbizmsgcrypt.WXBizMsgCrypt{},
+		tokens:     map[string]tokenEntry{},
+		tokenOrder: list.New(),
 	}, nil
 }
 
@@ -541,23 +552,41 @@ func sendMsgID(msg channels.OutboundMessage, seg int) string {
 func (c *Channel) getAccessToken(ctx context.Context, corpID, secretRef string) (string, error) {
 	key := corpID + "|" + secretRef
 	c.tokenMu.Lock()
-	defer c.tokenMu.Unlock()
 	if e, ok := c.tokens[key]; ok && time.Now().Before(e.expiry) {
+		c.tokenOrder.MoveToFront(e.elem)
+		c.tokenMu.Unlock()
 		return e.token, nil
 	}
+	c.tokenMu.Unlock()
+	// The refresh runs off the cache lock (see tokenFlights): concurrent
+	// misses for one identity share a single gettoken call.
+	token, err, _ := c.tokenFlights.Do(key, func() (any, error) {
+		return c.refreshAccessToken(ctx, corpID, secretRef)
+	})
+	if err != nil {
+		return "", err
+	}
+	return token.(string), nil
+}
+
+// refreshAccessToken resolves the secret, calls gettoken, and stores the
+// result. It runs without the cache lock; singleflight serializes callers
+// for the same identity.
+func (c *Channel) refreshAccessToken(ctx context.Context, corpID, secretRef string) (any, error) {
+	key := corpID + "|" + secretRef
 	secret, err := c.secret.Resolve(ctx, secretRef)
 	if err != nil {
-		return "", fmt.Errorf("wxkf: resolve kf secret: %w", err)
+		return nil, fmt.Errorf("wxkf: resolve kf secret: %w", err)
 	}
 	apiURL := c.cfg.APIBase + "/cgi-bin/gettoken?corpid=" + url.QueryEscape(corpID) +
 		"&corpsecret=" + url.QueryEscape(secret)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	resp, err := c.client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("wxkf gettoken: %w", channels.ScrubError(err))
+		return nil, fmt.Errorf("wxkf gettoken: %w", channels.ScrubError(err))
 	}
 	defer func() { _ = resp.Body.Close() }()
 	var result struct {
@@ -567,28 +596,40 @@ func (c *Channel) getAccessToken(ctx context.Context, corpID, secretRef string) 
 		ExpiresIn   int    `json:"expires_in"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return "", fmt.Errorf("wxkf gettoken decode: %w", err)
+		return nil, fmt.Errorf("wxkf gettoken decode: %w", err)
 	}
 	if result.ErrCode != 0 || result.AccessToken == "" {
-		return "", fmt.Errorf("wxkf gettoken: errcode %d", result.ErrCode)
+		return nil, fmt.Errorf("wxkf gettoken: errcode %d", result.ErrCode)
 	}
 	ttl := time.Duration(result.ExpiresIn)*time.Second - tokenExpiryMargin
 	if ttl <= 0 {
 		ttl = time.Hour
 	}
-	if len(c.tokens) >= maxTokenCacheEntries {
-		// Bindings come and go; a wholesale reset bounds the map without
-		// correctness impact (the next send per identity re-authenticates).
-		c.tokens = map[string]tokenEntry{}
+	c.tokenMu.Lock()
+	defer c.tokenMu.Unlock()
+	// Evict the least recently used identity when full: a wholesale reset
+	// would re-authenticate every live binding at once.
+	for len(c.tokens) >= maxTokenCacheEntries {
+		back := c.tokenOrder.Back()
+		if back == nil {
+			break
+		}
+		delete(c.tokens, back.Value.(string))
+		c.tokenOrder.Remove(back)
 	}
-	c.tokens[key] = tokenEntry{token: result.AccessToken, expiry: time.Now().Add(ttl)}
+	elem := c.tokenOrder.PushFront(key)
+	c.tokens[key] = tokenEntry{token: result.AccessToken, expiry: time.Now().Add(ttl), elem: elem}
 	return result.AccessToken, nil
 }
 
 func (c *Channel) invalidateToken(corpID, secretRef string) {
 	c.tokenMu.Lock()
 	defer c.tokenMu.Unlock()
-	delete(c.tokens, corpID+"|"+secretRef)
+	key := corpID + "|" + secretRef
+	if e, ok := c.tokens[key]; ok && e.elem != nil {
+		c.tokenOrder.Remove(e.elem)
+	}
+	delete(c.tokens, key)
 }
 
 // splitText breaks s into segments of at most n bytes, on rune boundaries.
