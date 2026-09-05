@@ -63,7 +63,7 @@ func TestSplitText(t *testing.T) {
 		{"exact fit", "hello", 5, []string{"hello"}},
 		{"ascii split", "hello", 2, []string{"he", "ll", "o"}},
 		{"empty", "", 4, []string{""}},
-		// Each 中文 rune is 3 bytes: n=3 yields one rune per segment, and the
+		// Each Chinese rune is 3 bytes: n=3 yields one rune per segment, and the
 		// segments reassemble losslessly.
 		{"cjk", "中文中文", 3, []string{"中", "文", "中", "文"}},
 		{"cjk multi-rune chunks", "中文中文", 6, []string{"中文", "中文"}},
