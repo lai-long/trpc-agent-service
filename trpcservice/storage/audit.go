@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	plog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/metrics"
 )
 
 // AuditEvent is one row of the audit_log table.
@@ -74,6 +75,14 @@ type Auditor struct {
 // Dropped returns how many events were lost to a sustained queue overload
 // (compliance: a non-zero value means the audit trail has holes).
 func (a *Auditor) Dropped() uint64 { return a.dropped.Load() }
+
+// markDropped records lost events on the in-process counter and the
+// audit_dropped_total metric: operations discovers a hole in the compliance
+// trail from the dashboard, not from grepping logs.
+func (a *Auditor) markDropped(n uint64) {
+	metrics.AuditDroppedTotal.Add(context.Background(), int64(n))
+	a.dropped.Add(n)
+}
 
 // NewAuditor creates an Auditor on an established pool.
 func NewAuditor(pool *pgxpool.Pool) *Auditor {
@@ -162,8 +171,9 @@ func (a *Auditor) LogAsync(ev AuditEvent) {
 	select {
 	case a.ch <- ev:
 	case <-timer.C:
+		a.markDropped(1)
 		plog.Errorf("audit queue full, dropped %s event (trace=%s, dropped_total=%d)",
-			ev.Decision, ev.TraceID, a.dropped.Add(1))
+			ev.Decision, ev.TraceID, a.dropped.Load())
 	}
 }
 
@@ -221,8 +231,8 @@ func (a *Auditor) recoverPerRow(events []AuditEvent) {
 		if err == nil {
 			continue
 		}
+		a.markDropped(1)
 		plog.Errorf("audit event dropped (trace=%s, decision=%s): %v", ev.TraceID, ev.Decision, err)
-		a.dropped.Add(1)
 	}
 }
 

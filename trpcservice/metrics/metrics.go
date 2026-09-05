@@ -61,6 +61,9 @@ var (
 	// SendRateLimitedTotal counts outbound messages re-queued because the
 	// per-{channel, tenant} send bucket was exhausted within the wait window.
 	SendRateLimitedTotal otelmetric.Int64Counter
+	// AuditDroppedTotal counts audit events lost (queue overload, rows the
+	// schema rejected): a non-zero rate means the compliance trail has holes.
+	AuditDroppedTotal otelmetric.Int64Counter
 )
 
 func init() {
@@ -93,6 +96,9 @@ func init() {
 		panic(err)
 	}
 	if SendRateLimitedTotal, err = meter.Int64Counter("send_rate_limited_total"); err != nil {
+		panic(err)
+	}
+	if AuditDroppedTotal, err = meter.Int64Counter("audit_dropped_total"); err != nil {
 		panic(err)
 	}
 }
