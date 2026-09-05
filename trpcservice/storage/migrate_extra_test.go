@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	"trpc.group/trpc-go/trpc-agent-go/event"
+	"trpc.group/trpc-go/trpc-agent-go/model"
 	"trpc.group/trpc-go/trpc-agent-go/session"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/storage"
@@ -561,5 +563,345 @@ func TestMigratorRunMarksBadBackendPairFailed(t *testing.T) {
 	}
 	if !strings.Contains(failure, "backend pair") {
 		t.Fatalf("the failure reason must name the backend pair, got %q", failure)
+	}
+}
+
+// roleTextEvent is textEvent with the message role under the test's control —
+// ApplyEventFiltering keys on it, so a journal that opens without a user
+// message needs genuinely non-user events to prove anything.
+func roleTextEvent(id string, role model.Role, content string) *event.Event {
+	return &event.Event{
+		ID:     id,
+		Author: string(role),
+		Response: &model.Response{Choices: []model.Choice{{
+			Message: model.Message{Role: role, Content: content},
+		}}},
+	}
+}
+
+// Dual write is live the whole time a migration runs, and the fanout writes
+// the SECONDARY first — so by the time the backfill reaches a session, the
+// target already holds the source's newest events at seqs 1..k. The old copy
+// upserted the source's i-th event at seq i+1 with ON CONFLICT DO NOTHING,
+// which dropped the source's first k events (their seqs were taken), left the
+// tail duplicated at both ends, and still added up to the source's row count —
+// so the count-based check blessed the read switch onto a scrambled journal.
+// The copy must reconcile by event ID and reorder the target into the source's
+// order instead.
+func TestMigratorReconcilesDualWriteTailByEventID(t *testing.T) {
+	_, pool := pgSessionService(t)
+	rdb := redisOrSkipForMigrate(t)
+	redisSvc := redisSessionService(t)
+	pgSvc := storage.NewPGSessionService(pool)
+	ctx := context.Background()
+
+	tenantID := uniqueUUID("fffffff4")
+	appID := uniqueUUID("fffffff3")
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO tenant (id, name, status) VALUES ($1, 'migrate-dual-write', 'active')`, tenantID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO agent_app (id, tenant_id, name, agent_type, config, version, status)
+		 VALUES ($1, $2, 'migrate-dual-write', 'llm', '{}', 1, 'published')`, appID, tenantID); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), `DELETE FROM agent_app WHERE id = $1`, appID)
+		_, _ = pool.Exec(context.Background(), `DELETE FROM tenant WHERE id = $1`, tenantID)
+	})
+
+	key := session.Key{AppName: appID, UserID: "u-tail", SessionID: "dm:mock:tail-" + t.Name()}
+	cleanupSession(t, pool, key)
+	t.Cleanup(func() { cleanupSession(t, pool, key) })
+	t.Cleanup(func() { _ = redisSvc.DeleteSession(context.Background(), key) })
+
+	// History the session already had when the migration row was created.
+	rSess, err := redisSvc.CreateSession(ctx, key, session.StateMap{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"tail-e1", "tail-e2"} {
+		if err := redisSvc.AppendEvent(ctx, rSess, textEvent(id, "user", "迁移前的历史")); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var migID string
+	if err := pool.QueryRow(ctx,
+		`INSERT INTO storage_migration (tenant_id, resource, from_backend, to_backend, phase)
+		 VALUES ($1, 'session', 'redis', 'postgres', 'dual_write') RETURNING id`,
+		tenantID).Scan(&migID); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), `DELETE FROM storage_migration WHERE id = $1`, migID)
+		_, _ = pool.Exec(context.Background(), `UPDATE tenant SET storage_config = NULL WHERE id = $1`, tenantID)
+	})
+
+	// The live tail during dual write: the fanout writes the secondary (the PG
+	// target) FIRST with the same event object, so the target holds the
+	// source's newest events before the backfill ever reaches this session.
+	pSess, err := pgSvc.CreateSession(ctx, key, rSess.State)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range []*event.Event{
+		textEvent("tail-e3", "user", "迁移中的新消息"),
+		textEvent("tail-e4", "user", "迁移中的更新消息"),
+	} {
+		if err := pgSvc.AppendEvent(ctx, pSess, e); err != nil {
+			t.Fatal(err)
+		}
+		if err := redisSvc.AppendEvent(ctx, rSess, e); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	m := storage.NewMigrator(pool, rdb,
+		map[string]session.Service{"redis": redisSvc, "postgres": pgSvc}, 50*time.Millisecond)
+
+	var phase, failureText string
+	for i := 0; i < 8; i++ {
+		if err := m.Tick(ctx); err != nil {
+			t.Fatalf("tick %d: %v", i, err)
+		}
+		if err := pool.QueryRow(ctx,
+			`SELECT phase, COALESCE(error, '') FROM storage_migration WHERE id = $1`,
+			migID).Scan(&phase, &failureText); err != nil {
+			t.Fatal(err)
+		}
+		if phase != tenant.PhaseDualWrite && phase != tenant.PhaseBackfilling {
+			break
+		}
+	}
+	if phase != tenant.PhaseObserving {
+		t.Fatalf("want phase observing after the read switch, got %s (%s)", phase, failureText)
+	}
+
+	// The target journal must be the source journal, event by event, in seq
+	// order: prefix restored, tail de-duplicated, nothing parked in between.
+	journal, err := pgSvc.FullJournal(ctx, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"tail-e1", "tail-e2", "tail-e3", "tail-e4"}
+	if len(journal) != len(want) {
+		t.Fatalf("target journal must hold %d events, got %d: %+v", len(want), len(journal), journal)
+	}
+	for i, id := range want {
+		if journal[i].ID != id {
+			t.Fatalf("target event %d must be %s, got %s (journal %+v)", i, id, journal[i].ID, journal)
+		}
+	}
+}
+
+// The redis source journal must be read past GetSession, not through it:
+// every read applies ApplyEventFiltering, which keeps only the newest
+// sessionEventLimit events (1000 in production) and then anchors the head to
+// the first user message. Copying that view leaves the head behind while the
+// copy still looks complete to anything that counts it — the mirror image of
+// the postgres summary/archive truncation.
+func TestMigratorCopiesRedisJournalPastGetSessionTruncation(t *testing.T) {
+	_, pool := pgSessionService(t)
+	rdb := redisOrSkipForMigrate(t)
+	redisSvc := redisSessionService(t)
+	pgSvc := storage.NewPGSessionService(pool)
+	ctx := context.Background()
+
+	tenantID := uniqueUUID("ffffffef")
+	appID := uniqueUUID("ffffffee")
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO tenant (id, name, status) VALUES ($1, 'migrate-redis-trunc', 'active')`, tenantID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO agent_app (id, tenant_id, name, agent_type, config, version, status)
+		 VALUES ($1, $2, 'migrate-redis-trunc', 'llm', '{}', 1, 'published')`, appID, tenantID); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), `DELETE FROM agent_app WHERE id = $1`, appID)
+		_, _ = pool.Exec(context.Background(), `DELETE FROM tenant WHERE id = $1`, tenantID)
+	})
+
+	key := session.Key{AppName: appID, UserID: "u-trunc", SessionID: "dm:mock:trunc-" + t.Name()}
+	cleanupSession(t, pool, key)
+	t.Cleanup(func() { cleanupSession(t, pool, key) })
+	t.Cleanup(func() { _ = redisSvc.DeleteSession(context.Background(), key) })
+
+	rSess, err := redisSvc.CreateSession(ctx, key, session.StateMap{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A journal that opens without a user message — channel adapters can
+	// write welcome/system events before the first user turn. Timestamps are
+	// explicit: the redis zset is scored by event timestamp, and zero-value
+	// timestamps would reorder the journal by event ID.
+	base := time.Now()
+	for i, e := range []*event.Event{
+		roleTextEvent("tr-a1", model.RoleAssistant, "欢迎语，任何用户消息之前"),
+		roleTextEvent("tr-u1", model.RoleUser, "第一条用户消息"),
+		roleTextEvent("tr-a2", model.RoleAssistant, "回复"),
+	} {
+		e.Timestamp = base.Add(time.Duration(i) * time.Second)
+		if err := redisSvc.AppendEvent(ctx, rSess, e); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Premise: GetSession really does drop the head — the stored journal holds
+	// three events, the read returns two.
+	view, err := redisSvc.GetSession(ctx, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(view.Events) != 2 || view.Events[0].ID != "tr-u1" {
+		t.Fatalf("precondition: GetSession must expose only [tr-u1, tr-a2], got %+v", view.Events)
+	}
+
+	var migID string
+	if err := pool.QueryRow(ctx,
+		`INSERT INTO storage_migration (tenant_id, resource, from_backend, to_backend, phase)
+		 VALUES ($1, 'session', 'redis', 'postgres', 'dual_write') RETURNING id`,
+		tenantID).Scan(&migID); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), `DELETE FROM storage_migration WHERE id = $1`, migID)
+		_, _ = pool.Exec(context.Background(), `UPDATE tenant SET storage_config = NULL WHERE id = $1`, tenantID)
+	})
+
+	m := storage.NewMigrator(pool, rdb,
+		map[string]session.Service{"redis": redisSvc, "postgres": pgSvc}, 50*time.Millisecond)
+
+	var phase, failureText string
+	for i := 0; i < 8; i++ {
+		if err := m.Tick(ctx); err != nil {
+			t.Fatalf("tick %d: %v", i, err)
+		}
+		if err := pool.QueryRow(ctx,
+			`SELECT phase, COALESCE(error, '') FROM storage_migration WHERE id = $1`,
+			migID).Scan(&phase, &failureText); err != nil {
+			t.Fatal(err)
+		}
+		if phase != tenant.PhaseDualWrite && phase != tenant.PhaseBackfilling {
+			break
+		}
+	}
+	if phase != tenant.PhaseObserving {
+		t.Fatalf("want phase observing after the read switch, got %s (%s)", phase, failureText)
+	}
+
+	journal, err := pgSvc.FullJournal(ctx, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"tr-a1", "tr-u1", "tr-a2"}
+	if len(journal) != len(want) {
+		t.Fatalf("the whole journal must cross over, got %+v", journal)
+	}
+	for i, id := range want {
+		if journal[i].ID != id {
+			t.Fatalf("event %d: want %s, got %s", i, id, journal[i].ID)
+		}
+	}
+}
+
+// An event that reached the target but never the source (the fanout writes the
+// secondary first; if the primary write then fails, the shadow stays) must
+// park the migration in "failed" with the extra named, not flip reads onto a
+// journal the source cannot reproduce.
+func TestMigratorFailsClosedOnTargetOnlyEvent(t *testing.T) {
+	_, pool := pgSessionService(t)
+	rdb := redisOrSkipForMigrate(t)
+	redisSvc := redisSessionService(t)
+	pgSvc := storage.NewPGSessionService(pool)
+	ctx := context.Background()
+
+	tenantID := uniqueUUID("ffffffed")
+	appID := uniqueUUID("ffffffec")
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO tenant (id, name, status) VALUES ($1, 'migrate-extra-event', 'active')`, tenantID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO agent_app (id, tenant_id, name, agent_type, config, version, status)
+		 VALUES ($1, $2, 'migrate-extra-event', 'llm', '{}', 1, 'published')`, appID, tenantID); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), `DELETE FROM agent_app WHERE id = $1`, appID)
+		_, _ = pool.Exec(context.Background(), `DELETE FROM tenant WHERE id = $1`, tenantID)
+	})
+
+	key := session.Key{AppName: appID, UserID: "u-extra", SessionID: "dm:mock:extra-" + t.Name()}
+	cleanupSession(t, pool, key)
+	t.Cleanup(func() { cleanupSession(t, pool, key) })
+	t.Cleanup(func() { _ = redisSvc.DeleteSession(context.Background(), key) })
+
+	rSess, err := redisSvc.CreateSession(ctx, key, session.StateMap{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pSess, err := pgSvc.CreateSession(ctx, key, session.StateMap{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// e1 made it to both sides; x2 only to the target.
+	if err := redisSvc.AppendEvent(ctx, rSess, textEvent("extra-e1", "user", "两边都有")); err != nil {
+		t.Fatal(err)
+	}
+	if err := pgSvc.AppendEvent(ctx, pSess, textEvent("extra-e1", "user", "两边都有")); err != nil {
+		t.Fatal(err)
+	}
+	if err := pgSvc.AppendEvent(ctx, pSess, textEvent("extra-x2", "user", "只在目标端")); err != nil {
+		t.Fatal(err)
+	}
+
+	var migID string
+	if err := pool.QueryRow(ctx,
+		`INSERT INTO storage_migration (tenant_id, resource, from_backend, to_backend, phase)
+		 VALUES ($1, 'session', 'redis', 'postgres', 'dual_write') RETURNING id`,
+		tenantID).Scan(&migID); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), `DELETE FROM storage_migration WHERE id = $1`, migID)
+		_, _ = pool.Exec(context.Background(), `UPDATE tenant SET storage_config = NULL WHERE id = $1`, tenantID)
+	})
+
+	m := storage.NewMigrator(pool, rdb,
+		map[string]session.Service{"redis": redisSvc, "postgres": pgSvc}, 50*time.Millisecond)
+
+	var phase, failureText string
+	for i := 0; i < 8; i++ {
+		if err := m.Tick(ctx); err != nil {
+			t.Fatalf("tick %d: %v", i, err)
+		}
+		if err := pool.QueryRow(ctx,
+			`SELECT phase, COALESCE(error, '') FROM storage_migration WHERE id = $1`,
+			migID).Scan(&phase, &failureText); err != nil {
+			t.Fatal(err)
+		}
+		if phase != tenant.PhaseDualWrite && phase != tenant.PhaseBackfilling {
+			break
+		}
+	}
+	if phase != tenant.PhaseFailed {
+		t.Fatalf("an event only the target holds must fail the migration, got phase %s", phase)
+	}
+	if !strings.Contains(failureText, "extra-x2") {
+		t.Fatalf("the failure must name the extra event, got %q", failureText)
+	}
+
+	// The read switch must not have fired.
+	var storageCfg string
+	if err := pool.QueryRow(ctx,
+		`SELECT COALESCE(storage_config::text, '') FROM tenant WHERE id = $1`, tenantID).Scan(&storageCfg); err != nil {
+		t.Fatal(err)
+	}
+	if storageCfg != "" {
+		t.Fatalf("reads must stay on the old backend after a failed check, got %s", storageCfg)
 	}
 }

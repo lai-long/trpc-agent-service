@@ -242,27 +242,40 @@ func (s *PGSessionService) FullJournal(ctx context.Context, key session.Key) ([]
 	return out, rows.Err()
 }
 
-// CountFullJournal is FullJournal's length without materializing the events:
-// the migration's consistency check compares counts, and a session whose
-// history the sweep has been archiving for a year holds far more than the
-// runner ever loads.
-func (s *PGSessionService) CountFullJournal(ctx context.Context, key session.Key) (int, error) {
+// FullJournalIDs is FullJournal reduced to the ordered event IDs. The
+// migration's consistency check compares the two backends' journals as ID
+// multisets, and IDs alone keep a 100k-event session a few hundred kilobytes
+// instead of its full JSON. event->>'id' is the framework's event identity —
+// the summary boundary already keys on it, and dual write preserves it
+// because the fanout hands both backends the same event — so an ID that
+// appears on both sides is the same event.
+func (s *PGSessionService) FullJournalIDs(ctx context.Context, key session.Key) ([]string, error) {
 	if err := key.CheckSessionKey(); err != nil {
-		return 0, err
+		return nil, err
 	}
 	sessID, err := s.sessionID(ctx, key)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 	if sessID == "" {
-		return 0, nil
+		return nil, nil
 	}
-	var n int
-	if err := s.pool.QueryRow(ctx,
-		`SELECT COUNT(*) FROM (`+fullJournalTables+`) journal`, sessID).Scan(&n); err != nil {
-		return 0, fmt.Errorf("count full journal: %w", err)
+	rows, err := s.pool.Query(ctx,
+		`SELECT COALESCE(event->>'id', '') FROM (`+fullJournalTables+`) journal ORDER BY event_seq`, sessID)
+	if err != nil {
+		return nil, fmt.Errorf("query full journal ids: %w", err)
 	}
-	return n, nil
+	defer rows.Close()
+
+	var out []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan event id: %w", err)
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
 }
 
 // ListSessions implements session.Service.

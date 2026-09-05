@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -26,10 +27,11 @@ import (
 // Dual write is live from row creation (the assembler fans writes out for
 // tenants with an active migration). The Migrator drives the rest: copy the
 // tenant's sessions from the old backend to the new (batched, resumable by
-// cursor), run the consistency check (per-session event counts must match),
-// flip tenant.storage_config (read switch), keep dual write through the
-// observation window, then finish. Any failure parks the row in "failed"
-// with the reason — reads never switch on a failed check.
+// cursor), run the consistency check (the two journals must agree event ID by
+// event ID — a count match is not agreement), flip tenant.storage_config
+// (read switch), keep dual write through the observation window, then finish.
+// Any failure parks the row in "failed" with the reason — reads never switch
+// on a failed check.
 type Migrator struct {
 	pool     *pgxpool.Pool
 	rdb      *redis.Client // enumerate + publish invalidation on read switch
@@ -52,8 +54,8 @@ type migrationProgress struct {
 	// single-dimension cursor steps over the second of two apps that share a
 	// session_key and never migrates it. A progress row written before this
 	// split carries only Cursor; CursorApp then reads empty, which restarts
-	// enumeration from the beginning — safe, because copySession skips the
-	// event prefix the target already holds.
+	// enumeration from the beginning — safe, because copySession reconciles
+	// by event ID and appends only what the target journal is still missing.
 	CursorApp    string    `json:"cursor_app,omitempty"`
 	Cursor       string    `json:"cursor,omitempty"`
 	Mismatches   []string  `json:"mismatches,omitempty"` // consistency check failures
@@ -196,9 +198,9 @@ func (m *Migrator) backfill(ctx context.Context, tx pgx.Tx, mig migrationRow) er
 		return m.setPhase(ctx, tx, mig.ID, tenant.PhaseBackfilling, mig.Progress)
 	}
 
-	// Everything copied: consistency check gates the read switch;
-	// per-session event counts must match.
-	mismatches, err := m.checkConsistency(ctx, mig, src, dst)
+	// Everything copied: the consistency check gates the read switch; both
+	// journals must agree event by event.
+	mismatches, err := m.checkConsistency(ctx, mig)
 	if err != nil {
 		return err
 	}
@@ -351,10 +353,12 @@ func (m *Migrator) enumerateRedis(ctx context.Context, tenantID string, cursor e
 	return out, nil
 }
 
-// copySession copies one session, resuming partial copies: the target's
-// existing event prefix is skipped (events are append-only and ordered, and
-// both targets dedupe — PG via the (session_id, event_seq) constraint, redis
-// via zset member equality on identical event JSON).
+// copySession copies one session, reconciling by event ID so it is idempotent
+// and safe against dual write: writes are already fanned out to the target
+// while the backfill runs, so the target may hold the source's live tail
+// before this copy delivers the prefix — position-based skipping cannot
+// describe that state, but "an event is either on the target or it is not"
+// does, on both backends.
 func (m *Migrator) copySession(ctx context.Context, mig migrationRow, src, dst session.Service, key session.Key) error {
 	srcSess, err := src.GetSession(ctx, key)
 	if err != nil {
@@ -363,50 +367,139 @@ func (m *Migrator) copySession(ctx context.Context, mig migrationRow, src, dst s
 	if srcSess == nil {
 		return nil // vanished between enumerate and copy
 	}
-	// A postgres source has to be read past GetSession: that returns only the
-	// events after the summary and only those the archive sweep has not moved
-	// out, so copying through it silently leaves the summarized and archived
-	// history behind — for a long-lived session it copies nothing at all.
+	// The journal must not be read through GetSession on either backend. A
+	// postgres source truncates at the summary cursor and the archive
+	// boundary; a redis source caps at sessionEventLimit (1000 by default)
+	// and then anchors the head to the first user message — copying through
+	// either view silently leaves history behind while the copy still looks
+	// complete to anything that counts it.
 	events := srcSess.Events
-	if pg, ok := src.(*PGSessionService); ok {
-		if events, err = pg.FullJournal(ctx, key); err != nil {
-			return fmt.Errorf("read source journal: %w", err)
+	switch mig.From {
+	case "postgres":
+		if pg, ok := src.(*PGSessionService); ok {
+			if events, err = pg.FullJournal(ctx, key); err != nil {
+				return fmt.Errorf("read source journal: %w", err)
+			}
 		}
-	}
-
-	dstSess, err := dst.GetSession(ctx, key)
-	if err != nil {
-		return fmt.Errorf("read target: %w", err)
-	}
-	existing := 0
-	if dstSess != nil {
-		existing = len(dstSess.Events)
+	case "redis":
+		if events, err = m.fullJournalRedis(ctx, key); err != nil {
+			return err
+		}
 	}
 
 	if mig.To == "postgres" {
 		return m.writeSessionToPG(ctx, mig.TenantID, srcSess, events)
 	}
-	// Redis target: create (idempotent) then append the missing tail.
-	// AppendEvent mutates the carrier session's event list, so the destination's
-	// own session object is the carrier and the loop indexes a slice it does not
-	// grow.
-	dstSessNew, err := dst.CreateSession(ctx, key, srcSess.State)
+	// Redis target: create (idempotent), then append exactly the events the
+	// target does not already hold, identified by event ID. The old positional
+	// skip ("append source events from len(target events) onward") read the
+	// target's count and assumed its rows were the source's prefix — with
+	// dual write live they are the source's NEWEST events, so the skip
+	// discarded the prefix entirely. Redis storage is ID-keyed (hash field =
+	// event ID, zset member = event ID), so an event already present cannot be
+	// duplicated anyway, and the zset is scored by timestamp: append order does
+	// not decide read order. AppendEvent mutates the carrier session's event
+	// list, so the destination's own session object is the carrier.
+	dstSess, err := dst.CreateSession(ctx, key, srcSess.State)
 	if err != nil {
 		return fmt.Errorf("create target session: %w", err)
 	}
-	for i := existing; i < len(events); i++ {
+	have := make(map[string]bool)
+	targetIDs, err := m.journalIDs(ctx, mig.To, key)
+	if err != nil {
+		return err
+	}
+	for _, id := range targetIDs {
+		have[id] = true
+	}
+	for i := range events {
+		if have[events[i].ID] {
+			continue
+		}
 		evt := events[i]
-		if err := dst.AppendEvent(ctx, dstSessNew, &evt); err != nil {
-			return fmt.Errorf("append event %d: %w", i, err)
+		if err := dst.AppendEvent(ctx, dstSess, &evt); err != nil {
+			return fmt.Errorf("append event %s: %w", evt.ID, err)
 		}
 	}
 	return nil
 }
 
-// writeSessionToPG writes the session row + the given journal with its original
-// order as event_seq, idempotently (ON CONFLICT DO NOTHING on both tables). The
-// events are a parameter rather than sess.Events because the caller may have
-// read them past GetSession's summary/archive truncation.
+// redisEventKeys are the framework's hashidx event keys (session/redis v1.11
+// default layout, the same one enumerateRedis scans): evtidx:time is a zset of
+// event ID scored by timestamp — the order the framework reads events in —
+// and evtdata a hash of event ID → event JSON, both written atomically by the
+// append script.
+func redisEventKeys(k session.Key) (idxKey, dataKey string) {
+	return fmt.Sprintf("hashidx:evtidx:time:%s:{%s}:%s", k.AppName, k.UserID, k.SessionID),
+		fmt.Sprintf("hashidx:evtdata:%s:{%s}:%s", k.AppName, k.UserID, k.SessionID)
+}
+
+// redisHMGetChunk bounds one HMGET so a very long journal does not turn into
+// one unbounded redis request.
+const redisHMGetChunk = 1000
+
+// fullJournalRedis reads one session's complete journal straight from the
+// hashidx layout. GetSession cannot serve this read: beyond the 1000-event
+// cap it also drops the head up to the first user message, and there is no
+// option to widen on the service the migrator is handed — the raw keys are
+// the only full-journal view a redis backend has.
+func (m *Migrator) fullJournalRedis(ctx context.Context, key session.Key) ([]event.Event, error) {
+	idxKey, dataKey := redisEventKeys(key)
+	ids, err := m.rdb.ZRange(ctx, idxKey, 0, -1).Result()
+	if err != nil {
+		return nil, fmt.Errorf("read redis event index: %w", err)
+	}
+	var out []event.Event
+	for start := 0; start < len(ids); start += redisHMGetChunk {
+		end := min(start+redisHMGetChunk, len(ids))
+		vals, err := m.rdb.HMGet(ctx, dataKey, ids[start:end]...).Result()
+		if err != nil {
+			return nil, fmt.Errorf("read redis events: %w", err)
+		}
+		for i, v := range vals {
+			raw, ok := v.(string)
+			if !ok {
+				// The event vanished between the two reads; the consistency
+				// check re-reads both journals and reports the gap.
+				continue
+			}
+			var evt event.Event
+			if err := json.Unmarshal([]byte(raw), &evt); err != nil {
+				return nil, fmt.Errorf("decode redis event %s: %w", ids[start+i], err)
+			}
+			out = append(out, evt)
+		}
+	}
+	return out, nil
+}
+
+// writeSessionToPG makes the target journal exactly the source journal,
+// reconciled by event ID rather than by position. The events are a parameter
+// rather than sess.Events because the caller may have read them past
+// GetSession's summary/archive truncation.
+//
+// Positional upserts assumed the target's existing rows were the source's
+// prefix. Dual write breaks that assumption from the moment the migration row
+// is created: the fanout appends the live tail to a still-EMPTY target, so the
+// target's seqs 1..k hold the source's NEWEST k events. The positional ON
+// CONFLICT (session_id, event_seq) DO NOTHING then dropped the source's first
+// k events on the floor (their seqs were already taken), left the tail
+// duplicated at both ends of the journal, and still added up to the source's
+// row count — the count-based consistency check passed, the read switch
+// flipped, and the new backend served a scrambled journal with no error
+// anywhere.
+//
+// The reconcile runs under the session row lock (the same FOR UPDATE
+// AppendEvent's ensureSession takes), so a dual-write append racing this copy
+// either committed before it — its event is part of the plan: a row matched
+// to its source position, or an extra parked beyond the prefix — or waits for
+// the commit and takes the next seq. Rows are matched on event->>'id', the
+// framework's event identity, which dual write preserves because the fanout
+// hands both backends the same event; a re-run therefore plans no moves and
+// no inserts. No row is ever deleted: ids stay stable for
+// summary.covered_event_id, and an event the source never saw (its primary
+// write failed) stays on the target as a visible extra the consistency check
+// reports instead of a silently vanished row.
 func (m *Migrator) writeSessionToPG(ctx context.Context, tenantID string, sess *session.Session, events []event.Event) error {
 	tx, err := m.pool.Begin(ctx)
 	if err != nil {
@@ -418,7 +511,140 @@ func (m *Migrator) writeSessionToPG(ctx context.Context, tenantID string, sess *
 	if err != nil {
 		return err
 	}
+	sessID, err := m.lockTargetSession(ctx, tx, tenantID, sess, stateJSON)
+	if err != nil {
+		return err
+	}
+
+	// The target's journal by event ID, in seq order.
+	type targetRow struct {
+		rowID   string
+		seq     int64
+		eventID string
+	}
+	var (
+		byID     = make(map[string]targetRow, len(events)) // event ID → row
+		seqOrder []targetRow                               // every row, seq-ordered
+	)
+	rows, err := tx.Query(ctx,
+		`SELECT id, event_seq, COALESCE(event->>'id', '') FROM session_event
+		 WHERE session_id = $1 ORDER BY event_seq`, sessID)
+	if err != nil {
+		return fmt.Errorf("read target journal: %w", err)
+	}
+	for rows.Next() {
+		var r targetRow
+		if err := rows.Scan(&r.rowID, &r.seq, &r.eventID); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan target event: %w", err)
+		}
+		if r.eventID != "" {
+			byID[r.eventID] = r // last row wins: an ID held twice keeps one, the other becomes an extra
+		}
+		seqOrder = append(seqOrder, r)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("iterate target journal: %w", err)
+	}
+	rows.Close()
+
+	// Plan. Each source event claims its 1-based position; the row holding it
+	// moves there if it is not already there, and a missing event is inserted
+	// at it. Target rows no source event claims (the dual-written tail whose
+	// primary write had not landed yet, or a duplicate ID) are parked beyond
+	// the prefix in their current order — they are by construction newer than
+	// everything in the source snapshot, so the end is their chronological
+	// place.
+	finalSeq := make(map[string]int64, len(seqOrder))
+	var missing []struct {
+		evt event.Event
+		seq int64
+	}
+	for i := range events {
+		pos := int64(i + 1)
+		if r, ok := byID[events[i].ID]; ok {
+			finalSeq[r.rowID] = pos
+			continue
+		}
+		missing = append(missing, struct {
+			evt event.Event
+			seq int64
+		}{events[i], pos})
+	}
+	next := int64(len(events) + 1)
+	for _, r := range seqOrder {
+		if _, claimed := finalSeq[r.rowID]; !claimed {
+			finalSeq[r.rowID] = next
+			next++
+		}
+	}
+
+	// Place. A mover's destination is always free (each position is claimed by
+	// at most one row, and non-movers already sit on theirs), but a mover's
+	// ORIGIN may still be occupied by another mover's destination, so every
+	// mover first vacates to the negation of its current seq — distinct seqs
+	// negate to distinct seqs, and the negative range is unreachable for the
+	// append path, which only ever takes max+1.
+	var movers []string
+	for _, r := range seqOrder {
+		if finalSeq[r.rowID] != r.seq {
+			movers = append(movers, r.rowID)
+		}
+	}
+	if len(movers) > 0 {
+		if _, err := tx.Exec(ctx,
+			`UPDATE session_event SET event_seq = -event_seq
+			 WHERE session_id = $1 AND id = ANY($2)`, sessID, movers); err != nil {
+			return fmt.Errorf("vacate target events: %w", err)
+		}
+		for rowID, seq := range finalSeq {
+			if _, err := tx.Exec(ctx,
+				`UPDATE session_event SET event_seq = $3 WHERE session_id = $1 AND id = $2`,
+				sessID, rowID, seq); err != nil {
+				return fmt.Errorf("move target event to seq %d: %w", seq, err)
+			}
+		}
+	}
+	// Missing events insert at their source positions. No ON CONFLICT: every
+	// conflicting position was vacated above, so a collision here means the
+	// plan is wrong, and failing the session loudly beats storing a scrambled
+	// journal a count check would later bless.
+	for _, miss := range missing {
+		raw, err := json.Marshal(miss.evt)
+		if err != nil {
+			return fmt.Errorf("marshal event %s: %w", miss.evt.ID, err)
+		}
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO session_event (session_id, event_seq, event) VALUES ($1, $2, $3)`,
+			sessID, miss.seq, raw); err != nil {
+			return fmt.Errorf("insert event %s at seq %d: %w", miss.evt.ID, miss.seq, err)
+		}
+	}
+	return tx.Commit(ctx)
+}
+
+// lockTargetSession returns the target session's UUID under the row lock the
+// append path takes, inserting the row when absent. The lock is what makes
+// the rewrite atomic against dual write: an AppendEvent for this session
+// either waits for the reconcile to commit and then takes max(seq)+1, or
+// committed first and its event is part of the plan.
+func (m *Migrator) lockTargetSession(ctx context.Context, tx pgx.Tx, tenantID string, sess *session.Session, stateJSON []byte) (string, error) {
 	var sessID string
+	err := tx.QueryRow(ctx,
+		`SELECT id FROM session WHERE app_id = $1 AND session_key = $2 FOR UPDATE`,
+		sess.AppName, sess.ID).Scan(&sessID)
+	if err == nil {
+		return sessID, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return "", fmt.Errorf("lock target session: %w", err)
+	}
+	// State is only seeded on insert: an existing row's snapshot was written
+	// by dual write's AppendEvent, which stores the runner's complete state —
+	// newer than anything this copy read. The conflict arm exists for a
+	// concurrent first insert; ON CONFLICT DO UPDATE takes the row lock, so
+	// the returned id is locked too.
 	err = tx.QueryRow(ctx,
 		`INSERT INTO session (tenant_id, app_id, session_key, user_id, channel, state)
 		 VALUES ($1, $2, $3, $4, $5, $6)
@@ -426,46 +652,103 @@ func (m *Migrator) writeSessionToPG(ctx context.Context, tenantID string, sess *
 		 RETURNING id`,
 		tenantID, sess.AppName, sess.ID, sess.UserID, channelOf(sess.ID), stateJSON).Scan(&sessID)
 	if err != nil {
-		return fmt.Errorf("upsert session: %w", err)
+		return "", fmt.Errorf("upsert target session: %w", err)
 	}
-	for i, evt := range events {
-		raw, err := json.Marshal(evt)
-		if err != nil {
-			return fmt.Errorf("marshal event %d: %w", i, err)
-		}
-		if _, err := tx.Exec(ctx,
-			`INSERT INTO session_event (session_id, event_seq, event) VALUES ($1, $2, $3)
-			 ON CONFLICT (session_id, event_seq) DO NOTHING`,
-			sessID, i+1, raw); err != nil {
-			return fmt.Errorf("insert event %d: %w", i+1, err)
-		}
-	}
-	return tx.Commit(ctx)
+	return sessID, nil
 }
 
-// checkConsistency compares per-session event counts between the backends.
-// Returns the mismatching session keys.
-func (m *Migrator) checkConsistency(ctx context.Context, mig migrationRow, src, dst session.Service) ([]string, error) {
+// checkConsistency compares the two backends' full journals, session by
+// session, as event-ID multisets, and returns the mismatching sessions.
+//
+// Counting was never enough: a dual-write tail that reached the target before
+// the backfill copied the prefix leaves both sides holding the same NUMBER of
+// events — the target's first k seqs hold the source's last k events — so a
+// count check blessed the read switch while the journal was scrambled. The
+// comparison is a multiset rather than an ordered list because the redis
+// journal's order is (timestamp, member): two events inside one timestamp are
+// ordered by ID there but by arrival on PG, and that framework-level tie
+// order is not something a migration should fail on. A multiset still catches
+// every failure this pipeline can produce — missing, extra and duplicated
+// events.
+func (m *Migrator) checkConsistency(ctx context.Context, mig migrationRow) ([]string, error) {
 	keys, err := m.enumerateAll(ctx, mig)
 	if err != nil {
 		return nil, err
 	}
 	var mismatches []string
 	for _, key := range keys {
-		srcCount, err := countEvents(ctx, src, key)
+		srcIDs, err := m.journalIDs(ctx, mig.From, key)
 		if err != nil {
 			return nil, err
 		}
-		dstCount, err := countEvents(ctx, dst, key)
+		dstIDs, err := m.journalIDs(ctx, mig.To, key)
 		if err != nil {
 			return nil, err
 		}
-		if srcCount != dstCount {
-			mismatches = append(mismatches,
-				fmt.Sprintf("%s/%s(%d!=%d)", key.AppName, key.SessionID, srcCount, dstCount))
+		if missing, extra := idDiff(srcIDs, dstIDs); len(missing) > 0 || len(extra) > 0 {
+			mismatches = append(mismatches, fmt.Sprintf("%s/%s(missing %s; extra %s)",
+				key.AppName, key.SessionID, idList(missing), idList(extra)))
 		}
 	}
 	return mismatches, nil
+}
+
+// journalIDs reads one backend's full journal as event IDs. The PG branch goes
+// through FullJournalIDs (hot table plus archive, past the summary cursor);
+// the redis branch reads the event index zset directly — GetSession's 1000
+// cap and first-user-message anchor made the old count check compare two
+// truncated views and agree with itself while history was missing.
+func (m *Migrator) journalIDs(ctx context.Context, backend string, key session.Key) ([]string, error) {
+	if backend == "postgres" {
+		pg, ok := m.backends[backend].(*PGSessionService)
+		if !ok {
+			return nil, fmt.Errorf("%s backend is not the platform session service", backend)
+		}
+		return pg.FullJournalIDs(ctx, key)
+	}
+	idxKey, _ := redisEventKeys(key)
+	ids, err := m.rdb.ZRange(ctx, idxKey, 0, -1).Result()
+	if err != nil {
+		return nil, fmt.Errorf("read redis event index: %w", err)
+	}
+	return ids, nil
+}
+
+// idDiff reports the event IDs src holds that dst does not (missing) and the
+// ones dst holds beyond src (extra), sorted for a deterministic message.
+func idDiff(src, dst []string) (missing, extra []string) {
+	count := make(map[string]int, len(src))
+	for _, id := range src {
+		count[id]++
+	}
+	for _, id := range dst {
+		if count[id] > 0 {
+			count[id]--
+			continue
+		}
+		extra = append(extra, id)
+	}
+	for id, n := range count {
+		if n > 0 {
+			missing = append(missing, id)
+		}
+	}
+	slices.Sort(missing)
+	slices.Sort(extra)
+	return missing, extra
+}
+
+// idList renders a few IDs plus a count, so a badly divergent session stays a
+// one-line mismatch entry.
+func idList(ids []string) string {
+	const show = 3
+	if len(ids) == 0 {
+		return "none"
+	}
+	if len(ids) <= show {
+		return strings.Join(ids, ",")
+	}
+	return fmt.Sprintf("%s +%d more", strings.Join(ids[:show], ","), len(ids)-show)
 }
 
 // enumerateAll lists every session of the tenant (no batching): consistency
@@ -485,24 +768,6 @@ func (m *Migrator) enumerateAll(ctx context.Context, mig migrationRow) ([]sessio
 		last := batch[len(batch)-1]
 		cursor = enumCursor{appID: last.AppName, sessionKey: last.SessionID}
 	}
-}
-
-// countEvents reports how many events a backend holds for the session. A
-// postgres backend is counted through its full journal: GetSession reports only
-// the post-summary tail, so comparing it against a target that received the
-// complete copy would fail a migration that did its job.
-func countEvents(ctx context.Context, svc session.Service, key session.Key) (int, error) {
-	if pg, ok := svc.(*PGSessionService); ok {
-		return pg.CountFullJournal(ctx, key)
-	}
-	sess, err := svc.GetSession(ctx, key)
-	if err != nil {
-		return 0, err
-	}
-	if sess == nil {
-		return 0, nil
-	}
-	return len(sess.Events), nil
 }
 
 func (m *Migrator) countTenantSessions(ctx context.Context, mig migrationRow) (int, error) {
