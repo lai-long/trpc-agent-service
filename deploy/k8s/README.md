@@ -29,7 +29,8 @@ kubectl apply -f deploy/k8s/admin.yaml
 要点：
 
 - **角色与端口**：gateway 对外（IM webhook 经 LB/Ingress 进来），但对外的口上只有回调；
-  每个角色另起一个内网 metrics 监听（TRPC_METRICS_ADDR，默认 `:8082`），探针与
+  每个角色另起一个内网 metrics 监听（TRPC_METRICS_ADDR，默认 `127.0.0.1:8082`，k8s 清单
+  里显式设为 `:8082` 供 kubelet 探针与 Prometheus 抓取），探针与
   Prometheus 都抓它——导出的序列带租户维度流量、token 消耗和队列积压，挂在公网可达的
   回调 mux 上等于白送侦察材料。admin 仅 ClusterIP（内网）且只承载 `/admin/*`（逐路由
   token 鉴权），需要更强管控时上 TRPC_ADMIN_TLS_CERT/KEY/CLIENT_CA 三件套启用 mTLS。

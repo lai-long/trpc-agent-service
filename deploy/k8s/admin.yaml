@@ -22,6 +22,9 @@ spec:
             - secretRef: {name: trpc-service-infra}
           env:
             - {name: TRPC_ADMIN_TOKEN, valueFrom: {secretKeyRef: {name: trpc-admin-token, key: token}}}
+            # kubelet readiness probes and Prometheus scrape the pod IP, which
+            # a loopback-only metrics bind would not serve.
+            - {name: TRPC_METRICS_ADDR, value: ":8082"}
           volumeMounts:
             # KMS bootstrap token -> TRPC_SECRETS_DIR; without this mount the
             # resolver fails closed and the pod CrashLoops at startup.

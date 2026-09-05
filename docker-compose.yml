@@ -13,6 +13,8 @@
 #   TRPC_WECOMWS_ADDR=wss://openws.work.weixin.qq.com
 #   # TRPC_WECOMWS_PING_INTERVAL=30s TRPC_WECOMWS_LEADER_TTL=15s
 #   # TRPC_WECOMWS_RESYNC_INTERVAL=15s TRPC_WECOMWS_SEGMENT_BYTES=2048
+# Prometheus (below) scrapes the service on the host, so /metrics must be
+# reachable from the compose network: run the service with TRPC_METRICS_ADDR=:8082.
 
 services:
   postgres:

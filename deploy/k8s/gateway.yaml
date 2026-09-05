@@ -23,6 +23,10 @@ spec:
             # KMS bootstrap token -> TRPC_SECRETS_DIR; without this mount the
             # resolver fails closed and the pod CrashLoops at startup.
             - {name: kms-bootstrap, mountPath: /etc/trpc/secrets, readOnly: true}
+          env:
+            # kubelet readiness probes and Prometheus scrape the pod IP,
+            # which a loopback-only metrics bind would not serve.
+            - {name: TRPC_METRICS_ADDR, value: ":8082"}
           ports:
             - {containerPort: 8080, name: http}
             # Internal only: not in the Service below, so it never reaches the
