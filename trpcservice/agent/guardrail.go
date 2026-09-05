@@ -198,6 +198,13 @@ func (g *Guarded) Process(ctx context.Context, msg channels.InboundMessage) (cha
 	//    async lane; process errors ride the same event as error_type.
 	started := time.Now()
 	out, err := g.Inner.Process(ctx, msg)
+	// Charge the run's actual tokens on every exit path: a model failure can
+	// burn prompt tokens before dying, and charging only successful runs
+	// would let a sustained model outage bypass the daily budget. Zero usage
+	// (infra failure before any model call) is a no-op in Record.
+	if g.Budget != nil && msg.TenantID != "" {
+		g.Budget.Record(ctx, msg.TenantID, int64(out.PromptTokens+out.CompletionTokens))
+	}
 
 	// Drain the interception signal even on error: a redelivery regenerates
 	// it, and a stale signal must not leak into an unrelated run.
@@ -233,11 +240,6 @@ func (g *Guarded) Process(ctx context.Context, msg channels.InboundMessage) (cha
 		out.Text = degradedReply
 		return out, nil
 	}
-	// Budget accounting with the run's actual tokens.
-	if g.Budget != nil && msg.TenantID != "" {
-		g.Budget.Record(ctx, msg.TenantID, int64(out.PromptTokens+out.CompletionTokens))
-	}
-
 	// 7. Output checks: platform desensitization, then the tenant's output
 	//    denylist — a hit replaces the reply and audits a deny.
 	out, deniedWord := g.redactOutput(ctx, msg, policy, out)

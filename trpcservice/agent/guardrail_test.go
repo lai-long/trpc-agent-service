@@ -635,3 +635,38 @@ func TestGuardedAllowlistBlocksApprovalAnswer(t *testing.T) {
 		t.Fatal("the pending approval must survive a refused answer")
 	}
 }
+
+// A model failure can still burn prompt tokens before dying: the degraded
+// path must charge them to the daily budget, or a sustained model outage
+// becomes a free-usage window.
+func TestGuardedBudgetRecordsTokensOnModelFailure(t *testing.T) {
+	aud := &fakeAuditor{}
+	fb := &fakeBudget{allowed: true, recorded: map[string]int64{}}
+	g := &Guarded{
+		Inner:   usageFailProcessor{},
+		Auditor: aud,
+		Budget:  fb,
+	}
+	out, err := g.Process(context.Background(), testMsg("hello"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.Text, "繁忙") {
+		t.Fatalf("want the degraded busy reply, got %q", out.Text)
+	}
+	if fb.recorded["t1"] != 1500 {
+		t.Fatalf("model-failure usage must still be charged, got %v", fb.recorded)
+	}
+}
+
+// usageFailProcessor fails with a model error but reports the usage the run
+// already consumed, as the runner does when a generation dies mid-flight.
+type usageFailProcessor struct{}
+
+func (usageFailProcessor) Process(_ context.Context, msg channels.InboundMessage) (channels.OutboundMessage, error) {
+	out := channels.OutboundMessage{
+		Channel: msg.Channel, MsgID: msg.MsgID, SessionKey: msg.SessionKey,
+		TenantID: msg.TenantID, PromptTokens: 1000, CompletionTokens: 500,
+	}
+	return out, &ModelError{Err: errors.New("upstream 502")}
+}
