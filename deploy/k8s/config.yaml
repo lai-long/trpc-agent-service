@@ -14,6 +14,10 @@ data:
   TRPC_SUMMARY_EVENT_THRESHOLD: "20"
   TRPC_ARCHIVE_RETENTION: "720h"
   TRPC_SECRET_RESOLVER: "kms" # file for dev, kms in production
+  # The KMS resolver's bearer token bootstraps from a file under this dir
+  # (buildSecretResolver refuses to start without it), so every role
+  # Deployment mounts the trpc-kms-bootstrap Secret here.
+  TRPC_SECRETS_DIR: "/etc/trpc/secrets"
   # The mock callback is an unauthenticated message injector: off in
   # production (the binary default is already off; stated here so a future
   # default flip cannot silently re-arm it).
@@ -38,3 +42,4 @@ stringData:
   TRPC_S3_ACCESSKEY_REF: "s3-accesskey"
   TRPC_S3_SECRETKEY_REF: "s3-secretkey"
   TRPC_KMS_ENDPOINT: "http://kms.trpc-infra.svc:8080"
+  TRPC_KMS_TOKEN_REF: "kms-bootstrap-token" # file name under TRPC_SECRETS_DIR, not a secret value

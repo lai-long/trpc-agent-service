@@ -11,6 +11,11 @@ docker build -t trpc-agent-service:v1 .
 kubectl apply -f deploy/k8s/config.yaml
 kubectl create secret generic trpc-admin-token --from-literal=token="$(openssl rand -hex 24)"
 
+# KMS bootstrap token：pods 唯一直接持有的明文（其余密钥都在 KMS、以 *_REF 引用）。
+# resolver=kms 时 buildSecretResolver 从 TRPC_SECRETS_DIR 读不到该文件会拒绝启动，
+# 三个 Deployment 都把 trpc-kms-bootstrap 挂载到该目录——漏掉这一步就是三角色 CrashLoop。
+kubectl create secret generic trpc-kms-bootstrap --from-literal=token="<KMS 签发的 bootstrap token>"
+
 # 初始化数据库 schema（空库首次部署；Job 是幂等的，表已存在时跳过）
 kubectl create configmap trpc-db-init --from-file=init.sql=deploy/db/init.sql
 kubectl apply -f deploy/k8s/db-init.yaml
@@ -34,6 +39,7 @@ kubectl apply -f deploy/k8s/admin.yaml
   （排空 = 模型超时 60s × 重试 + 余量，默认给 130s）；滚动更新时在途会话由
   Stream pending + XCLAIM 接管，不丢消息。
 - **密钥**：所有密钥以引用（`*_REF`）存在于配置中，运行时经 KMS Resolver 取值；
-  不要把明文写进 ConfigMap/Secret。
+  不要把明文写进 ConfigMap/Secret。唯一例外是 KMS bootstrap token——它是访问 KMS
+  本身的凭证，只能由 k8s Secret 挂载进 `TRPC_SECRETS_DIR`（见上方创建步骤）。
 - **有状态依赖**：PG 主从、Redis 哨兵、MinIO/云 OSS、OTel Collector、KMS sidecar
   均为外部中间件，按你的环境接入。

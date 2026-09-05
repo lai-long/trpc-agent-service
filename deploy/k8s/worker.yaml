@@ -22,6 +22,10 @@ spec:
           envFrom:
             - configMapRef: {name: trpc-service-config}
             - secretRef: {name: trpc-service-infra}
+          volumeMounts:
+            # KMS bootstrap token -> TRPC_SECRETS_DIR; without this mount the
+            # resolver fails closed and the pod CrashLoops at startup.
+            - {name: kms-bootstrap, mountPath: /etc/trpc/secrets, readOnly: true}
           env:
             - {name: TRPC_METRICS_ADDR, value: ":8082"}
           ports:
@@ -40,6 +44,11 @@ spec:
           resources:
             requests: {cpu: "500m", memory: "512Mi"}
             limits: {cpu: "2", memory: "4Gi"}
+      volumes:
+        - name: kms-bootstrap
+          secret:
+            secretName: trpc-kms-bootstrap
+            items: [{key: token, path: kms-bootstrap-token}]
 ---
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
