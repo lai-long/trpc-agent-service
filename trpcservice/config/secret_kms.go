@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -33,10 +34,17 @@ func NewKMSResolver(endpoint, token string) (*KMSResolver, error) {
 	}, nil
 }
 
+// secretRefPattern is the shape a KMS secret reference may take: slash
+// separated segments of the characters a KMS or Vault path uses. The ref is
+// interpolated into the request path, so anything else is refused rather than
+// escaped — a ".." segment or a query/fragment would let whoever can set a
+// binding make the platform request an arbitrary KMS path.
+var secretRefPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*(/[A-Za-z0-9][A-Za-z0-9._-]*)*$`)
+
 // Resolve implements SecretResolver.
 func (k *KMSResolver) Resolve(ctx context.Context, ref string) (string, error) {
-	if ref == "" {
-		return "", fmt.Errorf("kms: empty secret ref")
+	if !secretRefPattern.MatchString(ref) {
+		return "", fmt.Errorf("kms: invalid secret ref %q", ref)
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
 		k.endpoint+"/v1/secrets/"+ref, nil)

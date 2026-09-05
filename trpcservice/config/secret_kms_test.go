@@ -18,6 +18,8 @@ func TestKMSResolver(t *testing.T) {
 		switch ref {
 		case "db-password":
 			_, _ = w.Write([]byte("p4ss\n"))
+		case "team/env/db-password":
+			_, _ = w.Write([]byte("p4ss\n"))
 		case "empty":
 			_, _ = w.Write([]byte(""))
 		default:
@@ -48,6 +50,20 @@ func TestKMSResolver(t *testing.T) {
 	}
 	if _, err := bad.Resolve(context.Background(), "db-password"); err == nil {
 		t.Fatal("bad token must error")
+	}
+
+	// Path traversal and injection shapes are refused, not escaped: the ref
+	// is interpolated into the request path verbatim.
+	for _, bad := range []string{
+		"", "../../v1/sys/config", "db-password?x=1", "db-password#frag",
+		"/abs", "a/b/../c", "%2e%2e/db-password", "sp ace",
+	} {
+		if _, err := r.Resolve(context.Background(), bad); err == nil {
+			t.Errorf("ref %q must be refused", bad)
+		}
+	}
+	if _, err := r.Resolve(context.Background(), "team/env/db-password"); err != nil {
+		t.Errorf("multi-segment ref must resolve: %v", err)
 	}
 
 	if _, err := NewKMSResolver("", "t"); err == nil {
