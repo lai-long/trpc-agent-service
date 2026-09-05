@@ -36,12 +36,13 @@ type AuditEvent struct {
 }
 
 const (
-	auditBatchSize     = 100             // flush the buffer at this many events
-	auditFlushInterval = time.Second     // or this often, whichever comes first
-	auditSyncTimeout   = 3 * time.Second // deny/review writes get this much slack
-	auditFlushTimeout  = 5 * time.Second // per flush attempt
-	auditFlushTries    = 3               // a dropped batch is a lost audit trail
-	auditFlushBackoff  = 200 * time.Millisecond
+	auditBatchSize      = 100             // flush the buffer at this many events
+	auditFlushInterval  = time.Second     // or this often, whichever comes first
+	auditSyncTimeout    = 3 * time.Second // deny/review writes get this much slack
+	auditFlushTimeout   = 5 * time.Second // per flush attempt
+	auditFlushTries     = 3               // a dropped batch is a lost audit trail
+	auditFlushBackoff   = 200 * time.Millisecond
+	auditRecoveryBudget = 5 * time.Second // whole-batch per-row recovery budget
 
 	// auditQueueSize is the buffer depth and auditEnqueueWait how long a
 	// producer waits for room before its event is dropped: a brief burst is
@@ -178,8 +179,12 @@ func (a *Auditor) LogSync(ctx context.Context, ev AuditEvent) error {
 
 // flush writes one batch, retrying with a short backoff: the buffer is the
 // only copy of these events, so giving up on the first error would drop a
-// chunk of the audit trail. After auditFlushTries the batch is lost, but
-// loudly.
+// chunk of the audit trail. After auditFlushTries the batch falls back to
+// per-row recovery instead of being dropped wholesale: a batch fails
+// atomically (the statements between two pipeline syncs are implicitly
+// transactional), so one poisoned event — a shape the schema rejects, e.g. a
+// tenant id that is not a uuid — fails deterministically on every retry and
+// would otherwise bury every valid event sharing its batch.
 func (a *Auditor) flush(buf []AuditEvent) {
 	for attempt := 1; ; attempt++ {
 		ctx, cancel := context.WithTimeout(context.Background(), auditFlushTimeout)
@@ -189,14 +194,35 @@ func (a *Auditor) flush(buf []AuditEvent) {
 			return
 		}
 		if attempt >= auditFlushTries {
-			plog.Errorf("audit batch flush (%d events) failed after %d attempts, dropping: %v",
+			plog.Errorf("audit batch flush (%d events) failed after %d attempts, recovering per row: %v",
 				len(buf), attempt, err)
-			a.dropped.Add(uint64(len(buf)))
+			a.recoverPerRow(buf)
 			return
 		}
 		plog.Warnf("audit batch flush (%d events) attempt %d/%d: %v",
 			len(buf), attempt, auditFlushTries, err)
 		time.Sleep(time.Duration(attempt) * auditFlushBackoff)
+	}
+}
+
+// recoverPerRow writes the batch one event at a time, so a schema-rejected
+// row costs itself alone. Rows that still fail — the poison and, while the
+// database is down, everything behind the recovery budget — are dropped
+// loudly and counted, keyed by trace id so the hole in the trail is
+// identifiable.
+func (a *Auditor) recoverPerRow(events []AuditEvent) {
+	// One budget for the whole recovery: a database outage must not turn a
+	// 100-row batch into 100 sequential timeouts riding the flush loop.
+	deadline := time.Now().Add(auditRecoveryBudget)
+	for _, ev := range events {
+		ctx, cancel := context.WithDeadline(context.Background(), deadline)
+		err := a.insert(ctx, []AuditEvent{ev})
+		cancel()
+		if err == nil {
+			continue
+		}
+		plog.Errorf("audit event dropped (trace=%s, decision=%s): %v", ev.TraceID, ev.Decision, err)
+		a.dropped.Add(1)
 	}
 }
 

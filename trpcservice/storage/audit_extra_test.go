@@ -87,3 +87,39 @@ func TestAuditorSyncWritesSessionIDAndDetail(t *testing.T) {
 		t.Fatalf("empty Detail must persist as NULL, got %s", detail)
 	}
 }
+
+// One poisoned event must not bury the valid events sharing its batch: the
+// batch is atomic, so retrying it fails deterministically. flush falls back
+// to per-row recovery, which writes every schema-valid row and drops only
+// the poison (counted, keyed by trace id).
+func TestAuditorPoisonRowDoesNotKillTheBatch(t *testing.T) {
+	pool, err := NewPG(context.Background(), testPGDSN)
+	if err != nil {
+		t.Skipf("postgres unavailable (%v), skipping integration test", err)
+	}
+	ctx := context.Background()
+	tag := fmt.Sprintf("audit-poison-%d", time.Now().UnixNano())
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), "DELETE FROM audit_log WHERE trace_id LIKE $1", tag+"%")
+		pool.Close()
+	})
+
+	a := NewAuditor(pool)
+	a.flush([]AuditEvent{
+		{TenantID: zeroTenant, Decision: "allow", TraceID: tag + "-good-1"},
+		{TenantID: zeroTenant, Decision: "allow", TraceID: tag + "-good-2"},
+		{TenantID: "t1", Decision: "allow", TraceID: tag + "-poison"}, // not a uuid
+		{TenantID: zeroTenant, Decision: "allow", TraceID: tag + "-good-3"},
+	})
+	if got := a.Dropped(); got != 1 {
+		t.Fatalf("only the poisoned event may be dropped, got %d", got)
+	}
+	var n int
+	if err := pool.QueryRow(ctx,
+		"SELECT count(*) FROM audit_log WHERE trace_id LIKE $1", tag+"%").Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 3 {
+		t.Fatalf("the three valid events must survive the poisoned batch, got %d", n)
+	}
+}
