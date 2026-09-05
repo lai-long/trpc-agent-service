@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"trpc.group/trpc-go/trpc-agent-go/memory"
 )
@@ -163,3 +164,52 @@ func (failingEmbedder) GetEmbeddingWithUsage(context.Context, string) ([]float64
 	return nil, nil, errors.New("embedder unavailable")
 }
 func (failingEmbedder) GetDimensions() int { return 0 }
+
+// The app → tenant cache is per process and out of the admin invalidation
+// broadcast's reach, so entries expire: after the TTL a reassignment is
+// picked up instead of routing writes under a stale tenant forever. A live
+// entry serves without a second query.
+func TestAppTenantResolverCacheExpiry(t *testing.T) {
+	pool, err := NewPG(context.Background(), testPGDSN)
+	if err != nil {
+		t.Skipf("postgres unavailable (%v), skipping integration test", err)
+	}
+	defer pool.Close()
+
+	r := newAppTenantResolver(pool)
+	now := time.Unix(1757000000, 0)
+	const fixtureAppID = "00000000-0000-0000-0000-0000000001aa"
+	r.now = func() time.Time { return now }
+
+	tenantID, err := r.resolve(context.Background(), fixtureAppID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.cache[fixtureAppID].expiresAt != now.Add(appTenantCacheTTL) {
+		t.Fatalf("entry must carry the TTL, got %v", r.cache[fixtureAppID].expiresAt)
+	}
+
+	// A stale entry is re-queried, not served.
+	r.cache[fixtureAppID] = appTenantEntry{tenantID: tenantID, expiresAt: now.Add(-time.Second)}
+	fresh, err := r.resolve(context.Background(), fixtureAppID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fresh != tenantID {
+		t.Fatalf("re-resolution must return the row's tenant, got %q", fresh)
+	}
+	if r.cache[fixtureAppID].expiresAt != now.Add(appTenantCacheTTL) {
+		t.Fatal("the refreshed entry must carry a fresh expiry")
+	}
+
+	// A live entry is served without touching the row: bump the stored value
+	// and confirm the next resolve returns it.
+	r.cache[fixtureAppID] = appTenantEntry{tenantID: "00000000-0000-0000-0000-0000000000cc", expiresAt: now.Add(appTenantCacheTTL)}
+	cached, err := r.resolve(context.Background(), fixtureAppID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cached != "00000000-0000-0000-0000-0000000000cc" {
+		t.Fatalf("a live entry must be served from the cache, got %q", cached)
+	}
+}
