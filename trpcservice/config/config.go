@@ -173,9 +173,13 @@ type Config struct {
 // fields at startup and fail fast.
 func Load() Config {
 	return Config{
-		HTTPAddr:    getenv("TRPC_HTTP_ADDR", ":8080"),
-		AdminAddr:   getenv("TRPC_ADMIN_ADDR", "127.0.0.1:8081"),
-		MetricsAddr: getenv("TRPC_METRICS_ADDR", ":8082"),
+		HTTPAddr:  getenv("TRPC_HTTP_ADDR", ":8080"),
+		AdminAddr: getenv("TRPC_ADMIN_ADDR", "127.0.0.1:8081"),
+		// Loopback by default, like AdminAddr: /metrics carries per-tenant
+		// traffic and cost with no auth of its own. Deployments that expose
+		// it (k8s readiness probes, cluster scraping) set TRPC_METRICS_ADDR
+		// to an all-interfaces bind explicitly.
+		MetricsAddr: getenv("TRPC_METRICS_ADDR", "127.0.0.1:8082"),
 		PGDSN:       getenv("TRPC_PG_DSN", "postgres://trpc:trpc-dev-only@localhost:5432/trpc?sslmode=disable"),
 		RedisAddr:   getenv("TRPC_REDIS_ADDR", "localhost:6380"), // host 6379 is often taken by other local services; compose maps 6380
 		LogLevel:    getenv("TRPC_LOG_LEVEL", "info"),
