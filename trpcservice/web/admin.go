@@ -555,6 +555,17 @@ func (a *AdminAPI) createBinding(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, msg)
 			return
 		}
+		// A legacy callback path is mounted once at startup under the
+		// env-global credentials, so a binding row carrying its own refs on
+		// that path would look authoritative while inbound verification
+		// never consults them. Own credentials must ride the auto-filled
+		// binding path.
+		if legacy, mounted := legacyCallbackPaths[in.Channel]; mounted && in.WebhookPath == legacy &&
+			(in.TokenRef != "" || in.AESKeyRef != "") {
+			writeError(w, http.StatusBadRequest,
+				"the legacy callback path is served with the env-global credentials; leave token_ref/aeskey_ref empty or use the auto-filled binding path")
+			return
+		}
 	}
 	// Per-channel binding validation at create time: a config jsonb the
 	// adapter cannot parse would otherwise fail every send under this
@@ -657,7 +668,7 @@ func validateWebhookPath(channel, webhookPath string) string {
 // /wecomws/{bot_id}. WS inbound has no IM redelivery, so a typo'd path would
 // not surface as a routing error — it would silently blackhole every message
 // the bot receives.
-var wecomwsPathPattern = regexp.MustCompile(`^/wecomws/([A-Za-z0-9_-]+)$`)
+var wecomwsPathPattern = regexp.MustCompile(`^/` + wecomws.ChannelName + `/([A-Za-z0-9_-]+)$`)
 
 // validateWecomwsBinding enforces the wecomws binding shape; a non-empty
 // return value is the 400 message. The config schema is validated by the
@@ -1065,8 +1076,14 @@ func listFailed(w http.ResponseWriter, op string, rows pgx.Rows) bool {
 	return false
 }
 
+// adminBodyLimit caps one admin request body: the endpoints take JSON
+// documents and knowledge content, not uploads, and an unauthenticated-size
+// body would let a valid token pin server memory (and bloat the change-audit
+// detail column).
+const adminBodyLimit = 1 << 20
+
 func decodeBody(w http.ResponseWriter, r *http.Request, v any) bool {
-	if err := json.NewDecoder(r.Body).Decode(v); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, adminBodyLimit)).Decode(v); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid json: "+err.Error())
 		return false
 	}

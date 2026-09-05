@@ -424,7 +424,7 @@ func TestAdminKnowledgeValidation(t *testing.T) {
 	// Knowledge is enabled here (validation runs before any embedding): the
 	// table is dropped again at cleanup.
 	table := "knowledge_test_admin_val_" + fmt.Sprint(nano)
-	kb, err := agent.NewKnowledgeBase(testenv.PGDSN(), table, 8, fakeEmbedder{dim: 8})
+	kb, _, err := agent.NewKnowledgeBase(testenv.PGDSN(), table, 8, fakeEmbedder{dim: 8})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -451,7 +451,7 @@ func TestAdminKnowledgeValidation(t *testing.T) {
 	wantCode(t, code, http.StatusInternalServerError, out)
 
 	// Enabled knowledge with a broken embedder: ingestion fails with 500.
-	deadKB, err := agent.NewKnowledgeBase(testenv.PGDSN(),
+	deadKB, _, err := agent.NewKnowledgeBase(testenv.PGDSN(),
 		"knowledge_test_admin_err_"+fmt.Sprint(nano), 8, erroringEmbedder{dim: 8})
 	if err != nil {
 		t.Fatal(err)

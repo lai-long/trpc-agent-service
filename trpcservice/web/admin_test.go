@@ -224,11 +224,19 @@ func TestAdminLifecycle(t *testing.T) {
 	// generated id, it is the only caller-supplied webhook_path the platform
 	// serves. The wecom and mock legacy paths are taken by the seed rows.
 	code, out = doJSON(t, mux, http.MethodPost, "/admin/apps/"+appV1+"/bindings",
-		`{"channel":"wxkf","webhook_path":"/wxkf/callback","token_ref":"wxkf-token"}`)
+		`{"channel":"wxkf","webhook_path":"/wxkf/callback"}`)
 	if code != http.StatusCreated {
 		t.Fatalf("create binding: %d %v", code, out)
 	}
 	bindingID, _ = out["id"].(string)
+	// The legacy mount verifies under the env-global credentials, so a
+	// binding naming its own refs there would store credentials inbound
+	// never consults.
+	code, _ = doJSON(t, mux, http.MethodPost, "/admin/apps/"+appV1+"/bindings",
+		`{"channel":"wecom","webhook_path":"/wecom/callback","token_ref":"wecom-token"}`)
+	if code != http.StatusBadRequest {
+		t.Fatalf("own refs on a legacy path must be rejected, got %d", code)
+	}
 	// Empty webhook_path: the canonical binding-scoped callback path is
 	// derived from the DB-generated id in the same statement, so the route
 	// the dispatcher resolves is self-consistent.
@@ -251,8 +259,11 @@ func TestAdminLifecycle(t *testing.T) {
 	if len(list) != 2 || list[0]["webhook_path"] != "/wxkf/callback" {
 		t.Fatalf("list bindings: %+v", list)
 	}
-	if list[0]["token_ref"] != "wxkf-token" {
-		t.Fatalf("token_ref must be a reference, got %v", list[0]["token_ref"])
+	if list[0]["token_ref"] != nil {
+		t.Fatalf("the legacy-path row must carry no refs, got %v", list[0]["token_ref"])
+	}
+	if list[1]["token_ref"] != "wecom-token" {
+		t.Fatalf("token_ref must be a reference, got %v", list[1]["token_ref"])
 	}
 
 	// Publishing must repoint bindings at the new version in the same tx —
@@ -317,7 +328,7 @@ func TestAdminKnowledgeIngestion(t *testing.T) {
 	// metadata in the pgvector table.
 	const table = "knowledge_test_admin_ingest"
 	t.Cleanup(func() { _, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS `+table) })
-	kb, err := agent.NewKnowledgeBase(
+	kb, _, err := agent.NewKnowledgeBase(
 		"postgres://trpc:trpc-dev-only@localhost:5432/trpc?sslmode=disable", table, 64, fakeEmbedder{dim: 64})
 	if err != nil {
 		t.Fatal(err)
