@@ -1039,7 +1039,9 @@ func buildEmbedder(ctx context.Context, cfg config.Config, secrets config.Secret
 
 // buildKnowledge builds the pgvector-backed knowledge base when an
 // embeddings-capable endpoint is configured; otherwise it returns nil and the
-// agent runs without knowledge retrieval.
+// agent runs without knowledge retrieval. It also kicks off the one-shot
+// re-key of pre-scoping legacy document IDs — every replica runs it, the pass
+// is idempotent and converges under concurrency.
 func buildKnowledge(ctx context.Context, cfg config.Config, secrets config.SecretResolver) *knowledge.BuiltinKnowledge {
 	emb, dim, err := buildEmbedder(ctx, cfg, secrets)
 	if err != nil {
@@ -1049,11 +1051,25 @@ func buildKnowledge(ctx context.Context, cfg config.Config, secrets config.Secre
 	if emb == nil {
 		return nil
 	}
-	kb, err := agent.NewKnowledgeBase(cfg.PGDSN, cfg.KnowledgeTable, dim, emb)
+	kb, vs, err := agent.NewKnowledgeBase(cfg.PGDSN, cfg.KnowledgeTable, dim, emb)
 	if err != nil {
 		plog.Warnf("knowledge base unavailable (%v), knowledge disabled", err)
 		return nil
 	}
+	go func() {
+		// Detached context: a deployment-time data fix must not die with the
+		// startup request's cancellation, but it must not hang forever either.
+		rctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		defer cancel()
+		n, err := agent.RekeyLegacyDocuments(rctx, vs)
+		if err != nil {
+			plog.Warnf("knowledge legacy re-key pass failed (retried at next start): %v", err)
+			return
+		}
+		if n > 0 {
+			plog.Infof("knowledge legacy re-key: %d document(s) moved to scoped IDs", n)
+		}
+	}()
 	plog.Infof("knowledge base enabled (model=%s, dim=%d)", cfg.EmbedderModel, dim)
 	return kb
 }

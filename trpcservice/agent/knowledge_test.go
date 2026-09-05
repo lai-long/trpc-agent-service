@@ -3,9 +3,13 @@ package agent_test
 import (
 	"context"
 	"hash/fnv"
+	"slices"
+	"strconv"
 	"testing"
 
 	"trpc.group/trpc-go/trpc-agent-go/knowledge"
+	"trpc.group/trpc-go/trpc-agent-go/knowledge/document"
+	"trpc.group/trpc-go/trpc-agent-go/knowledge/vectorstore"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/agent"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/testenv"
@@ -104,15 +108,21 @@ func TestDocSourceIDScopesByTenantAndApp(t *testing.T) {
 func TestKnowledgeBaseRoundTrip(t *testing.T) {
 	ctx := context.Background()
 	pool := testenv.PG(t)
-	defer pool.Close()
 
 	const dim = 64
 	table := "knowledge_test_" + "roundtrip"
+	// testenv closes the pool in a t.Cleanup that runs after this test's; a
+	// deferred pool.Close() here would close it first and silently void the
+	// DROP, leaking the table into the next run. Drop leftovers up front for
+	// the same reason: a crashed run leaves its rows behind.
+	if _, err := pool.Exec(ctx, `DROP TABLE IF EXISTS `+table); err != nil {
+		t.Fatal(err)
+	}
 	t.Cleanup(func() {
 		_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS `+table)
 	})
 
-	kb, err := agent.NewKnowledgeBase(
+	kb, _, err := agent.NewKnowledgeBase(
 		"postgres://trpc:trpc-dev-only@localhost:5432/trpc?sslmode=disable",
 		table, dim, fakeEmbedder{dim: dim})
 	if err != nil {
@@ -141,7 +151,156 @@ func TestKnowledgeBaseRoundTrip(t *testing.T) {
 // A knowledge base on an unreachable or malformed DSN fails at construction
 // instead of producing a half-initialized agent.
 func TestKnowledgeBaseRejectsBadDSN(t *testing.T) {
-	if _, err := agent.NewKnowledgeBase("not a valid dsn", "knowledge_test_bad", 64, fakeEmbedder{dim: 64}); err == nil {
+	if _, _, err := agent.NewKnowledgeBase("not a valid dsn", "knowledge_test_bad", 64, fakeEmbedder{dim: 64}); err == nil {
 		t.Fatal("malformed DSN must fail NewKnowledgeBase")
 	}
+}
+
+// legacyDocID is the pre-scoping scheme: fnv64a of name+content alone. Rows
+// written before 449994c carry this ID.
+func legacyDocID(name, content string) string {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(name))
+	_, _ = h.Write([]byte(content))
+	return strconv.FormatUint(h.Sum64(), 16)
+}
+
+// vectorAt builds a dim-length embedding with one distinguishing slot, so a
+// re-keyed row's carried embedding is exact-comparable after the float32
+// round trip.
+func vectorAt(dim, slot int, val float64) []float64 {
+	v := make([]float64, dim)
+	v[slot%dim] = val
+	return v
+}
+
+// Documents written under the pre-scoping ID scheme are stranded: a re-ingest
+// hashes to the scoped ID and inserts a second row (one tenant, the same
+// document, duplicate retrieval), and with no delete endpoint the legacy row
+// cannot be removed any other way. RekeyLegacyDocuments must move every
+// legacy row to its scoped ID — embedding carried verbatim, no embedder
+// involved — and collapse the re-ingested duplicate back to one row, after
+// which re-ingesting is an upsert again.
+func TestRekeyLegacyDocuments(t *testing.T) {
+	ctx := context.Background()
+	pool := testenv.PG(t)
+
+	const dim = 64
+	table := "knowledge_test_rekey"
+	if _, err := pool.Exec(ctx, `DROP TABLE IF EXISTS `+table); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS `+table)
+	})
+
+	kb, vs, err := agent.NewKnowledgeBase(
+		"postgres://trpc:trpc-dev-only@localhost:5432/trpc?sslmode=disable",
+		table, dim, fakeEmbedder{dim: dim})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	md := map[string]any{agent.MetadataTenantID: "t-rekey", agent.MetadataAppID: "a-rekey"}
+
+	// stranded: ingested before the scheme change, never re-ingested. Its
+	// embedding (slot 3) differs from anything the fake embedder would make,
+	// so the re-key carrying it verbatim is observable.
+	stranded := &agent.DocSource{DocName: "配送范围", Content: "仅限同城配送", Metadata: md}
+	strandedID := legacyDocID(stranded.DocName, stranded.Content)
+	if err := vs.Add(ctx, &document.Document{
+		ID: strandedID, Name: stranded.DocName, Content: stranded.Content, Metadata: md,
+	}, vectorAt(dim, 3, 7)); err != nil {
+		t.Fatal(err)
+	}
+
+	// duplicated: the legacy row plus a post-change re-ingest of the same
+	// document — the two rows one tenant now retrieves twice.
+	duplicated := &agent.DocSource{DocName: "发票说明", Content: "支持电子发票", Metadata: md}
+	dupID := legacyDocID(duplicated.DocName, duplicated.Content)
+	if err := vs.Add(ctx, &document.Document{
+		ID: dupID, Name: duplicated.DocName, Content: duplicated.Content, Metadata: md,
+	}, vectorAt(dim, 5, 9)); err != nil {
+		t.Fatal(err)
+	}
+	if err := kb.AddSource(ctx, duplicated); err != nil {
+		t.Fatal(err)
+	}
+
+	meta, err := vs.GetMetadata(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(meta) != 3 {
+		t.Fatalf("premise: 2 legacy rows + 1 scoped twin must be present, got %d: %v", len(meta), keysOf(meta))
+	}
+
+	n, err := agent.RekeyLegacyDocuments(ctx, vs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Fatalf("both legacy rows must be re-keyed, got %d", n)
+	}
+
+	// Exactly two rows remain: both scoped IDs, both legacy IDs gone.
+	meta, err = vs.GetMetadata(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	strandedScoped := docID(t, stranded)
+	dupScoped := docID(t, duplicated)
+	if len(meta) != 2 || !keyIn(meta, strandedScoped) || !keyIn(meta, dupScoped) {
+		t.Fatalf("want exactly the two scoped IDs %s + %s, got %v", strandedScoped, dupScoped, keysOf(meta))
+	}
+
+	// The stranded document's embedding crossed over verbatim — the pass
+	// never calls the embedder.
+	doc, emb, err := vs.Get(ctx, strandedScoped)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if doc.Content != stranded.Content {
+		t.Fatalf("re-keyed content changed: %q", doc.Content)
+	}
+	if !slices.Equal(emb, vectorAt(dim, 3, 7)) {
+		t.Fatalf("re-keyed embedding must be carried verbatim, got %v", emb)
+	}
+
+	// The duplicate collapsed onto one row whose content survived.
+	if doc, _, err = vs.Get(ctx, dupScoped); err != nil {
+		t.Fatal(err)
+	}
+	if doc.Content != duplicated.Content {
+		t.Fatalf("duplicate collapse changed content: %q", doc.Content)
+	}
+
+	// A second pass is a no-op, and re-ingesting the migrated document is an
+	// upsert again instead of a third row.
+	if n, err = agent.RekeyLegacyDocuments(ctx, vs); err != nil || n != 0 {
+		t.Fatalf("second pass must re-key nothing, got %d (%v)", n, err)
+	}
+	if err := kb.AddSource(ctx, stranded); err != nil {
+		t.Fatal(err)
+	}
+	if meta, err = vs.GetMetadata(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(meta) != 2 {
+		t.Fatalf("re-ingest after the re-key must upsert, still 2 rows, got %v", keysOf(meta))
+	}
+}
+
+func keyIn(m map[string]vectorstore.DocumentMetadata, id string) bool {
+	_, ok := m[id]
+	return ok
+}
+
+func keysOf(m map[string]vectorstore.DocumentMetadata) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	slices.Sort(out)
+	return out
 }

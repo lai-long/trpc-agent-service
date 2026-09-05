@@ -9,26 +9,32 @@ import (
 	"trpc.group/trpc-go/trpc-agent-go/knowledge"
 	"trpc.group/trpc-go/trpc-agent-go/knowledge/document"
 	"trpc.group/trpc-go/trpc-agent-go/knowledge/embedder"
+	"trpc.group/trpc-go/trpc-agent-go/knowledge/vectorstore"
 	"trpc.group/trpc-go/trpc-agent-go/knowledge/vectorstore/pgvector"
+
+	plog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
 )
 
 // NewKnowledgeBase builds the platform knowledge base on pgvector; the store
 // auto-creates the vector extension, its table and the HNSW index. Documents
 // carry tenant/app metadata, and the agent searches through a metadata filter
 // so knowledge stays tenant-isolated inside the shared table.
-func NewKnowledgeBase(pgDSN, table string, dim int, emb embedder.Embedder) (*knowledge.BuiltinKnowledge, error) {
+//
+// The store is returned alongside the knowledge base so the caller can run
+// RekeyLegacyDocuments over it once (see buildKnowledge).
+func NewKnowledgeBase(pgDSN, table string, dim int, emb embedder.Embedder) (*knowledge.BuiltinKnowledge, *pgvector.VectorStore, error) {
 	vs, err := pgvector.New(
 		pgvector.WithPGVectorClientDSN(pgDSN),
 		pgvector.WithTable(table),
 		pgvector.WithIndexDimension(dim),
 	)
 	if err != nil {
-		return nil, fmt.Errorf("pgvector store: %w", err)
+		return nil, nil, fmt.Errorf("pgvector store: %w", err)
 	}
 	return knowledge.New(
 		knowledge.WithVectorStore(vs),
 		knowledge.WithEmbedder(emb),
-	), nil
+	), vs, nil
 }
 
 // Metadata keys that scope a document to one tenant's app. The write side
@@ -69,25 +75,79 @@ type DocSource struct {
 // another tenant's row — content, embedding and the tenant_id that decides
 // who can still retrieve it.
 func (s *DocSource) ReadDocuments(context.Context) ([]*document.Document, error) {
-	h := fnv.New64a()
-	for _, part := range []string{
+	id := ScopedDocID(
 		metadataString(s.Metadata, MetadataTenantID),
 		metadataString(s.Metadata, MetadataAppID),
-		s.DocName,
-		s.Content,
-	} {
-		// A length prefix keeps the boundaries unambiguous: without it
-		// ("t1","a1x") and ("t1a","1x") would hash alike.
-		_, _ = h.Write([]byte(strconv.Itoa(len(part))))
-		_, _ = h.Write([]byte{0})
-		_, _ = h.Write([]byte(part))
-	}
+		s.DocName, s.Content)
 	return []*document.Document{{
-		ID:       strconv.FormatUint(h.Sum64(), 16),
+		ID:       id,
 		Name:     s.DocName,
 		Content:  s.Content,
 		Metadata: s.Metadata,
 	}}, nil
+}
+
+// ScopedDocID is the document ID scheme: a length-prefixed fnv64a over the
+// owning tenant, app, document name and content. A length prefix keeps the
+// boundaries unambiguous: without it ("t1","a1x") and ("t1a","1x") would hash
+// alike. Extraction exists because RekeyLegacyDocuments must recompute a
+// stored row's ID from exactly the parts ReadDocuments hashed it from.
+func ScopedDocID(tenantID, appID, docName, content string) string {
+	h := fnv.New64a()
+	for _, part := range []string{tenantID, appID, docName, content} {
+		_, _ = h.Write([]byte(strconv.Itoa(len(part))))
+		_, _ = h.Write([]byte{0})
+		_, _ = h.Write([]byte(part))
+	}
+	return strconv.FormatUint(h.Sum64(), 16)
+}
+
+// RekeyLegacyDocuments walks the whole knowledge table once and re-keys every
+// document whose ID is not the scoped ID of its own tenant/app/name/content —
+// the rows written before the ID scheme gained its tenant scope, when the ID
+// was fnv64a of name+content alone. Those rows are stranded: re-ingesting the
+// same document now hashes to the scoped ID and inserts a SECOND row, so one
+// tenant retrieves the same document twice, and with no delete endpoint the
+// legacy row cannot be removed any other way.
+//
+// The re-key carries the stored embedding verbatim (Get returns it, Add writes
+// it back — no embedder call), the metadata, and the old scheme's semantics:
+// content changes always created new rows, so a legacy row keeps its own
+// identity even when a scoped twin already exists — the Add upserts the same
+// bytes over the twin and the legacy row is dropped, leaving exactly one row.
+// Two replicas running the pass concurrently converge: Add is an upsert and
+// Delete of an already-re-keyed row is a no-op.
+func RekeyLegacyDocuments(ctx context.Context, vs vectorstore.VectorStore) (int, error) {
+	meta, err := vs.GetMetadata(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("enumerate documents: %w", err)
+	}
+	rekeyed := 0
+	for id := range meta {
+		doc, emb, err := vs.Get(ctx, id)
+		if err != nil {
+			// Vanished between the scan and the read — another replica's pass
+			// or an operator delete; nothing left to re-key.
+			plog.Warnf("knowledge rekey: document %s unreadable, skipping: %v", id, err)
+			continue
+		}
+		want := ScopedDocID(
+			metadataString(doc.Metadata, MetadataTenantID),
+			metadataString(doc.Metadata, MetadataAppID),
+			doc.Name, doc.Content)
+		if want == id {
+			continue
+		}
+		doc.ID = want
+		if err := vs.Add(ctx, doc, emb); err != nil {
+			return rekeyed, fmt.Errorf("re-key document %s: %w", id, err)
+		}
+		if err := vs.Delete(ctx, id); err != nil {
+			return rekeyed, fmt.Errorf("delete legacy document %s: %w", id, err)
+		}
+		rekeyed++
+	}
+	return rekeyed, nil
 }
 
 // metadataString reads one metadata key as a string, tolerating the numeric
