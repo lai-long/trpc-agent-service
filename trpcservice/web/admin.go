@@ -961,6 +961,23 @@ func (a *AdminAPI) queryAudit(w http.ResponseWriter, r *http.Request) {
 // helpers
 // ---------------------------------------------------------------------------
 
+// OperatorID names who performed a write, for the change audit. With mTLS on
+// the admin listener the verified client certificate CN is the identity — a
+// header anyone holding the shared token could set is not attributable. The
+// header remains the fallback for plain-token deployments, where the audit
+// value is "which token holder claimed this", not proof.
+func OperatorID(r *http.Request) string {
+	if r.TLS != nil && len(r.TLS.PeerCertificates) > 0 {
+		if cn := r.TLS.PeerCertificates[0].Subject.CommonName; cn != "" {
+			return cn
+		}
+	}
+	if operator := r.Header.Get("X-Admin-User"); operator != "" {
+		return operator
+	}
+	return "admin"
+}
+
 // afterWrite audits the write operation (operator + before/after content)
 // and broadcasts config invalidation: workers drop their cache within
 // seconds; TTL is the fallback when the notification is lost.
@@ -976,10 +993,7 @@ func (a *AdminAPI) afterWrite(r *http.Request, op, tenantID string, before, afte
 	if tenantID == "" {
 		tenantID = "00000000-0000-0000-0000-000000000000"
 	}
-	operator := r.Header.Get("X-Admin-User")
-	if operator == "" {
-		operator = "admin"
-	}
+	operator := OperatorID(r)
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	if err := a.auditor.LogSync(ctx, storage.AuditEvent{

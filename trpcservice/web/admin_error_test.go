@@ -8,6 +8,9 @@ package web_test
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"errors"
 	"fmt"
 	"net/http"
@@ -722,5 +725,27 @@ func TestAdminAfterWriteResilience(t *testing.T) {
 	}
 	if n != 0 {
 		t.Fatalf("failed audit must not write a row, got %d", n)
+	}
+}
+
+// The change audit's operator comes from the verified mTLS client certificate
+// when the listener has one: a header anyone holding the shared token could
+// set is not attributable. The header stays the plain-token fallback, and a
+// CN-less certificate falls back too rather than writing an empty operator.
+func TestOperatorIDPrefersClientCertCN(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/admin/tenants", nil)
+	req.Header.Set("X-Admin-User", "spoofed")
+	if got := web.OperatorID(req); got != "spoofed" {
+		t.Fatalf("plain-token deployment keeps the header operator, got %q", got)
+	}
+	req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{
+		{Subject: pkix.Name{CommonName: "admin-client"}},
+	}}
+	if got := web.OperatorID(req); got != "admin-client" {
+		t.Fatalf("a verified client cert must name the operator, got %q", got)
+	}
+	req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{{}}}
+	if got := web.OperatorID(req); got != "spoofed" {
+		t.Fatalf("a CN-less certificate must fall back to the header, got %q", got)
 	}
 }
