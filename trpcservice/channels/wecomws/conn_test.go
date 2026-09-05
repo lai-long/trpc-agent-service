@@ -484,9 +484,11 @@ func TestInboundNormalized(t *testing.T) {
 	})
 	waitFor(t, func() bool { return h.calls() >= 1 })
 	m := h.last()
+	epoch, reqID := parseReplyToken(m.ReplyToken)
 	if m.Channel != "wecomws" || m.MsgID != "m1" || m.UserID != "u1" || m.Text != "你好" ||
 		m.SessionKey != "dm:wecomws:u1" || m.ChatID != "" || m.Type != channels.TypeText ||
-		m.BindingID != "b1" || m.WebhookPath != "/wecomws/bot-1" || m.ReplyToken != "req-cb-1" {
+		m.BindingID != "b1" || m.WebhookPath != "/wecomws/bot-1" ||
+		epoch == 0 || reqID != "req-cb-1" {
 		t.Fatalf("normalized direct message: %+v", m)
 	}
 

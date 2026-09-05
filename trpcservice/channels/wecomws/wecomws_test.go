@@ -3,6 +3,7 @@ package wecomws
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -158,6 +159,102 @@ func TestSendEmptyReplyToken(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 	if got := len(conn.respondFrames()); got != 0 {
 		t.Fatalf("no frame may leave without a reply token, got %d", got)
+	}
+}
+
+// TestSendStaleReplyTokenAfterReconnect: a req_id is only deliverable on the
+// connection that received its callback. After a reconnect the write on the
+// successor would succeed while the platform drops the uncorrelatable frame —
+// under that behavior the sender recorded the reply as sent and the user never
+// saw it. Send must reject the stale token as an error and write nothing,
+// while a fresh token on the live connection still delivers, and a bare
+// pre-scheme token (in flight across a rolling deploy) keeps sending as-is.
+func TestSendStaleReplyTokenAfterReconnect(t *testing.T) {
+	f := newFakePlatform(t, "bot-1", "s3cr3t")
+	h := &recordingHandler{}
+	ch, bc, _ := startOne(t, f, h)
+	conn := f.waitConn(t, 1)
+	waitFor(t, func() bool { return f.totalAcks.Load() >= 1 })
+
+	// One callback lands on the first connection; its token must carry that
+	// connection's epoch.
+	conn.Push(msgEnvelope("req-stale", "m-stale"))
+	waitFor(t, func() bool { return h.calls() >= 1 })
+	staleToken := h.last().ReplyToken
+	epoch, reqID := parseReplyToken(staleToken)
+	if epoch == 0 || reqID != "req-stale" {
+		t.Fatalf("the reply token must be epoch-scoped, got %q", staleToken)
+	}
+
+	// The platform kicks the connection; a fresh one takes over.
+	conn.Push(envelope{
+		Cmd:     cmdEventCallback,
+		Headers: frameHeaders{ReqID: "ev-kick"},
+		Body:    json.RawMessage(`{"eventtype":"disconnected_event"}`),
+	})
+	conn2 := f.waitConn(t, 2)
+	// Wait for the takeover to be published (not merely dialed): until the
+	// successor's epoch lands, Send would race a "connection is down" instead
+	// of the stale verdict.
+	waitFor(t, func() bool { return bc.currentEpoch() != epoch })
+
+	err := ch.Send(context.Background(), channels.OutboundMessage{
+		Channel: "wecomws", BindingID: "b1", MsgID: "m-stale", ReplyToken: staleToken,
+		UserID: "u1", Text: "too late",
+	})
+	var stale *staleReplyError
+	if !errors.As(err, &stale) {
+		t.Fatalf("a reply across a reconnect must fail as stale, got %v", err)
+	}
+	time.Sleep(150 * time.Millisecond)
+	if got := len(conn2.respondFrames()); got != 0 {
+		t.Fatalf("a stale reply must not be written on the successor, got %d frames", got)
+	}
+
+	// A fresh callback on the successor replies normally, and the frame
+	// carries the bare req_id — never the scoped token.
+	conn2.Push(msgEnvelope("req-fresh", "m-fresh"))
+	waitFor(t, func() bool { return h.calls() >= 2 })
+	if err := ch.Send(context.Background(), channels.OutboundMessage{
+		Channel: "wecomws", BindingID: "b1", MsgID: "m-fresh", ReplyToken: h.last().ReplyToken,
+		UserID: "u1", Text: "on time",
+	}); err != nil {
+		t.Fatalf("a reply on the live connection must send: %v", err)
+	}
+	waitFor(t, func() bool { return len(conn2.respondFrames()) == 1 })
+	if resp := conn2.respondFrames()[0]; resp.Headers.ReqID != "req-fresh" {
+		t.Fatalf("the frame must echo the bare req_id, got %+v", resp)
+	}
+
+	// A token without an epoch (written before the scheme existed) keeps the
+	// old fail-open behavior: sent verbatim.
+	if err := ch.Send(context.Background(), channels.OutboundMessage{
+		Channel: "wecomws", BindingID: "b1", MsgID: "m-legacy", ReplyToken: "req-legacy",
+		UserID: "u1", Text: "rolling deploy",
+	}); err != nil {
+		t.Fatalf("a bare pre-scheme token must still send: %v", err)
+	}
+	waitFor(t, func() bool { return len(conn2.respondFrames()) == 2 })
+	if resp := conn2.respondFrames()[1]; resp.Headers.ReqID != "req-legacy" {
+		t.Fatalf("the bare token must ride the frame verbatim, got %+v", resp)
+	}
+}
+
+// TestParseReplyToken: round-trip and the shapes parseReplyToken must not
+// mistake for scoped — bare ids, and a colon whose prefix is not an epoch.
+func TestParseReplyToken(t *testing.T) {
+	if e, r := parseReplyToken(scopedReplyToken(42, "req-1")); e != 42 || r != "req-1" {
+		t.Fatalf("round trip: epoch=%d req_id=%q", e, r)
+	}
+	if e, r := parseReplyToken("req-42"); e != 0 || r != "req-42" {
+		t.Fatalf("a bare req_id must stay unscoped: epoch=%d req_id=%q", e, r)
+	}
+	if e, r := parseReplyToken("req:x"); e != 0 || r != "req:x" {
+		t.Fatalf("a non-numeric prefix must stay unscoped: epoch=%d req_id=%q", e, r)
+	}
+	// A scoped token keeps a colon inside the req_id intact.
+	if e, r := parseReplyToken(scopedReplyToken(7, "odd:req")); e != 7 || r != "odd:req" {
+		t.Fatalf("the split must be at the first colon only: epoch=%d req_id=%q", e, r)
 	}
 }
 

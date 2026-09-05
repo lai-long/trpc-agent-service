@@ -29,6 +29,18 @@ type kickedError struct{}
 
 func (*kickedError) Error() string { return "wecomws: disconnected by platform" }
 
+// staleReplyError marks a reply whose token was stamped by a connection that
+// is no longer live: the platform correlates replies per connection, so the
+// req_id is undeliverable on any successor. Retrying cannot heal it — the
+// sender's attempts bound it into the dead-letter — and the reply must not be
+// recorded as sent, which is what a plain successful write on the successor
+// connection would have done.
+type staleReplyError struct{ reqID string }
+
+func (e *staleReplyError) Error() string {
+	return fmt.Sprintf("wecomws: stale reply token (req_id %s): the callback's connection was replaced, the platform can no longer correlate this reply", e.reqID)
+}
+
 // botConn owns one bot's connection lifecycle: dial → subscribe → heartbeat +
 // read loop → jittered reconnect. run returns only when its ctx is canceled;
 // every other failure reconnects internally with backoff.
@@ -43,6 +55,7 @@ type botConn struct {
 	mu      sync.Mutex
 	conn    *websocket.Conn
 	pingOut string // req_id of the heartbeat awaiting its pong
+	epoch   uint64 // identity of the current connection; scopes reply tokens (0 before the first setConn)
 }
 
 // run owns the connection until ctx is canceled, reconnecting on every
@@ -168,7 +181,11 @@ func (c *botConn) serve(ctx context.Context, h channels.Handler) error {
 	// Published only after the ack: until then Send sees "no live
 	// connection" (the sender's PEL retries) instead of writing respond
 	// frames the platform silently drops on an un-subscribed socket.
-	c.setConn(ws)
+	epoch, err := newEpoch()
+	if err != nil {
+		return err
+	}
+	c.setConn(ws, epoch)
 	go c.heartbeat(connCtx, ws, cancelConn)
 
 	for _, env := range pending {
@@ -340,16 +357,28 @@ func (c *botConn) normalize(env envelope) (channels.InboundMessage, error) {
 		Type:        channels.TypeText,
 		WebhookPath: c.binding.WebhookPath,
 		BindingID:   c.binding.ID,
-		ReplyToken:  env.Headers.ReqID,
+		ReplyToken:  scopedReplyToken(c.currentEpoch(), env.Headers.ReqID),
 		ReceivedAt:  time.Now(),
 	}, nil
 }
 
-// setConn publishes the connection the read loop just dialed.
-func (c *botConn) setConn(ws *websocket.Conn) {
+// currentEpoch reports the identity of the connection now serving this bot.
+// Every frame this serve attempt dispatches was read on this attempt's socket
+// and run() dials a successor only after serve returns, so reading it here
+// stamps each callback with the connection it actually arrived on.
+func (c *botConn) currentEpoch() uint64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.epoch
+}
+
+// setConn publishes the connection the read loop just dialed, under the fresh
+// epoch that scopes this attempt's reply tokens.
+func (c *botConn) setConn(ws *websocket.Conn, epoch uint64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.conn = ws
+	c.epoch = epoch
 	c.pingOut = ""
 }
 
@@ -383,13 +412,20 @@ func (c *botConn) writeLockedOn(ctx context.Context, ws *websocket.Conn, data []
 }
 
 // write is the Send-facing serializer: one frame, bounded write timeout.
-func (c *botConn) write(ctx context.Context, env envelope) error {
+// wantEpoch is the connection epoch the reply token was stamped with (0 for a
+// pre-scheme token); checked under the same lock as the write, so a reconnect
+// between the check and the write cannot let a dead token slip onto the
+// successor connection.
+func (c *botConn) write(ctx context.Context, env envelope, wantEpoch uint64) error {
 	data, err := json.Marshal(env)
 	if err != nil {
 		return err
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if wantEpoch != 0 && wantEpoch != c.epoch {
+		return &staleReplyError{reqID: env.Headers.ReqID}
+	}
 	return c.writeLocked(ctx, data)
 }
 

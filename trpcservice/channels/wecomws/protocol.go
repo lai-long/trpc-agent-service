@@ -2,9 +2,12 @@ package wecomws
 
 import (
 	"crypto/rand"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"strconv"
+	"strings"
 )
 
 // WeCom aibot WebSocket protocol commands.
@@ -139,4 +142,47 @@ func newReqID() (string, error) {
 		return "", fmt.Errorf("new req_id: %w", err)
 	}
 	return hex.EncodeToString(b[:]), nil
+}
+
+// scopedReplyToken couples the callback's req_id with the epoch of the
+// connection that received it: "<epoch>:<req_id>". The platform correlates a
+// reply by req_id on the connection that asked, so after a reconnect the old
+// req_id is undeliverable — the token has to carry which connection earned it
+// or a successor connection would accept the write while the platform drops
+// the frame as uncorrelatable.
+func scopedReplyToken(epoch uint64, reqID string) string {
+	return strconv.FormatUint(epoch, 10) + ":" + reqID
+}
+
+// parseReplyToken splits a scoped reply token back into its epoch and req_id.
+// An epoch of 0 means the token predates epoch-scoping (a message in flight
+// across a rolling deploy): it is sent as-is, the pre-scheme behavior, since
+// its owning connection cannot be identified anymore.
+func parseReplyToken(token string) (epoch uint64, reqID string) {
+	i := strings.IndexByte(token, ':')
+	if i < 0 {
+		return 0, token
+	}
+	e, err := strconv.ParseUint(token[:i], 10, 64)
+	if err != nil {
+		return 0, token
+	}
+	return e, token[i+1:]
+}
+
+// newEpoch returns a random non-zero connection epoch. It must be unique
+// across processes — a new leader redials with fresh epochs, and a plain
+// per-connection counter would collide with the predecessor's counter and
+// bless a dead predecessor's tokens — so 64 random bits instead; zero stays
+// reserved for "unscoped".
+func newEpoch() (uint64, error) {
+	var b [8]byte
+	for {
+		if _, err := rand.Read(b[:]); err != nil {
+			return 0, fmt.Errorf("new epoch: %w", err)
+		}
+		if e := binary.BigEndian.Uint64(b[:]); e != 0 {
+			return e, nil
+		}
+	}
 }

@@ -389,7 +389,7 @@ func TestPreAckBuffering(t *testing.T) {
 	}
 	if last := h.last(); last.MsgID != fmt.Sprintf("m%d", pendingBufferMax-1) {
 		t.Fatalf("the newest buffered callback must dispatch last, got %q", last.MsgID)
-	} else if last.ReplyToken != fmt.Sprintf("pre-%d", pendingBufferMax-1) {
+	} else if _, reqID := parseReplyToken(last.ReplyToken); reqID != fmt.Sprintf("pre-%d", pendingBufferMax-1) {
 		t.Fatalf("buffered callbacks must keep their req_id: %+v", last)
 	}
 }
@@ -600,7 +600,7 @@ func TestSendWithoutLiveConnection(t *testing.T) {
 		t.Fatalf("a send on a dead connection must fail loudly, got %v", err)
 	}
 
-	err = bc.write(context.Background(), envelope{Cmd: cmdRespond, Body: json.RawMessage(`{oops`)})
+	err = bc.write(context.Background(), envelope{Cmd: cmdRespond, Body: json.RawMessage(`{oops`)}, 0)
 	if err == nil {
 		t.Fatal("an unserializable frame must fail to send")
 	}

@@ -126,9 +126,13 @@ func (c *Channel) RegisterRoutes(_ *http.ServeMux, _ channels.Handler) {}
 
 // Send implements channels.Channel: every segment goes out as one
 // aibot_respond_msg frame on the binding's connection, echoing the callback
-// frame's req_id the platform correlates replies by. Unknown bindings and
-// missing reply tokens are errors — the message stays pending in the sender's
-// PEL and redelivers instead of being dropped.
+// frame's req_id the platform correlates replies by. The reply token carries
+// the epoch of the connection that received the callback, and a token from a
+// replaced connection is rejected as stale: the write would succeed on the
+// successor socket while the platform drops the frame, so the sender would
+// record the reply as sent and the user would never see it. Unknown bindings
+// and missing reply tokens are errors — the message stays pending in the
+// sender's PEL and redelivers instead of being dropped.
 func (c *Channel) Send(ctx context.Context, msg channels.OutboundMessage) error {
 	bc := c.byBinding(msg.BindingID)
 	if bc == nil {
@@ -141,17 +145,18 @@ func (c *Channel) Send(ctx context.Context, msg channels.OutboundMessage) error 
 		plog.Errorf("wecomws: outbound msg %s carries no reply token (req_id), cannot respond", msg.MsgID)
 		return errors.New("wecomws: missing reply token (req_id)")
 	}
+	epoch, reqID := parseReplyToken(msg.ReplyToken)
 	msgType := "text"
 	if msg.TextType == channels.TextTypeMarkdown {
 		msgType = channels.TextTypeMarkdown
 	}
 	segments := channels.SplitText(msg.Text, c.segment)
 	for i, seg := range segments {
-		frame, err := respondFrame(msg.ReplyToken, msgType, seg)
+		frame, err := respondFrame(reqID, msgType, seg)
 		if err != nil {
 			return err
 		}
-		if err := bc.write(ctx, frame); err != nil {
+		if err := bc.write(ctx, frame, epoch); err != nil {
 			if i > 0 {
 				return fmt.Errorf("wecomws: send segment %d/%d (partial delivery): %w", i+1, len(segments), err)
 			}
