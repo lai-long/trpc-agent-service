@@ -44,6 +44,41 @@ func TestCheckAdminToken(t *testing.T) {
 	}
 }
 
+// TestInstanceID covers the replica identity that ends up in stream consumer
+// names and lock owner tokens: a shared name across replicas is what lets one
+// replica renew another's expired session lease.
+func TestInstanceID(t *testing.T) {
+	first := instanceID()
+	if first == "" {
+		t.Fatal("instance id must never be empty")
+	}
+	if second := instanceID(); second != first {
+		t.Fatalf("instance id must be stable within one process: %q then %q", first, second)
+	}
+}
+
+// TestSchemeIs pins the IM endpoint gate: the token endpoints carry the corp
+// secret in the query string, so anything but an https/wss URL with a host is
+// refused and the channel is disabled at startup.
+func TestSchemeIs(t *testing.T) {
+	if !schemeIs("https://qyapi.weixin.qq.com", "https") {
+		t.Fatal("https base must be accepted")
+	}
+	if !schemeIs("wss://openws.work.weixin.qq.com", "wss") {
+		t.Fatal("wss addr must be accepted")
+	}
+	for _, bad := range []string{
+		"http://qyapi.weixin.qq.com", "ws://127.0.0.1:9000", "://bad", "", "https://",
+	} {
+		if schemeIs(bad, "https") {
+			t.Errorf("https: %q must be refused", bad)
+		}
+		if schemeIs(bad, "wss") {
+			t.Errorf("wss: %q must be refused", bad)
+		}
+	}
+}
+
 func TestAdminTLSConfigUnset(t *testing.T) {
 	cfg, err := adminTLSConfig(config.Config{})
 	if cfg != nil || err != nil {

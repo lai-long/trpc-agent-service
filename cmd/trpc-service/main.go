@@ -2,14 +2,17 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"slices"
@@ -133,7 +136,7 @@ func serve(role string) error {
 	if err := stream.EnsureGroup(ctx, storage.StreamInbound, "workers"); err != nil {
 		return err
 	}
-	if err := stream.EnsureGroup(ctx, storage.StreamOutbound, "senders"); err != nil {
+	if err := stream.EnsureGroup(ctx, storage.StreamOutbound, channels.DefaultSenderGroup); err != nil {
 		return err
 	}
 	// wecomws replies ride the same outbound stream but are delivered by the
@@ -209,7 +212,7 @@ func serve(role string) error {
 	}
 
 	g, gctx := errgroup.WithContext(ctx)
-	consumer := fmt.Sprintf("%s-%d", role, os.Getpid())
+	consumer := fmt.Sprintf("%s-%s-%d", role, instanceID(), os.Getpid())
 
 	// --- Gateway role: IM callbacks in, replies out -------------------------
 	if wantGateway {
@@ -361,7 +364,7 @@ func serve(role string) error {
 			}
 			g.Go(func() error {
 				return runWecomwsLeader(gctx, storage.NewLeaderLock(rdb), wsStarter, wsSender, enqueue,
-					consumer, parseDuration(cfg.WecomwsLeaderTTL, 15*time.Second))
+					consumer, parseDuration(cfg.WecomwsLeaderTTL, defaultWecomwsLeaderTTL))
 			})
 		}
 	}
@@ -544,6 +547,16 @@ func startPGConsumers(ctx context.Context, cfg config.Config) (*storage.Auditor,
 	}
 }
 
+// schemeIs reports whether an external endpoint URL carries the wanted
+// scheme: the IM token endpoints put the corp secret in the query string, so
+// an http:// base ships it in cleartext across every network between here and
+// the IM. The model endpoint is held to the same bar by the tenant config
+// validator.
+func schemeIs(base, want string) bool {
+	u, err := url.Parse(base)
+	return err == nil && u.Scheme == want && u.Hostname() != ""
+}
+
 // startWecom builds the WeCom channel from env config; it returns nil (with a
 // warning) when the channel is not configured or its secrets are missing, so
 // the rest of the platform keeps serving the other channels. media is the
@@ -552,6 +565,10 @@ func startPGConsumers(ctx context.Context, cfg config.Config) (*storage.Auditor,
 // every reply on the env-global identity).
 func startWecom(cfg config.Config, media channels.MediaStore, secrets config.SecretResolver, bindings channels.BindingProvider) *wecom.Channel {
 	if cfg.WecomCorpID == "" {
+		return nil
+	}
+	if !schemeIs(cfg.WecomAPIBase, "https") {
+		plog.Warnf("wecom channel disabled: TRPC_WECOM_API_BASE %q must use https", cfg.WecomAPIBase)
 		return nil
 	}
 	agentID, err := strconv.Atoi(cfg.WecomAgentID)
@@ -583,6 +600,10 @@ func startWxkf(cfg config.Config, secrets config.SecretResolver, bindings channe
 	if cfg.WxkfCorpID == "" || cfg.WxkfKfAccount == "" {
 		return nil
 	}
+	if !schemeIs(cfg.WxkfAPIBase, "https") {
+		plog.Warnf("wxkf channel disabled: TRPC_WXKF_API_BASE %q must use https", cfg.WxkfAPIBase)
+		return nil
+	}
 	ch, err := wxkf.New(wxkf.Config{
 		CorpID:    cfg.WxkfCorpID,
 		KfAccount: cfg.WxkfKfAccount,
@@ -608,19 +629,23 @@ func startWecomws(cfg config.Config, secrets config.SecretResolver, routes wecom
 	if cfg.WecomwsAddr == "" {
 		return nil
 	}
+	if !schemeIs(cfg.WecomwsAddr, "wss") {
+		plog.Warnf("wecomws channel disabled: TRPC_WECOMWS_ADDR %q must use wss", cfg.WecomwsAddr)
+		return nil
+	}
 	ws, err := wecomws.New(secrets,
 		wecomws.WithAddr(cfg.WecomwsAddr),
 		wecomws.WithRoutes(routes),
-		wecomws.WithPingInterval(parseDuration(cfg.WecomwsPingInterval, 30*time.Second)),
-		wecomws.WithSegmentBytes(parseInt(cfg.WecomwsSegmentBytes, 2048)),
-		wecomws.WithResyncInterval(parseDuration(cfg.WecomwsResyncInterval, 15*time.Second)),
+		wecomws.WithPingInterval(parseDuration(cfg.WecomwsPingInterval, wecomws.DefaultPingInterval)),
+		wecomws.WithSegmentBytes(parseInt(cfg.WecomwsSegmentBytes, wecomws.DefaultSegmentBytes)),
+		wecomws.WithResyncInterval(parseDuration(cfg.WecomwsResyncInterval, wecomws.DefaultResyncInterval)),
 	)
 	if err != nil {
 		plog.Warnf("wecomws channel disabled: %v", err)
 		return nil
 	}
 	plog.Infof("wecomws channel enabled (addr %s, leader ttl %s)", cfg.WecomwsAddr,
-		parseDuration(cfg.WecomwsLeaderTTL, 15*time.Second))
+		parseDuration(cfg.WecomwsLeaderTTL, defaultWecomwsLeaderTTL))
 	return ws
 }
 
@@ -662,8 +687,9 @@ func (b bindingProvider) BindingByID(ctx context.Context, id string) (channels.O
 // toward the cap, so an instantly failing child (e.g. misconfiguration) does
 // not spin the acquire/run/release cycle on a fixed 2s cadence forever.
 const (
-	recampaignBase = 2 * time.Second
-	recampaignCap  = time.Minute
+	recampaignBase          = 2 * time.Second
+	recampaignCap           = time.Minute
+	defaultWecomwsLeaderTTL = 15 * time.Second
 )
 
 func recampaignWait(failStreak int) time.Duration {
@@ -688,8 +714,9 @@ func runWecomwsLeader(ctx context.Context, leader *storage.LeaderLock, starter c
 				return nil
 			}
 			plog.Warnf("wecomws leader acquire: %v", err)
+			wait := recampaignWait(failStreak)
 			failStreak++
-			if !wecomws.Sleep(ctx, recampaignWait(failStreak)) {
+			if !wecomws.Sleep(ctx, wait) {
 				return nil
 			}
 			continue
@@ -715,8 +742,10 @@ func runWecomwsLeader(ctx context.Context, leader *storage.LeaderLock, starter c
 		cancel()
 		release()
 		<-innerDone // drain: children stopped, run loops returned
+		wait := recampaignBase
 		if innerErr != nil && ctx.Err() == nil {
 			plog.Errorf("wecomws leader role failed, re-campaigning: %v", innerErr)
+			wait = recampaignWait(failStreak)
 			if time.Since(started) < recampaignCap {
 				failStreak++
 			} else {
@@ -728,7 +757,7 @@ func runWecomwsLeader(ctx context.Context, leader *storage.LeaderLock, starter c
 		if ctx.Err() != nil {
 			return nil
 		}
-		if !wecomws.Sleep(ctx, recampaignWait(failStreak)) {
+		if !wecomws.Sleep(ctx, wait) {
 			return nil
 		}
 	}
@@ -928,6 +957,24 @@ func buildSummarizer(ctx context.Context, cfg config.Config, secrets config.Secr
 	return sessionsummary.NewSummarizer(m, sessionsummary.WithEventThreshold(threshold))
 }
 
+// instanceID names this replica for consumer-group and lock-owner tokens.
+// The PID alone is not enough: a container runs its entrypoint as PID 1, so
+// every replica of the same image would share one name and the session lock
+// could no longer tell which replica holds a lease. Hostname separates
+// replicas (the pod name under k8s); the random fallback covers hosts that
+// have none, where several processes may also start at once.
+func instanceID() string {
+	h, err := os.Hostname()
+	if err != nil || h == "" {
+		var b [8]byte
+		if _, err := rand.Read(b[:]); err != nil {
+			return "anon-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+		}
+		return "anon-" + hex.EncodeToString(b[:])
+	}
+	return h
+}
+
 // parseInt / parseFloat / parseDuration parse env string values, falling back
 // to def with a warning on invalid input.
 func parseInt(s string, def int) int {
@@ -1059,7 +1106,7 @@ func buildKnowledge(ctx context.Context, cfg config.Config, secrets config.Secre
 	go func() {
 		// Detached context: a deployment-time data fix must not die with the
 		// startup request's cancellation, but it must not hang forever either.
-		rctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Minute)
 		defer cancel()
 		n, err := agent.RekeyLegacyDocuments(rctx, vs)
 		if err != nil {

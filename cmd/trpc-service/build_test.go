@@ -497,7 +497,12 @@ func TestStartWecom(t *testing.T) {
 	}
 	base := config.Config{
 		WecomCorpID: "corp", WecomTokenRef: "wecom-token", WecomAESKeyRef: "wecom-aeskey",
-		WecomAPIBase: "http://127.0.0.1:1",
+		WecomAPIBase: "https://127.0.0.1:1",
+	}
+	if wc := startWecom(config.Config{
+		WecomCorpID: "corp", WecomAgentID: "1000002", WecomAPIBase: "http://127.0.0.1:1",
+	}, nil, secrets, nil); wc != nil {
+		t.Fatal("an http API base must disable the channel (token rides the query)")
 	}
 	for _, agentID := range []string{"not-a-number", "0", ""} {
 		cfg := base
@@ -516,7 +521,7 @@ func TestStartWecom(t *testing.T) {
 	wc := startWecom(config.Config{
 		WecomCorpID: "corp", WecomAgentID: "1000002",
 		WecomTokenRef: "wecom-token", WecomAESKeyRef: "wecom-aeskey",
-		WecomAPIBase: "http://127.0.0.1:1",
+		WecomAPIBase: "https://127.0.0.1:1",
 	}, nil, secrets, nil)
 	if wc == nil {
 		t.Fatal("valid config must enable the wecom channel")
@@ -540,11 +545,16 @@ func TestStartWxkf(t *testing.T) {
 	}, config.NewFileResolver(t.TempDir()), nil); ch != nil {
 		t.Fatal("unresolvable secrets must disable the channel")
 	}
+	if ch := startWxkf(config.Config{
+		WxkfCorpID: "corp", WxkfKfAccount: "wk0001", WxkfAPIBase: "http://127.0.0.1:1",
+	}, secrets, nil); ch != nil {
+		t.Fatal("an http API base must disable the channel (secret rides the query)")
+	}
 
 	cfg := config.Config{
 		WxkfCorpID: "corp", WxkfKfAccount: "wk0001",
 		WxkfTokenRef: "wxkf-token", WxkfAESKeyRef: "wxkf-aeskey",
-		WxkfAPIBase: "http://127.0.0.1:1",
+		WxkfAPIBase: "https://127.0.0.1:1",
 	}
 	ch := startWxkf(cfg, secrets, nil)
 	if ch == nil {
