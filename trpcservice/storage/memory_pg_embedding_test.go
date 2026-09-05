@@ -209,3 +209,75 @@ func TestPGMemorySearchFallbackWithoutEmbedder(t *testing.T) {
 		t.Fatalf("keyword search without embedder must still work: %+v", found)
 	}
 }
+
+// A memory id from another tenant must not be deletable. The soft delete
+// carries the tenant predicate, so it matches nothing — and the vector row has
+// to survive that, otherwise anyone holding the id could destroy a recall they
+// were never authorized to read.
+func TestPGMemoryDeleteGuardsForeignMemory(t *testing.T) {
+	_, pool := pgSessionService(t)
+	ensureMemoryEmbeddingTable(t, pool)
+	svc := storage.NewPGMemoryService(pool,
+		storage.WithMemoryEmbedder(memFakeEmbedder{dim: storage.MemoryEmbeddingDimension}))
+	t.Cleanup(func() { _ = svc.Close() })
+
+	ctx := context.Background()
+	key := memoryUserKey(t.Name())
+	t.Cleanup(func() {
+		_, _ = pool.Exec(ctx, `DELETE FROM memory_item WHERE user_id = $1`, key.UserID)
+	})
+
+	if err := svc.AddMemory(ctx, key, "隔离用例：用户偏好关键词丙", []string{"偏好"}); err != nil {
+		t.Fatal(err)
+	}
+	waitForEmbeddings(t, pool, key.UserID, 1)
+	found, err := svc.SearchMemories(ctx, key, "关键词丙")
+	if err != nil || len(found) != 1 {
+		t.Fatalf("seed memory not found: %+v err=%v", found, err)
+	}
+	memoryID := found[0].ID
+
+	// The same id resolved through an app of a second tenant.
+	if err := svc.DeleteMemory(ctx,
+		memory.Key{AppName: foreignTenantApp(t, pool), UserID: key.UserID, MemoryID: memoryID}); err != nil {
+		t.Fatal(err)
+	}
+
+	entries, err := svc.ReadMemories(ctx, key, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("a delete from another tenant must not touch the memory, got %d", len(entries))
+	}
+	var vecRows int
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM memory_embedding WHERE memory_id = $1`, memoryID).Scan(&vecRows); err != nil {
+		t.Fatal(err)
+	}
+	if vecRows != 1 {
+		t.Fatalf("a delete from another tenant must not remove the embedding row, got %d", vecRows)
+	}
+}
+
+// foreignTenantApp inserts a second tenant with its own app and returns the
+// app id: resolving through it yields a different tenant_id, which is what the
+// isolation predicates compare against.
+func foreignTenantApp(t *testing.T, pool *pgxpool.Pool) string {
+	t.Helper()
+	ctx := context.Background()
+	const tenantID = "00000000-0000-0000-0000-0000000000bb"
+	const appID = "00000000-0000-0000-0000-0000000001bb"
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO tenant (id, name, status) VALUES ($1, 'pg-memory-foreign', 'active')
+		 ON CONFLICT (id) DO NOTHING`, tenantID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO agent_app (id, tenant_id, name, agent_type, config, version, status)
+		 VALUES ($1, $2, 'pg-memory-foreign', 'llm', '{}', 1, 'published') ON CONFLICT DO NOTHING`,
+		appID, tenantID); err != nil {
+		t.Fatal(err)
+	}
+	return appID
+}

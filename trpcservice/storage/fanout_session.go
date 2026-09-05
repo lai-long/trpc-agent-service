@@ -2,12 +2,19 @@ package storage
 
 import (
 	"context"
+	"time"
 
 	"trpc.group/trpc-go/trpc-agent-go/event"
 	"trpc.group/trpc-go/trpc-agent-go/session"
 
 	plog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
 )
+
+// shadowWriteTimeout caps one shadow write. The secondary is a best-effort
+// copy that the backfill and the consistency check re-cover, so a stalled
+// migration target must never hold the authoritative path to the caller's
+// full deadline — which is unbounded on the message path.
+const shadowWriteTimeout = time.Second
 
 // FanoutSessionService dual-writes two session backends during a storage
 // migration: reads and summary queries go to the primary (the authoritative
@@ -74,12 +81,22 @@ func (f *FanoutSessionService) UpdateSessionState(ctx context.Context, key sessi
 }
 
 func (f *FanoutSessionService) AppendEvent(ctx context.Context, sess *session.Session, e *event.Event, opts ...session.Option) error {
-	// Shadow first: a slow secondary must not delay the authoritative write.
-	// The secondary gets a Clone — AppendEvent mutates the carrier's event
-	// list (UpdateUserSession), and sharing the pointer would append every
-	// event twice into the caller's in-flight session.
-	f.shadow("append_event", f.Secondary.AppendEvent(ctx, sess.Clone(), e, opts...))
-	return f.Primary.AppendEvent(ctx, sess, e, opts...)
+	// The secondary gets a Clone, taken before either write: AppendEvent
+	// mutates the carrier's event list (UpdateUserSession), and sharing the
+	// pointer would append every event twice into the caller's in-flight
+	// session.
+	shadow := sess.Clone()
+	// Authoritative write first, on the caller's context: a shadow that ran
+	// ahead of a failed primary write is a divergence the consistency check
+	// would have to reconcile.
+	err := f.Primary.AppendEvent(ctx, sess, e, opts...)
+	// The shadow write then gets its own short budget, so a stalled secondary
+	// costs at most shadowWriteTimeout instead of holding the message path to
+	// the caller's deadline.
+	sctx, cancel := context.WithTimeout(ctx, shadowWriteTimeout)
+	defer cancel()
+	f.shadow("append_event", f.Secondary.AppendEvent(sctx, shadow, e, opts...))
+	return err
 }
 
 func (f *FanoutSessionService) CreateSessionSummary(ctx context.Context, sess *session.Session, filterKey string, force bool) error {

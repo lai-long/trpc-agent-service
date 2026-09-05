@@ -339,9 +339,12 @@ func (s *PGSessionService) DeleteSession(ctx context.Context, key session.Key, _
 		return fmt.Errorf("find session: %w", err)
 	}
 	// Children first: neither FK declares ON DELETE CASCADE, so deleting the
-	// session row while events still reference it would violate the FK.
+	// session row while events still reference it would violate the FK. The
+	// archive has no FK at all, so it would otherwise keep the conversation
+	// forever — a deletion that leaves the content behind is not a deletion.
 	for _, q := range []string{
 		`DELETE FROM session_event WHERE session_id = $1`,
+		`DELETE FROM session_event_archive WHERE session_id = $1`,
 		`DELETE FROM summary WHERE session_id = $1`,
 	} {
 		if _, err := tx.Exec(ctx, q, sessID); err != nil {

@@ -250,3 +250,68 @@ func TestFanoutSessionServiceShadowFailureDoesNotBreakPrimary(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 }
+
+// stalledSessionService hangs in AppendEvent until its context is done: a
+// shadow backend that stopped answering must not stall the authoritative
+// write behind it.
+type stalledSessionService struct {
+	*sessioninmemory.SessionService
+	called chan struct{}
+}
+
+func (s *stalledSessionService) AppendEvent(ctx context.Context, _ *session.Session, _ *event.Event, _ ...session.Option) error {
+	select {
+	case s.called <- struct{}{}:
+	default:
+	}
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+// The shadow write is best-effort: it must neither delay nor fail the
+// authoritative append, and a secondary that hangs is bounded by its own short
+// budget instead of the caller's (unbounded) one.
+func TestFanoutAppendEventDoesNotWaitOnStalledShadow(t *testing.T) {
+	primary := sessioninmemory.NewSessionService()
+	t.Cleanup(func() { _ = primary.Close() })
+	shadow := &stalledSessionService{
+		SessionService: sessioninmemory.NewSessionService(),
+		called:         make(chan struct{}, 1),
+	}
+	fo := &storage.FanoutSessionService{Primary: primary, Secondary: shadow}
+
+	ctx := context.Background()
+	key := session.Key{AppName: "a1", UserID: "u1", SessionID: "s1"}
+	sess, err := primary.CreateSession(ctx, key, session.StateMap{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// No deadline on the caller's context at all: only the shadow's own
+	// budget can end the wait.
+	done := make(chan error, 1)
+	start := time.Now()
+	go func() { done <- fo.AppendEvent(ctx, sess, textEvent("e1", "user", "hi")) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("a stalled shadow must not fail the authoritative write: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("AppendEvent waited on a stalled shadow backend")
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("the shadow write must not hold the message path, took %v", elapsed)
+	}
+	if len(shadow.called) == 0 {
+		t.Fatal("the shadow backend was never called")
+	}
+
+	got, err := primary.GetSession(ctx, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Events) != 1 || got.Events[0].ID != "e1" {
+		t.Fatalf("the authoritative write must still land: %+v", got.Events)
+	}
+}

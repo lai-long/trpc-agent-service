@@ -299,11 +299,18 @@ func (s *PGMemoryService) DeleteMemory(ctx context.Context, memoryKey memory.Key
 	if err != nil {
 		return err
 	}
-	if _, err := s.pool.Exec(ctx,
+	tag, err := s.pool.Exec(ctx,
 		`UPDATE memory_item SET deleted_at = now()
 		 WHERE id=$1 AND user_id=$2 AND tenant_id=$3 AND deleted_at IS NULL`,
-		memoryKey.MemoryID, memoryKey.UserID, tenantID); err != nil {
+		memoryKey.MemoryID, memoryKey.UserID, tenantID)
+	if err != nil {
 		return fmt.Errorf("delete memory: %w", err)
+	}
+	// Nothing matched, so the row is another tenant's (or another user's, or
+	// already deleted). Deleting the vector anyway would let anyone holding a
+	// memory id destroy a recall they were never authorized to touch.
+	if tag.RowsAffected() == 0 {
+		return nil
 	}
 	if _, err := s.pool.Exec(ctx,
 		`DELETE FROM memory_embedding WHERE memory_id = $1`, memoryKey.MemoryID); err != nil {

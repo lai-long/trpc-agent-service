@@ -440,3 +440,43 @@ func TestPGSessionEventTimeFilterAndUnknownChannel(t *testing.T) {
 		t.Fatalf("an early cutoff must keep all events, got %d", len(past.Events))
 	}
 }
+
+// Deleting a session must take its archived events with it. session_event_archive
+// declares no FK to session, so without an explicit delete the archived half of
+// a conversation outlives the request that was supposed to erase it.
+func TestPGSessionDeleteRemovesArchivedEvents(t *testing.T) {
+	svc, pool := pgSessionService(t)
+	ctx := context.Background()
+	key := testKey(t.Name())
+	cleanupSession(t, pool, key)
+	t.Cleanup(func() { cleanupSession(t, pool, key) })
+
+	if _, err := svc.CreateSession(ctx, key, session.StateMap{}); err != nil {
+		t.Fatal(err)
+	}
+	var sessID string
+	if err := pool.QueryRow(ctx,
+		`SELECT id FROM session WHERE app_id=$1 AND session_key=$2`,
+		key.AppName, key.SessionID).Scan(&sessID); err != nil {
+		t.Fatal(err)
+	}
+	// An archived event, as the archive task leaves it behind after moving
+	// the row out of session_event.
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO session_event_archive (id, session_id, event_seq, event, created_at)
+		 VALUES (gen_random_uuid(), $1, 1, '{"archived":true}', now())`, sessID); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := svc.DeleteSession(ctx, key); err != nil {
+		t.Fatal(err)
+	}
+	var left int
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM session_event_archive WHERE session_id=$1`, sessID).Scan(&left); err != nil {
+		t.Fatal(err)
+	}
+	if left != 0 {
+		t.Fatalf("archived events must go with the session, got %d left", left)
+	}
+}

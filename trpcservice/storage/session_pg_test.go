@@ -62,6 +62,8 @@ func cleanupSession(t *testing.T, pool *pgxpool.Pool, key session.Key) {
 	ctx := context.Background()
 	_, _ = pool.Exec(ctx, `DELETE FROM session_event WHERE session_id IN
 		(SELECT id FROM session WHERE app_id=$1 AND session_key=$2)`, key.AppName, key.SessionID)
+	_, _ = pool.Exec(ctx, `DELETE FROM session_event_archive WHERE session_id IN
+		(SELECT id FROM session WHERE app_id=$1 AND session_key=$2)`, key.AppName, key.SessionID)
 	_, _ = pool.Exec(ctx, `DELETE FROM summary WHERE session_id IN
 		(SELECT id FROM session WHERE app_id=$1 AND session_key=$2)`, key.AppName, key.SessionID)
 	_, _ = pool.Exec(ctx, `DELETE FROM session WHERE app_id=$1 AND session_key=$2`, key.AppName, key.SessionID)
