@@ -4,8 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/redis/go-redis/v9"
 )
 
 // A non-positive ttl must be refused, not leased as an immortal key (and
@@ -85,5 +88,54 @@ func TestLeaderLockMutexAndTakeover(t *testing.T) {
 	defer gcancel()
 	if _, _, err := NewLeaderLock(rdb).Acquire(gctx, name, "C", 2*time.Second); err != nil {
 		t.Fatalf("acquire after release must succeed immediately: %v", err)
+	}
+}
+
+// partitionHook fails every command while engaged, simulating a Redis
+// partition for the fencing test below.
+type partitionHook struct{ on atomic.Bool }
+
+func (h *partitionHook) DialHook(next redis.DialHook) redis.DialHook { return next }
+
+func (h *partitionHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		if h.on.Load() {
+			return errors.New("simulated partition")
+		}
+		return next(ctx, cmd)
+	}
+}
+
+func (h *partitionHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return next
+}
+
+// TestLeaderLockStepsDownOnProlongedPartition: once renew failures span the
+// full TTL the lease has provably lapsed — another replica may already hold
+// it — so the watchdog must close lost and step down instead of retrying
+// forever while acting as leader.
+func TestLeaderLockStepsDownOnProlongedPartition(t *testing.T) {
+	rdb := redisOrSkip(t)
+	ctx := context.Background()
+	name := fmt.Sprintf("leader-fence-%d", time.Now().UnixNano())
+
+	partition := &partitionHook{}
+	rdb.AddHook(partition)
+
+	release, lost, err := NewLeaderLock(rdb).Acquire(ctx, name, "A", 600*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		partition.on.Store(false)
+		release()
+		rdb.Del(ctx, leaderKey(name))
+	}()
+
+	partition.on.Store(true)
+	select {
+	case <-lost:
+	case <-time.After(5 * time.Second):
+		t.Fatal("lost must close once renew failures span the ttl")
 	}
 }

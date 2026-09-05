@@ -32,10 +32,12 @@ func leaderKey(name string) string { return "lock:leader:" + name }
 
 // Acquire blocks until leadership is won or ctx is done, retrying the SetNX
 // roughly every second with jitter. While held, a watchdog renews the lease
-// every ttl/3: a Redis hiccup is
-// retried on the next tick (the TTL has slack for one or two misses), only
-// actually losing the lock — another holder took over after expiry — closes
-// lost. release is idempotent and frees the key only if we still own it.
+// every ttl/3: a Redis hiccup is retried on the next tick (the TTL has slack
+// for one or two misses), but once renew failures span the full TTL the
+// lease has provably lapsed and lost closes, so the holder steps down
+// instead of running alongside a new leader. lost also closes when another
+// holder took over after expiry. release is idempotent and frees the key
+// only if we still own it.
 func (l *LeaderLock) Acquire(ctx context.Context, name, owner string, ttl time.Duration) (release func(), lost <-chan struct{}, err error) {
 	// A non-positive ttl would both lease a key that never expires (SetNX 0)
 	// and panic the watchdog's ticker on ttl/3; refuse it instead — the
@@ -74,6 +76,7 @@ func (l *LeaderLock) Acquire(ctx context.Context, name, owner string, ttl time.D
 	go func() {
 		ticker := time.NewTicker(ttl / 3)
 		defer ticker.Stop()
+		lastRenewOK := time.Now()
 		for {
 			select {
 			case <-done:
@@ -83,10 +86,21 @@ func (l *LeaderLock) Acquire(ctx context.Context, name, owner string, ttl time.D
 			case <-ticker.C:
 				ok, err := extendKey(ctx, l.rdb, key, owner, ttl)
 				switch {
+				case err == nil && ok:
+					lastRenewOK = time.Now()
 				case err != nil:
 					// Transient Redis failure: keep renewing — the lease has
-					// slack for a missed tick, and declaring loss here would
-					// drop leadership on a blip while the key is still ours.
+					// slack for a missed tick or two, and declaring loss here
+					// would drop leadership on a blip while the key is still
+					// ours. But once failures span the full TTL the lease has
+					// provably lapsed and another replica may already hold it:
+					// step down instead of running alongside a second leader.
+					if time.Since(lastRenewOK) >= ttl {
+						plog.Warnf("leader %s lost (owner %s): renew failing for %s (>= ttl %s), stepping down",
+							name, owner, time.Since(lastRenewOK).Truncate(time.Millisecond), ttl)
+						close(lostC)
+						return
+					}
 					plog.Warnf("leader %s renew failed (retrying): %v", name, err)
 				case !ok:
 					plog.Warnf("leader %s lost (owner %s): taken over by another holder", name, owner)
