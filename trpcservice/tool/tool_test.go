@@ -2,6 +2,7 @@ package tool
 
 import (
 	"context"
+	"slices"
 	"sort"
 	"testing"
 
@@ -89,5 +90,36 @@ func TestAllowedUnknownNamesIgnored(t *testing.T) {
 	got := toolNames(r.Allowed(ToolPolicy{Allow: []string{"alpha", "nope"}, Deny: []string{"ghost"}}))
 	if !equalNames(got, "alpha") {
 		t.Fatalf("want alpha only, got %v", got)
+	}
+}
+
+// The tool list goes into the model's prompt; map iteration would reshuffle
+// it on every call, so both All and Allowed return tools in name order.
+func TestRegistryToolsAreSortedByName(t *testing.T) {
+	r := NewRegistry(
+		Tool{Tool: notCallableTool{name: "weather"}},
+		Tool{Tool: notCallableTool{name: "memory_search"}},
+		Tool{Tool: notCallableTool{name: "approval_check"}},
+	)
+	names := func(tools []ttool.Tool) []string {
+		out := make([]string, 0, len(tools))
+		for _, tool := range tools {
+			out = append(out, tool.Declaration().Name)
+		}
+		return out
+	}
+	want := []string{"approval_check", "memory_search", "weather"}
+	for i := 0; i < 20; i++ {
+		if got := names(r.All()); !slices.Equal(got, want) {
+			t.Fatalf("All() = %v, want %v", got, want)
+		}
+		if got := names(r.Allowed()); !slices.Equal(got, want) {
+			t.Fatalf("Allowed() = %v, want %v", got, want)
+		}
+	}
+	// The policy-narrowed list keeps the same ordering guarantee.
+	got := names(r.Allowed(ToolPolicy{Allow: []string{"weather", "memory_search"}}))
+	if !slices.Equal(got, []string{"memory_search", "weather"}) {
+		t.Fatalf("Allowed(allow) = %v, want [memory_search weather]", got)
 	}
 }

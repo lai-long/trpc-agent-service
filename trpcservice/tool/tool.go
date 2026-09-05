@@ -4,6 +4,7 @@ package tool
 import (
 	"context"
 	"fmt"
+	"sort"
 
 	ttool "trpc.group/trpc-go/trpc-agent-go/tool"
 	"trpc.group/trpc-go/trpc-agent-go/tool/function"
@@ -34,12 +35,15 @@ func NewRegistry(tools ...Tool) *Registry {
 	return r
 }
 
-// All returns the framework tools, for llmagent.WithTools.
+// All returns the framework tools in name order, for llmagent.WithTools.
 func (r *Registry) All() []ttool.Tool {
 	out := make([]ttool.Tool, 0, len(r.tools))
 	for _, t := range r.tools {
 		out = append(out, t.Tool)
 	}
+	// Deterministic order: the list goes into the model's prompt, and a
+	// per-call shuffle (map iteration) is noise the model does not need.
+	sort.Slice(out, func(i, j int) bool { return out[i].Declaration().Name < out[j].Declaration().Name })
 	return out
 }
 
@@ -81,11 +85,12 @@ func (r *Registry) Allowed(policies ...ToolPolicy) []ttool.Tool {
 		}
 	}
 	out := make([]ttool.Tool, 0, len(allowed))
-	for name, ok := range allowed {
-		if ok {
-			out = append(out, r.tools[name].Tool)
-		}
+	for name := range allowed {
+		out = append(out, r.tools[name].Tool)
 	}
+	// Deterministic order: the list goes into the model's prompt, and a
+	// per-call shuffle (map iteration) is noise the model does not need.
+	sort.Slice(out, func(i, j int) bool { return out[i].Declaration().Name < out[j].Declaration().Name })
 	return out
 }
 
