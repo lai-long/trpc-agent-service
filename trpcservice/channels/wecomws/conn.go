@@ -359,13 +359,15 @@ func (c *botConn) handleFrame(ctx context.Context, h channels.Handler, env envel
 	for attempt := 1; ; attempt++ {
 		if _, err := h.Handle(ctx, msg); err == nil || errors.Is(err, channels.ErrDuplicate) {
 			return nil
-		} else if ctx.Err() != nil {
+		}
+		switch {
+		case ctx.Err() != nil:
 			return nil
-		} else if attempt >= inboundRetryMax {
+		case attempt >= inboundRetryMax:
 			plog.Errorf("wecomws bot %s: dropping msg %s after %d failed attempts: %v",
 				c.cfg.BotID, msg.MsgID, attempt, err)
 			return nil
-		} else {
+		default:
 			plog.Errorf("wecomws bot %s handle msg %s: %v (attempt %d/%d, retry in %s)",
 				c.cfg.BotID, msg.MsgID, err, attempt, inboundRetryMax, wait)
 		}

@@ -80,6 +80,7 @@ func (a *Auditor) Dropped() uint64 { return a.dropped.Load() }
 // audit_dropped_total metric: operations discovers a hole in the compliance
 // trail from the dashboard, not from grepping logs.
 func (a *Auditor) markDropped(n uint64) {
+	//nolint:gosec // G115: the counter accumulates in-memory drops, far below int64 range
 	metrics.AuditDroppedTotal.Add(context.Background(), int64(n))
 	a.dropped.Add(n)
 }
