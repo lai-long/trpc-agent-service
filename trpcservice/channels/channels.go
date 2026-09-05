@@ -145,9 +145,10 @@ type MediaStore interface {
 
 // SplitText breaks s into segments of at most n bytes, on rune boundaries
 // (never splitting inside a UTF-8 sequence). Channels with a per-message
-// size limit send the segments sequentially.
+// size limit send the segments sequentially. A non-positive n returns s
+// unsplit.
 func SplitText(s string, n int) []string {
-	if len(s) <= n {
+	if n <= 0 || len(s) <= n {
 		return []string{s}
 	}
 	var out []string
@@ -299,4 +300,28 @@ func ScrubError(err error) error {
 		}
 	}
 	return err
+}
+
+// CallbackTimestampWindow bounds how far from now a callback's own CreateTime
+// may sit. The signature covers the timestamp, so a captured callback cannot
+// be tampered with — but it also never expires on its own, and the inbound
+// dedup TTL does, so an unbounded window lets a months-old capture replay
+// after the dedup key is gone. Five minutes each way is far wider than any
+// clock skew or platform redelivery queue a healthy deployment sees.
+const CallbackTimestampWindow = 5 * time.Minute
+
+// StaleCallback reports whether a callback's CreateTime (unix seconds) is too
+// old or too far in the future to accept. A zero CreateTime (a callback shape
+// that carries none) is accepted: it has no replay value beyond what the
+// signature already bounds, and rejecting every such callback would break
+// channels that legitimately omit the field.
+func StaleCallback(createTime int64, now time.Time) bool {
+	if createTime == 0 {
+		return false
+	}
+	age := now.Sub(time.Unix(createTime, 0))
+	if age < 0 {
+		age = -age
+	}
+	return age > CallbackTimestampWindow
 }

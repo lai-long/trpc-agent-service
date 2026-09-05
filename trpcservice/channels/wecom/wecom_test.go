@@ -7,8 +7,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/sbzhu/weworkapi_golang/wxbizmsgcrypt"
 
@@ -54,10 +56,19 @@ type sendEnvelope struct {
 	Nonce        string   `xml:"Nonce"`
 }
 
+// freshCreateTime rewrites a forged callback's CreateTime to now: the
+// adapter rejects timestamps outside a five-minute freshness window, so a
+// hardcoded fixture date would be dropped before reaching the handler.
+func freshCreateTime(innerXML string) string {
+	return regexp.MustCompile(`<CreateTime>\d+</CreateTime>`).
+		ReplaceAllString(innerXML, fmt.Sprintf("<CreateTime>%d</CreateTime>", time.Now().Unix()))
+}
+
 // forgeCallback encrypts innerXML the way the platform would and returns the
 // callback body plus the query string carrying a valid signature.
 func forgeCallback(t *testing.T, innerXML string) (body []byte, query string) {
 	t.Helper()
+	innerXML = freshCreateTime(innerXML)
 	crypt := wxbizmsgcrypt.NewWXBizMsgCrypt(testToken, testAESKey, testCorpID, wxbizmsgcrypt.XmlType)
 	encrypted, cerr := crypt.EncryptMsg(innerXML, "1700000000", "nonce-1")
 	if cerr != nil {
@@ -367,7 +378,7 @@ func TestCallbackHandlerPerBinding(t *testing.T) {
 
 	// A callback encrypted under binding2's own keys reaches the pipeline.
 	crypt2 := wxbizmsgcrypt.NewWXBizMsgCrypt(testToken+"-b2", testAESKey, testCorpID, wxbizmsgcrypt.XmlType)
-	encrypted, cerr := crypt2.EncryptMsg(inner, "1700000000", "nonce-2")
+	encrypted, cerr := crypt2.EncryptMsg(freshCreateTime(inner), "1700000000", "nonce-2")
 	if cerr != nil {
 		t.Fatalf("encrypt b2: %s", cerr.ErrMsg)
 	}

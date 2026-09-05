@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/sbzhu/weworkapi_golang/wxbizmsgcrypt"
 
@@ -85,7 +86,7 @@ func TestCallbackRoundTrip(t *testing.T) {
 		return channels.OutboundMessage{}, nil
 	}))
 
-	inner := `{"msgid":"9876543210","openid":"oUSER1","msgtype":"text","text":{"content":"你好"},"create_time":1700000000}`
+	inner := fmt.Sprintf(`{"msgid":"9876543210","openid":"oUSER1","msgtype":"text","text":{"content":"你好"},"create_time":%d}`, time.Now().Unix())
 	body, query := forgeCallback(t, inner)
 
 	req := httptest.NewRequest(http.MethodPost, "/wxkf/callback?"+query, strings.NewReader(string(body)))
@@ -119,7 +120,7 @@ func TestCallbackSkipsEventsAndNonText(t *testing.T) {
 	}))
 
 	// Event callbacks are acked and skipped.
-	inner := `{"openid":"oUSER1","msgtype":"event","event":{"event_type":"enter_session"},"create_time":1700000000}`
+	inner := fmt.Sprintf(`{"openid":"oUSER1","msgtype":"event","event":{"event_type":"enter_session"},"create_time":%d}`, time.Now().Unix())
 	body, query := forgeCallback(t, inner)
 	req := httptest.NewRequest(http.MethodPost, "/wxkf/callback?"+query, strings.NewReader(string(body)))
 	rec := httptest.NewRecorder()

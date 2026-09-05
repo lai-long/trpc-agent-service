@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestRenderPlain(t *testing.T) {
@@ -135,5 +136,27 @@ func TestHandlerFunc(t *testing.T) {
 	}).Handle(context.Background(), InboundMessage{})
 	if err == nil {
 		t.Fatal("the wrapped error must surface")
+	}
+}
+
+func TestStaleCallback(t *testing.T) {
+	now := time.Unix(1757000000, 0)
+	cases := []struct {
+		name   string
+		create int64
+		stale  bool
+	}{
+		{"fresh", now.Add(-time.Minute).Unix(), false},
+		{"just inside the window", now.Add(-CallbackTimestampWindow).Unix(), false},
+		{"five minutes and a second old", now.Add(-CallbackTimestampWindow - time.Second).Unix(), true},
+		{"a day old", now.Add(-24 * time.Hour).Unix(), true},
+		{"slightly in the future", now.Add(time.Minute).Unix(), false},
+		{"far in the future", now.Add(time.Hour).Unix(), true},
+		{"no timestamp at all", 0, false},
+	}
+	for _, tc := range cases {
+		if got := StaleCallback(tc.create, now); got != tc.stale {
+			t.Errorf("%s: StaleCallback(%d) = %v, want %v", tc.name, tc.create, got, tc.stale)
+		}
 	}
 }

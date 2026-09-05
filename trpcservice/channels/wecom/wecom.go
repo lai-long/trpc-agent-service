@@ -350,6 +350,14 @@ func (c *Channel) receive(w http.ResponseWriter, r *http.Request, crypt *wxbizms
 		writeSuccess(w)
 		return
 	}
+	// The signature never expires, so freshness is the only replay bound that
+	// outlives the inbound dedup TTL. A stale callback is acked, not 5xx'd:
+	// the platform would redeliver a capture we will always refuse.
+	if channels.StaleCallback(cm.CreateTime, time.Now()) {
+		plog.Warnf("wecom drop stale callback (create_time %d, msg %s)", cm.CreateTime, cm.MsgID)
+		writeSuccess(w)
+		return
+	}
 	// Only text, media and recall events enter the pipeline; other events
 	// (enter_agent, ...) are acked and skipped. Messages without a MsgId
 	// cannot be deduplicated — skip them too.
