@@ -108,10 +108,9 @@ func (c *botConn) nextWait(err error, prev time.Duration) time.Duration {
 // heartbeat + read until something fails.
 func (c *botConn) serve(ctx context.Context, h channels.Handler) error {
 	// connCtx is this connection attempt's lifetime. The heartbeat kill and
-	// any read failure cancel it, so work parked on this connection (an
-	// inbound Handle retry, which would otherwise starve the read loop of
-	// pongs forever) wakes up and serve returns — run() reconnects instead
-	// of babysitting a dead socket.
+	// any read failure cancel it, so work parked on this connection (the
+	// dispatch worker's Handle retry loop) wakes up and serve returns —
+	// run() reconnects instead of babysitting a dead socket.
 	connCtx, cancelConn := context.WithCancel(ctx)
 	defer cancelConn()
 
@@ -188,12 +187,51 @@ func (c *botConn) serve(ctx context.Context, h channels.Handler) error {
 	c.setConn(ws, epoch)
 	go c.heartbeat(connCtx, ws, cancelConn)
 
+	// Inbound frames are dispatched on a serial worker behind a bounded
+	// queue so the read loop always stays free to drain pongs: a Handle
+	// parked in its capped retry loop inside the read loop would starve
+	// the heartbeat of pongs, which would kill the healthy connection and
+	// drop the message being retried — WS inbound has no platform
+	// redelivery. If the worker falls behind far enough for the queue to
+	// fill, the read loop blocks on the enqueue and the heartbeat kill
+	// returns as the escape hatch.
+	frames := make(chan envelope, inboundQueueMax)
+	fatal := make(chan error, 1)
+	workerDone := make(chan struct{})
+	go func() {
+		defer close(workerDone)
+		for {
+			select {
+			case <-connCtx.Done():
+				return
+			case env := <-frames:
+				if err := c.handleFrame(connCtx, h, env); err != nil {
+					fatal <- err
+					cancelConn() // unblock a readLoop parked in ws.Read
+					return
+				}
+			}
+		}
+	}()
+	defer func() {
+		cancelConn()
+		<-workerDone // drain before run() reconnects
+	}()
+
 	for _, env := range pending {
-		if err := c.handleFrame(connCtx, h, env); err != nil {
+		if err := dispatchFrame(connCtx, frames, fatal, env); err != nil {
 			return err
 		}
 	}
-	return c.readLoop(connCtx, h, ws)
+	readErr := c.readLoop(connCtx, ws, frames, fatal)
+	select {
+	// A worker-reported failure (e.g. the platform kick) is the real cause;
+	// the read loop only saw the cancelConn that unblocked it.
+	case ferr := <-fatal:
+		return ferr
+	default:
+		return readErr
+	}
 }
 
 // heartbeat pings every interval and kills the connection when the previous
@@ -247,9 +285,17 @@ func (c *botConn) heartbeat(ctx context.Context, ws *websocket.Conn, kill func()
 	}
 }
 
-// readLoop consumes frames until a connection error (or a platform kick).
-func (c *botConn) readLoop(ctx context.Context, h channels.Handler, ws *websocket.Conn) error {
+// readLoop consumes frames until a connection error (or a platform kick):
+// pongs are matched against the heartbeat, callbacks and events are queued
+// for the serial dispatch worker. A fatal error the worker reports (e.g. the
+// disconnected event) ends the loop just like a read failure.
+func (c *botConn) readLoop(ctx context.Context, ws *websocket.Conn, frames chan<- envelope, fatal <-chan error) error {
 	for {
+		select {
+		case err := <-fatal:
+			return err
+		default:
+		}
 		env, err := readEnvelope(ctx, ws)
 		if err != nil {
 			if errors.Is(err, errBadFrame) {
@@ -266,12 +312,25 @@ func (c *botConn) readLoop(ctx context.Context, h channels.Handler, ws *websocke
 			}
 			c.mu.Unlock()
 		case cmdMsgCallback, cmdEventCallback:
-			if err := c.handleFrame(ctx, h, env); err != nil {
+			if err := dispatchFrame(ctx, frames, fatal, env); err != nil {
 				return err
 			}
 		default:
 			plog.Warnf("wecomws bot %s: ignoring frame cmd %q", c.cfg.BotID, env.Cmd)
 		}
+	}
+}
+
+// dispatchFrame queues one frame for the serial worker; a fatal error the
+// worker already reported, or ctx cancellation, wins over the enqueue.
+func dispatchFrame(ctx context.Context, frames chan<- envelope, fatal <-chan error, env envelope) error {
+	select {
+	case err := <-fatal:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	case frames <- env:
+		return nil
 	}
 }
 
@@ -443,6 +502,10 @@ func (c *botConn) writeTo(ctx context.Context, ws *websocket.Conn, env envelope)
 
 // pendingBufferMax bounds the pre-ack callback buffer.
 const pendingBufferMax = 16
+
+// inboundQueueMax bounds the frames buffered for the serial dispatch worker;
+// it absorbs Handle stalls without blocking the read loop (see serve).
+const inboundQueueMax = 64
 
 // errBadFrame marks frames that cannot be routed (binary, unparseable, no
 // cmd): logged and skipped instead of tearing the connection down.

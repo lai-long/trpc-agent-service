@@ -43,8 +43,13 @@ func e2eAttr(msg OutboundMessage) otelmetric.RecordOption {
 	)
 }
 
+// DefaultSenderGroup is the consumer group a Sender reads when Group is
+// empty; the assembly binary's EnsureGroup uses the same constant.
+const DefaultSenderGroup = "senders"
+
 // Sender consumes the outbound stream as part of a consumer group (Group,
-// default "senders") and dispatches each message to the Send of its Channel.
+// default DefaultSenderGroup) and dispatches each message to the Send of its
+// Channel.
 //
 // Per-message protocol (outbound idempotency): check the sent: key first and
 // skip already-delivered replies; send; mark sent; only then Ack. A crash
@@ -60,10 +65,11 @@ type Sender struct {
 	Channels map[string]Channel  // channel name → channel implementation
 	Name     string              // consumer name
 
-	// Group is the consumer group this sender reads; empty means "senders".
-	// A second group (e.g. "senders-ws") partitions stream:outbound by
-	// channel: the main group skips messages it does not own via Skip, and
-	// each group carries its own pending list and reaper.
+	// Group is the consumer group this sender reads; empty means
+	// DefaultSenderGroup. A second group (e.g. wecomws.SenderGroup)
+	// partitions stream:outbound by channel: the main group skips messages
+	// it does not own via Skip, and each group carries its own pending list
+	// and reaper.
 	Group string
 	// Skip, when set, marks messages this sender must not deliver — they
 	// belong to another consumer group on the same stream. A skipped message
@@ -109,7 +115,7 @@ func (s *Sender) group() string {
 	if s.Group != "" {
 		return s.Group
 	}
-	return "senders"
+	return DefaultSenderGroup
 }
 
 func (s *Sender) sendQPS() float64 {

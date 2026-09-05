@@ -364,6 +364,12 @@ func (h *recordingHandler) all() []channels.InboundMessage {
 	return append([]channels.InboundMessage(nil), h.msgs...)
 }
 
+func (h *recordingHandler) heal() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.fails = 0
+}
+
 func (h *recordingHandler) setDups(v bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -516,7 +522,8 @@ func TestInboundNormalized(t *testing.T) {
 
 // TestHandleRetry: WS inbound has no platform redelivery, so a failing
 // Handle retries locally until it lands (or the message reports duplicate);
-// the retry lives in the read loop, so the heartbeat keeps running.
+// the retry lives on the dispatch worker, so the read loop keeps draining
+// pongs and the heartbeat keeps running.
 func TestHandleRetry(t *testing.T) {
 	f := newFakePlatform(t, "bot-1", "s3cr3t")
 	h := &recordingHandler{fails: 2}
@@ -559,13 +566,13 @@ func TestHandleRetry(t *testing.T) {
 	}
 }
 
-// TestHandleRetryYieldsOnDeadConnection: a Handler that stays down while the
-// heartbeat gives up must not wedge the connection — the retry loop lives on
-// the connection's ctx, so the heartbeat kill releases it and run()
-// reconnects instead of babysitting a dead socket with no pongs flowing.
-func TestHandleRetryYieldsOnDeadConnection(t *testing.T) {
+// TestHandleRetryKeepsConnectionAlive: a Handler that stays down no longer
+// starves the read loop — the retry loop lives on the serial dispatch worker
+// while pongs keep flowing, so the heartbeat does not kill a healthy socket
+// and the message is never dropped (WS inbound has no platform redelivery).
+func TestHandleRetryKeepsConnectionAlive(t *testing.T) {
 	f := newFakePlatform(t, "bot-1", "s3cr3t")
-	h := &recordingHandler{fails: 1 << 20} // down for the whole test
+	h := &recordingHandler{fails: 1 << 20} // down for most of the test
 	newTestChannel(t, f.addr(), []Binding{mustBinding(t, "b1", "bot-1", "ref")}, "s3cr3t", h)
 	conn := f.waitConn(t, 1)
 	waitFor(t, func() bool { return f.totalAcks.Load() >= 1 })
@@ -574,12 +581,47 @@ func TestHandleRetryYieldsOnDeadConnection(t *testing.T) {
 		Cmd: cmdMsgCallback, Headers: frameHeaders{ReqID: "req-cb-1"},
 		Body: json.RawMessage(`{"msgid":"m1","chattype":"single","from":{"userid":"u1"},"msgtype":"text","text":{"content":"hi"}}`),
 	})
-	waitFor(t, func() bool { return h.calls() >= 1 })
+	waitFor(t, func() bool { return h.calls() >= 3 }) // the worker is in its retry loop
 
-	// The handler keeps failing, so the read loop is parked in the retry and
-	// the pongs go unread; the heartbeat must kill the connection within a
-	// couple of intervals — and the retry loop must notice and let a fresh
-	// connection subscribe.
+	// Several ping intervals pass while the handler is down: pongs are still
+	// drained, so the connection must survive.
+	waitFor(t, func() bool { return conn.pingCount() >= 3 })
+	if got := f.connCount(); got != 1 {
+		t.Fatalf("a retrying handler must not tear down a healthy connection, got %d connections", got)
+	}
+
+	// Once the handler heals, the very same message lands — never dropped.
+	h.heal()
+	waitFor(t, func() bool { return h.calls() >= 4 })
+	if m := h.last(); m.MsgID != "m1" {
+		t.Fatalf("retried message lost/changed: %+v", m)
+	}
+	if got := f.connCount(); got != 1 {
+		t.Fatalf("healing must not reconnect either, got %d connections", got)
+	}
+}
+
+// TestDispatchQueueOverflowFallsBackToHeartbeatKill: when the worker is
+// wedged and the bounded dispatch queue fills up, the read loop blocks on the
+// enqueue and pongs starve again — the heartbeat kill stays the escape hatch
+// and run() reconnects instead of babysitting the backlog forever.
+func TestDispatchQueueOverflowFallsBackToHeartbeatKill(t *testing.T) {
+	f := newFakePlatform(t, "bot-1", "s3cr3t")
+	h := &recordingHandler{fails: 1 << 20} // down for the whole test
+	newTestChannel(t, f.addr(), []Binding{mustBinding(t, "b1", "bot-1", "ref")}, "s3cr3t", h)
+	conn := f.waitConn(t, 1)
+	waitFor(t, func() bool { return f.totalAcks.Load() >= 1 })
+
+	for i := 0; i < inboundQueueMax+2; i++ {
+		conn.PushWait(envelope{
+			Cmd:     cmdMsgCallback,
+			Headers: frameHeaders{ReqID: fmt.Sprintf("req-cb-%d", i)},
+			Body: json.RawMessage(fmt.Sprintf(
+				`{"msgid":"m%d","chattype":"single","from":{"userid":"u1"},"msgtype":"text","text":{"content":"hi"}}`, i)),
+		})
+	}
+	// The queue fills, the read loop parks on the enqueue, the heartbeat
+	// gives up within a couple of intervals and a fresh connection subscribes.
 	f.waitConn(t, 2)
 	waitFor(t, func() bool { return f.totalAcks.Load() >= 2 })
 }

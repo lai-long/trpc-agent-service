@@ -134,7 +134,7 @@ func (c *Channel) Send(_ context.Context, msg channels.OutboundMessage) error {
 		zap.String(plog.FieldChannel, msg.Channel),
 		zap.String(plog.FieldSessionKey, msg.SessionKey),
 		zap.String(plog.FieldTraceID, msg.TraceID),
-		zap.String("text", msg.Text))
+		zap.Int("text_len", len(msg.Text)))
 	return nil
 }
 

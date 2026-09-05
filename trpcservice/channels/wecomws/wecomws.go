@@ -8,9 +8,9 @@
 // connection per bot — a newer subscription kicks the older one — so
 // connections hang off a platform-wide leader (storage.LeaderLock). And
 // unlike the webhook channels there is no platform redelivery for inbound
-// frames: a failed Handle retries locally on a capped backoff inside the
-// read loop, and a crash inside that window loses the message (accepted
-// trade-off for protocol simplicity).
+// frames: a failed Handle retries locally on a capped backoff on a
+// per-connection dispatch worker, and a crash inside that window loses the
+// message (accepted trade-off for protocol simplicity).
 package wecomws
 
 import (
@@ -33,6 +33,13 @@ const ChannelName = "wecomws"
 // SenderGroup is the dedicated stream:outbound consumer group the
 // platform-wide leader runs for this channel's replies.
 const SenderGroup = "senders-ws"
+
+// Default knobs, shared by New and the assembly binary's env fallbacks.
+const (
+	DefaultPingInterval   = 30 * time.Second
+	DefaultSegmentBytes   = 2048
+	DefaultResyncInterval = 15 * time.Second
+)
 
 // Channel is the WeCom smart-bot WebSocket implementation of channels.Channel
 // (and channels.Starter): Start owns the connections and the bindings
@@ -89,9 +96,9 @@ func New(secret config.SecretResolver, opts ...Option) (*Channel, error) {
 	}
 	c := &Channel{
 		secret:           secret,
-		pingInterval:     30 * time.Second,
-		segment:          2048,
-		resyncInterval:   15 * time.Second,
+		pingInterval:     DefaultPingInterval,
+		segment:          DefaultSegmentBytes,
+		resyncInterval:   DefaultResyncInterval,
 		reconnectBase:    time.Second,
 		reconnectCap:     time.Minute,
 		kickedBase:       5 * time.Second,
@@ -105,13 +112,13 @@ func New(secret config.SecretResolver, opts ...Option) (*Channel, error) {
 		opt(c)
 	}
 	if c.pingInterval <= 0 {
-		c.pingInterval = 30 * time.Second
+		c.pingInterval = DefaultPingInterval
 	}
 	if c.segment <= 0 {
-		c.segment = 2048
+		c.segment = DefaultSegmentBytes
 	}
 	if c.resyncInterval <= 0 {
-		c.resyncInterval = 15 * time.Second
+		c.resyncInterval = DefaultResyncInterval
 	}
 	c.mgr = &manager{parent: c, conns: map[string]*botConn{}}
 	return c, nil
