@@ -337,7 +337,15 @@ func dispatchFrame(ctx context.Context, frames chan<- envelope, fatal <-chan err
 // handleFrame routes one callback frame; a kickedError propagates as a
 // disconnect. Message callbacks never fail the connection: WS inbound has no
 // platform redelivery, so Handle failures retry locally on a capped backoff
-// until they land (duplicates are success — the message was seen before).
+// (duplicates are success — the message was seen before).
+//
+// The retry count is bounded: the dispatch worker is serial, so an unbounded
+// retry would let one poisoned message (a deterministic handler failure) or
+// a long infrastructure outage park the whole connection behind it — every
+// later message on the bot queues up until the queue fills and the heartbeat
+// kill reconnects, which just replays the same frame. After the cap the
+// message is dropped loudly instead; the user can resend, the bot stays
+// alive.
 func (c *botConn) handleFrame(ctx context.Context, h channels.Handler, env envelope) error {
 	if env.Cmd == cmdEventCallback {
 		return c.handleEvent(env)
@@ -348,13 +356,18 @@ func (c *botConn) handleFrame(ctx context.Context, h channels.Handler, env envel
 		return nil
 	}
 	wait := c.parent.inboundRetryBase
-	for {
+	for attempt := 1; ; attempt++ {
 		if _, err := h.Handle(ctx, msg); err == nil || errors.Is(err, channels.ErrDuplicate) {
 			return nil
 		} else if ctx.Err() != nil {
 			return nil
+		} else if attempt >= inboundRetryMax {
+			plog.Errorf("wecomws bot %s: dropping msg %s after %d failed attempts: %v",
+				c.cfg.BotID, msg.MsgID, attempt, err)
+			return nil
 		} else {
-			plog.Errorf("wecomws bot %s handle msg %s: %v (retry in %s)", c.cfg.BotID, msg.MsgID, err, wait)
+			plog.Errorf("wecomws bot %s handle msg %s: %v (attempt %d/%d, retry in %s)",
+				c.cfg.BotID, msg.MsgID, err, attempt, inboundRetryMax, wait)
 		}
 		if !Sleep(ctx, wait) {
 			return nil

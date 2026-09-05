@@ -566,10 +566,12 @@ func TestHandleRetry(t *testing.T) {
 	}
 }
 
-// TestHandleRetryKeepsConnectionAlive: a Handler that stays down no longer
-// starves the read loop — the retry loop lives on the serial dispatch worker
-// while pongs keep flowing, so the heartbeat does not kill a healthy socket
-// and the message is never dropped (WS inbound has no platform redelivery).
+// TestHandleRetryKeepsConnectionAlive: a Handler that stays down does not
+// starve the read loop — the retry loop lives on the serial dispatch worker
+// while pongs keep flowing, so the heartbeat does not kill a healthy socket.
+// The retry count is bounded: once the cap is spent the message is dropped
+// loudly instead of parking every later message on the connection behind it
+// (and the bot keeps serving once the handler heals).
 func TestHandleRetryKeepsConnectionAlive(t *testing.T) {
 	f := newFakePlatform(t, "bot-1", "s3cr3t")
 	h := &recordingHandler{fails: 1 << 20} // down for most of the test
@@ -581,20 +583,28 @@ func TestHandleRetryKeepsConnectionAlive(t *testing.T) {
 		Cmd: cmdMsgCallback, Headers: frameHeaders{ReqID: "req-cb-1"},
 		Body: json.RawMessage(`{"msgid":"m1","chattype":"single","from":{"userid":"u1"},"msgtype":"text","text":{"content":"hi"}}`),
 	})
-	waitFor(t, func() bool { return h.calls() >= 3 }) // the worker is in its retry loop
+	// The cap is spent: exactly the bounded attempts, then the drop.
+	waitFor(t, func() bool { return h.calls() >= inboundRetryMax })
+	time.Sleep(100 * time.Millisecond)
+	if got := h.calls(); got != inboundRetryMax {
+		t.Fatalf("retries must stop at the cap, got %d deliveries", got)
+	}
 
-	// Several ping intervals pass while the handler is down: pongs are still
-	// drained, so the connection must survive.
+	// The connection stayed healthy throughout: pongs drained, no reconnect.
 	waitFor(t, func() bool { return conn.pingCount() >= 3 })
 	if got := f.connCount(); got != 1 {
 		t.Fatalf("a retrying handler must not tear down a healthy connection, got %d connections", got)
 	}
 
-	// Once the handler heals, the very same message lands — never dropped.
+	// The bot is not wedged: once the handler heals, the next message lands.
 	h.heal()
-	waitFor(t, func() bool { return h.calls() >= 4 })
-	if m := h.last(); m.MsgID != "m1" {
-		t.Fatalf("retried message lost/changed: %+v", m)
+	conn.Push(envelope{
+		Cmd: cmdMsgCallback, Headers: frameHeaders{ReqID: "req-cb-2"},
+		Body: json.RawMessage(`{"msgid":"m2","chattype":"single","from":{"userid":"u1"},"msgtype":"text","text":{"content":"hi"}}`),
+	})
+	waitFor(t, func() bool { return h.calls() >= inboundRetryMax+1 })
+	if m := h.last(); m.MsgID != "m2" {
+		t.Fatalf("post-drop message lost/changed: %+v", m)
 	}
 	if got := f.connCount(); got != 1 {
 		t.Fatalf("healing must not reconnect either, got %d connections", got)

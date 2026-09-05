@@ -41,6 +41,11 @@ const (
 	DefaultResyncInterval = 15 * time.Second
 )
 
+// inboundRetryMax bounds the local retries of one inbound callback. The
+// dispatch worker is serial, so retries beyond this would hold every later
+// message on the connection hostage to one unhandleable frame.
+const inboundRetryMax = 5
+
 // Channel is the WeCom smart-bot WebSocket implementation of channels.Channel
 // (and channels.Starter): Start owns the connections and the bindings
 // reconciliation loop, Send writes replies on the connection of the
