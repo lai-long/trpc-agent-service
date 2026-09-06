@@ -118,8 +118,7 @@ func TestMigratorRedisToPostgres(t *testing.T) {
 	}
 }
 
-// migrateTestRedisAddr is the compose redis (storage_test.go's copy is in
-// the internal test package and not visible here).
+// migrateTestRedisAddr is the compose redis.
 var migrateTestRedisAddr = testenv.RedisAddr()
 
 // redisOrSkipForMigrate returns the raw compose redis client (used by the

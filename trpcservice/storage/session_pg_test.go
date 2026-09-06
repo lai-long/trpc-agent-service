@@ -15,8 +15,8 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/storage"
 )
 
-// Test fixtures use their own tenant/app rows so tests are independent of the
-// demo seed. Needs the PG from compose; skips when unreachable.
+// testTenantID and testAppID are the fixture rows the PG tests run against,
+// kept separate from the demo seed. Skips when PG is unreachable.
 const (
 	testTenantID = "00000000-0000-0000-0000-0000000000aa"
 	testAppID    = "00000000-0000-0000-0000-0000000001aa"

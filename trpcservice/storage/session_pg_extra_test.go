@@ -10,9 +10,8 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/storage"
 )
 
-// ensureSession inserts the session row on first append; DeleteSession on a
-// missing session is a no-op; a stale summary cursor falls back to a full
-// replay; summarization degrades to a no-op on empty sessions and empty text.
+// ensureSession inserts the session row on first append, and DeleteSession on
+// a missing session is a no-op.
 func TestPGSessionEnsureInsertAndSummaryEdges(t *testing.T) {
 	svc, pool := pgSessionService(t)
 	ctx := context.Background()

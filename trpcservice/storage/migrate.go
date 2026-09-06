@@ -52,10 +52,10 @@ type migrationProgress struct {
 	// (app_id, session_key) of the last session copied. session_key alone is
 	// not unique — uk_session_app_key is (app_id, session_key) — so a
 	// single-dimension cursor steps over the second of two apps that share a
-	// session_key and never migrates it. A progress row written before this
-	// split carries only Cursor; CursorApp then reads empty, which restarts
-	// enumeration from the beginning — safe, because copySession reconciles
-	// by event ID and appends only what the target journal is still missing.
+	// session_key and never migrates it. A progress row carrying only Cursor
+	// restarts enumeration from the beginning — safe, because copySession
+	// reconciles by event ID and appends only what the target journal is
+	// still missing.
 	CursorApp    string    `json:"cursor_app,omitempty"`
 	Cursor       string    `json:"cursor,omitempty"`
 	Mismatches   []string  `json:"mismatches,omitempty"` // consistency check failures
@@ -391,15 +391,15 @@ func (m *Migrator) copySession(ctx context.Context, mig migrationRow, src, dst s
 		return m.writeSessionToPG(ctx, mig.TenantID, srcSess, events)
 	}
 	// Redis target: create (idempotent), then append exactly the events the
-	// target does not already hold, identified by event ID. The old positional
-	// skip ("append source events from len(target events) onward") read the
-	// target's count and assumed its rows were the source's prefix — with
-	// dual write live they are the source's NEWEST events, so the skip
-	// discarded the prefix entirely. Redis storage is ID-keyed (hash field =
-	// event ID, zset member = event ID), so an event already present cannot be
-	// duplicated anyway, and the zset is scored by timestamp: append order does
-	// not decide read order. AppendEvent mutates the carrier session's event
-	// list, so the destination's own session object is the carrier.
+	// target does not already hold, identified by event ID. A positional skip
+	// ("append source events from len(target events) onward") is wrong: with
+	// dual write live the target's newest events are the source's NEWEST
+	// events, so the skip would discard the prefix. Redis storage is ID-keyed
+	// (hash field = event ID, zset member = event ID), so an event already
+	// present cannot be duplicated anyway, and the zset is scored by
+	// timestamp: append order does not decide read order. AppendEvent mutates
+	// the carrier session's event list, so the destination's own session
+	// object is the carrier.
 	dstSess, err := dst.CreateSession(ctx, key, srcSess.State)
 	if err != nil {
 		return fmt.Errorf("create target session: %w", err)
@@ -652,16 +652,15 @@ func (m *Migrator) lockTargetSession(ctx context.Context, tx pgx.Tx, tenantID st
 // checkConsistency compares the two backends' full journals, session by
 // session, as event-ID multisets, and returns the mismatching sessions.
 //
-// Counting was never enough: a dual-write tail that reached the target before
+// A multiset, not a count: a dual-write tail that reached the target before
 // the backfill copied the prefix leaves both sides holding the same NUMBER of
-// events — the target's first k seqs hold the source's last k events — so a
-// count check blessed the read switch while the journal was scrambled. The
-// comparison is a multiset rather than an ordered list because the redis
-// journal's order is (timestamp, member): two events inside one timestamp are
-// ordered by ID there but by arrival on PG, and that framework-level tie
-// order is not something a migration should fail on. A multiset still catches
-// every failure this pipeline can produce — missing, extra and duplicated
-// events.
+// events — the target's first k seqs hold the source's last k events — so
+// only a content comparison catches it. It is a multiset rather than an
+// ordered list because the redis journal's order is (timestamp, member): two
+// events inside one timestamp are ordered by ID there but by arrival on PG,
+// and that framework-level tie order is not something a migration should fail
+// on. A multiset still catches every failure this pipeline can produce —
+// missing, extra and duplicated events.
 func (m *Migrator) checkConsistency(ctx context.Context, mig migrationRow) ([]string, error) {
 	keys, err := m.enumerateAll(ctx, mig)
 	if err != nil {
@@ -687,9 +686,9 @@ func (m *Migrator) checkConsistency(ctx context.Context, mig migrationRow) ([]st
 
 // journalIDs reads one backend's full journal as event IDs. The PG branch goes
 // through FullJournalIDs (hot table plus archive, past the summary cursor);
-// the redis branch reads the event index zset directly — GetSession's 1000
-// cap and first-user-message anchor made the old count check compare two
-// truncated views and agree with itself while history was missing.
+// the redis branch reads the event index zset directly, because GetSession
+// caps the journal and anchors its head at the first user message — a count
+// over truncated views would miss missing history.
 func (m *Migrator) journalIDs(ctx context.Context, backend string, key session.Key) ([]string, error) {
 	if backend == "postgres" {
 		pg, ok := m.backends[backend].(*PGSessionService)

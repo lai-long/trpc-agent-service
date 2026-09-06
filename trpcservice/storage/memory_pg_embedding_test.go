@@ -14,8 +14,7 @@ import (
 )
 
 // memFakeEmbedder produces deterministic bag-of-runes vectors: texts sharing
-// runes are close, so semantic recall is testable without an embeddings API
-// (same trick as the knowledge tests).
+// runes are close, so semantic recall is testable without an embeddings API.
 type memFakeEmbedder struct{ dim int }
 
 func (f memFakeEmbedder) GetEmbedding(_ context.Context, text string) ([]float64, error) {
@@ -46,9 +45,8 @@ func (errEmbedder) GetEmbeddingWithUsage(context.Context, string) ([]float64, ma
 }
 func (errEmbedder) GetDimensions() int { return 0 }
 
-// ensureMemoryEmbeddingTable deploys the vector table for the tests. The
-// canonical DDL lives in deploy/db/init.sql; the tests create it themselves so
-// they also run against a schema that predates the migration.
+// ensureMemoryEmbeddingTable deploys the vector table for the tests, so they
+// also run against a schema without it.
 func ensureMemoryEmbeddingTable(t *testing.T, pool *pgxpool.Pool) {
 	t.Helper()
 	ctx := context.Background()

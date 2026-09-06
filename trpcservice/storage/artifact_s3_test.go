@@ -13,9 +13,8 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/testenv"
 )
 
-// The integration tests need the MinIO service from compose (docker compose
-// up -d minio); they skip when unreachable instead of failing in Docker-less
-// environments.
+// testS3Endpoint and testS3Bucket address the MinIO instance the S3
+// integration tests run against; they skip when it is unreachable.
 var (
 	testS3Endpoint = testenv.S3Endpoint()
 	testS3Bucket   = "artifacts"

@@ -351,9 +351,8 @@ func (s *PGMemoryService) Tools() []ttool.Tool {
 	return tools
 }
 
-// EnqueueAutoMemoryJob implements memory.Service as a no-op: automatic memory
-// extraction needs a model-backed extractor, which arrives with the
-// summarizer stage. The runner tolerates the no-op.
+// EnqueueAutoMemoryJob implements memory.Service as a no-op: this backend
+// has no automatic memory extraction. The runner tolerates the no-op.
 func (s *PGMemoryService) EnqueueAutoMemoryJob(_ context.Context, _ *session.Session) error {
 	return nil
 }

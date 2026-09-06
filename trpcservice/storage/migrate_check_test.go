@@ -37,10 +37,7 @@ func checkEvent(id, content string) *event.Event {
 }
 
 // The consistency check must compare content, not counts: two journals of the
-// same length that agree on only one event are a hard mismatch. The old
-// count-only comparison blessed exactly this shape — the dual-write scramble
-// produced equal counts with the prefix dropped and the tail duplicated — and
-// flipped reads onto a journal neither backend could reproduce.
+// same length that agree on only one event are a hard mismatch.
 func TestCheckConsistencyComparesContentNotCounts(t *testing.T) {
 	pool, err := NewPG(context.Background(), testPGDSN)
 	if err != nil {

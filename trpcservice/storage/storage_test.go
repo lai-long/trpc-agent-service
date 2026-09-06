@@ -10,9 +10,9 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// The integration tests need the real services from compose (docker compose
-// up -d, or the CI services); they gate on TRPC_TEST_* variables and skip
-// with the variable named when unreachable.
+// testRedisAddr and testPGDSN address the services the integration tests
+// need; each test skips with the variable named when its service is
+// unreachable.
 var (
 	testRedisAddr = testenv.RedisAddr()
 	testPGDSN     = testenv.PGDSN()
@@ -122,7 +122,7 @@ func TestNewPGAndSchema(t *testing.T) {
 	}
 	defer pool.Close()
 
-	// All 8 tables from init.sql must exist.
+	// All 8 platform tables must exist.
 	var n int
 	err = pool.QueryRow(context.Background(),
 		`SELECT count(*) FROM information_schema.tables

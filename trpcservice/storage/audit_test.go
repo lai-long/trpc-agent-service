@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-// zeroTenant stands in for a real tenant id until the tenant module lands.
+// zeroTenant is a syntactically valid uuid for tests that have no real tenant.
 const zeroTenant = "00000000-0000-0000-0000-000000000000"
 
 func TestAuditorAsyncBatchAndSync(t *testing.T) {
@@ -84,8 +84,6 @@ func TestAuditorCloseWithoutStart(t *testing.T) {
 
 // A burst queued right before shutdown must still be written: the flush loop
 // drains the channel instead of stopping at the buffer it happens to hold.
-// Before the drain this was a coin flip — select picked randomly between the
-// queued event and the shutdown signal.
 func TestAuditorCloseDrainsQueuedEvents(t *testing.T) {
 	pool, err := NewPG(context.Background(), testPGDSN)
 	if err != nil {

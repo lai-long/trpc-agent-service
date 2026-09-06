@@ -12,8 +12,8 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/storage"
 )
 
-// Tools exposes the standard memory tool set and EnqueueAutoMemoryJob is an
-// accepted no-op until the model-backed extractor lands.
+// Tools exposes the standard memory tool set, and EnqueueAutoMemoryJob is an
+// accepted no-op.
 func TestPGMemoryToolsAndAutoMemoryJob(t *testing.T) {
 	svc, _ := pgMemoryService(t)
 

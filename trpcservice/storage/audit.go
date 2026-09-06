@@ -17,7 +17,7 @@ import (
 
 // AuditEvent is one row of the audit_log table.
 type AuditEvent struct {
-	TenantID         string // tenant UUID; zero UUID until the tenant module lands
+	TenantID         string // tenant UUID; zero UUID when the caller has none
 	Channel          string
 	UserID           string
 	SessionID        string // session UUID; empty means NULL (session_key is not a UUID)

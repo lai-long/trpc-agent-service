@@ -31,7 +31,7 @@ import (
 //     stream is the source of truth a crashed session can be replayed from.
 //   - summary compresses old events: GetSession replays only the events
 //     after covered_event_id and exposes the summary under
-//     Session.Summaries, so long sessions no longer do a full replay.
+//     Session.Summaries, so long sessions replay only the uncovered tail.
 //   - App/user-scoped state (app:/user: prefixes) is not supported by this
 //     backend: the platform's agent definitions don't use those scopes.
 //
@@ -200,12 +200,9 @@ const fullJournalTables = `
 	UNION ALL
 	SELECT event_seq, event FROM session_event_archive WHERE session_id = $1`
 
-// FullJournal reads every event of the session in event_seq order, ignoring the
-// summary cursor and the archive boundary. GetSession deliberately returns only
-// what the model should see again — the events after the summary, and only
-// those still hot — which is right for a runner and wrong for anything that has
-// to reproduce the journal, a migration above all: copying that truncated tail
-// leaves the summarized and archived history behind.
+// FullJournal reads every event of the session in event_seq order, ignoring
+// the summary cursor and the archive boundary — unlike GetSession, which
+// returns only the uncovered tail.
 func (s *PGSessionService) FullJournal(ctx context.Context, key session.Key) ([]event.Event, error) {
 	if err := key.CheckSessionKey(); err != nil {
 		return nil, err
@@ -239,11 +236,9 @@ func (s *PGSessionService) FullJournal(ctx context.Context, key session.Key) ([]
 	return out, rows.Err()
 }
 
-// FullJournalIDs is FullJournal reduced to the ordered event IDs. The
-// migration's consistency check compares the two backends' journals as ID
-// multisets, and IDs alone keep a 100k-event session a few hundred kilobytes
-// instead of its full JSON. event->>'id' is the framework's event identity —
-// the summary boundary already keys on it, and dual write preserves it
+// FullJournalIDs is FullJournal reduced to the ordered event IDs: IDs alone
+// keep a 100k-event session a few hundred kilobytes instead of its full JSON.
+// event->>'id' is the framework's event identity, and dual write preserves it
 // because the fanout hands both backends the same event — so an ID that
 // appears on both sides is the same event.
 func (s *PGSessionService) FullJournalIDs(ctx context.Context, key session.Key) ([]string, error) {

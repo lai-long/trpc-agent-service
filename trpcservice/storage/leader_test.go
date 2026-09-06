@@ -22,9 +22,9 @@ func TestLeaderLockRejectsBadTTL(t *testing.T) {
 	}
 }
 
-// TestLeaderLock covers the exactly-one-of semantics the wecomws leader
-// hangs off: mutual exclusion while held, takeover after the lease
-// disappears, owner-checked release and idempotent release.
+// TestLeaderLock covers the exactly-one-of semantics: mutual exclusion while
+// held, takeover after the lease disappears, owner-checked release and
+// idempotent release.
 func TestLeaderLockMutexAndTakeover(t *testing.T) {
 	rdb := redisOrSkip(t)
 	ctx := context.Background()
@@ -92,7 +92,7 @@ func TestLeaderLockMutexAndTakeover(t *testing.T) {
 }
 
 // partitionHook fails every command while engaged, simulating a Redis
-// partition for the fencing test below.
+// partition.
 type partitionHook struct{ on atomic.Bool }
 
 func (h *partitionHook) DialHook(next redis.DialHook) redis.DialHook { return next }

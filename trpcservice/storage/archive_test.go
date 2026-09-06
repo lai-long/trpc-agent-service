@@ -86,12 +86,11 @@ func TestArchiverMovesOldRows(t *testing.T) {
 }
 
 // A session quiet long enough for the sweep to archive every one of its events
-// must still continue its sequence when the user comes back. Deriving the next
-// event_seq from the hot table alone restarted it at 1, reusing seqs that still
-// exist in session_event_archive: the replay cursor (event_seq > afterSeq) then
-// skips the new events, and the next sweep violates uk_session_event_archive_seq
-// — a conflict the copy's ON CONFLICT (id) cannot absorb — which fails the batch
-// transaction and wedges every sweep after it.
+// must still continue its sequence when the user comes back: the next event_seq
+// is derived from the hot table and the archive together. Deriving it from the
+// hot table alone restarts at 1, reusing seqs that still exist in
+// session_event_archive — the next sweep violates uk_session_event_archive_seq
+// and wedges the batch transaction.
 func TestEventSeqSurvivesFullArchive(t *testing.T) {
 	svc, pool := pgSessionService(t)
 	ctx := context.Background()

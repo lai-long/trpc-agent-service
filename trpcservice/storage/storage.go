@@ -4,9 +4,8 @@
 // The storage layer owns the multi-backend implementations and tenant-level
 // routing of the Session/Memory/Knowledge/Artifact interfaces.
 //
-// Only the cmd layer creates connections (constructed, injected and closed
-// at the process entry by role); business packages receive ready-made
-// clients and never know where connections come from.
+// Every constructor here takes an established pool or client and never dials
+// one itself; only the cmd layer creates and closes connections.
 package storage
 
 import (
@@ -54,10 +53,9 @@ func NewPG(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
 	return pool, nil
 }
 
-// NewPGLazy builds a pool without pinging: connections dial on first use.
-// The gateway runs fail-closed: the tenant resolver must exist
-// even while PG is down at startup — routing errors (5xx, the IM retries)
-// until PG returns, then the resolver recovers on its next refresh.
+// NewPGLazy builds a pool without pinging: connections dial on first use, so
+// the service can be constructed while PG is down and recover when PG
+// returns.
 func NewPGLazy(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
 	pool, err := pgxpool.New(ctx, dsn)
 	if err != nil {

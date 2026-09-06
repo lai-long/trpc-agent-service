@@ -23,7 +23,7 @@ const s3DefaultContentType = "application/octet-stream"
 
 // S3ArtifactConfig holds the S3 artifact backend configuration. Secret
 // material is carried as references and resolved through Secrets, never
-// logged (same convention as the WeCom channel).
+// logged.
 type S3ArtifactConfig struct {
 	Endpoint     string // host:port, no scheme (compose MinIO: localhost:9000)
 	AccessKeyRef string // secret ref for the access key, resolved via Secrets
@@ -64,7 +64,7 @@ var _ artifact.Service = (*S3ArtifactService)(nil)
 
 // NewS3ArtifactService resolves the credentials, creates the client and
 // ensures the bucket exists; any failure is returned as an error (fail fast
-// at startup, same as NewRedis/NewPG).
+// at startup).
 func NewS3ArtifactService(cfg S3ArtifactConfig) (*S3ArtifactService, error) {
 	if cfg.Endpoint == "" || cfg.Bucket == "" {
 		return nil, errors.New("s3 artifact: Endpoint and Bucket are required")

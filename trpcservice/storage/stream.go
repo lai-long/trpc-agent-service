@@ -11,7 +11,7 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// Names of the two Stream queues.
+// The three Stream queues.
 const (
 	// StreamInbound is the Gateway→Worker inbound queue (consumer group workers).
 	StreamInbound = "stream:inbound"
@@ -40,8 +40,7 @@ type Message struct {
 }
 
 // Stream wraps Redis Stream send/receive: capped enqueue, consumer-group
-// blocking reads, and Ack after processing. XCLAIM takeover of pending
-// messages after a worker crash is implemented at the worker layer, not here.
+// blocking reads, and Ack after processing.
 type Stream struct {
 	rdb *redis.Client
 }

@@ -361,11 +361,10 @@ func TestMigratorRedisPagesTwoAppsSharingOneSessionKey(t *testing.T) {
 }
 
 // GetSession is not the journal: it replays only the events after the summary
-// cursor, and only those the archive sweep has left in the hot table. Copying a
-// postgres source through it migrated one event of a four-event session — and
-// because the consistency check counted the same truncated view on both sides,
-// it agreed with itself, the read switch flipped, and the summarized and
-// archived history became unreachable on the new backend with no error anywhere.
+// cursor, and only those the archive sweep has left in the hot table. A
+// postgres source must be copied through the full journal instead; a copy
+// through GetSession loses the summarized and archived history on the new
+// backend with no error anywhere.
 func TestMigratorCopiesTheFullJournalPastSummaryAndArchive(t *testing.T) {
 	_, pool := pgSessionService(t)
 	rdb := redisOrSkipForMigrate(t)
@@ -581,13 +580,11 @@ func roleTextEvent(id string, role model.Role, content string) *event.Event {
 
 // Dual write is live the whole time a migration runs, and the fanout writes
 // the SECONDARY first — so by the time the backfill reaches a session, the
-// target already holds the source's newest events at seqs 1..k. The old copy
-// upserted the source's i-th event at seq i+1 with ON CONFLICT DO NOTHING,
-// which dropped the source's first k events (their seqs were taken), left the
-// tail duplicated at both ends, and still added up to the source's row count —
-// so the count-based check blessed the read switch onto a scrambled journal.
-// The copy must reconcile by event ID and reorder the target into the source's
-// order instead.
+// target already holds the source's newest events at seqs 1..k. A copy that
+// upserts the source's i-th event at seq i+1 with ON CONFLICT DO NOTHING
+// would drop the source's first k events (their seqs are taken) and leave the
+// tail duplicated at both ends. The copy must reconcile by event ID and
+// reorder the target into the source's order instead.
 func TestMigratorReconcilesDualWriteTailByEventID(t *testing.T) {
 	_, pool := pgSessionService(t)
 	rdb := redisOrSkipForMigrate(t)
