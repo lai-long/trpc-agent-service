@@ -119,11 +119,9 @@ type Config struct {
 	// default) or "kms" (KMS sidecar / Vault agent at TRPC_KMS_ENDPOINT). The
 	// KMS bearer token is itself a secret, resolved from TRPC_KMS_TOKEN_REF
 	// through the file resolver. Every backend is wrapped in the short-TTL
-	// process cache (TRPC_SECRET_CACHE_TTL).
-	//
-	// KMSTokenRef's default names the file deploy/k8s mounts the
-	// trpc-kms-bootstrap Secret at, so a dropped env var still resolves instead
-// of sending the resolver hunting a path that exists nowhere in the cluster.
+	// process cache (TRPC_SECRET_CACHE_TTL). KMSTokenRef's default names the
+	// bootstrap token file the deployed KMS sidecar reads, so a dropped env
+	// var still resolves.
 SecretResolverType string // TRPC_SECRET_RESOLVER
 	KMSEndpoint        string // TRPC_KMS_ENDPOINT
 	KMSTokenRef        string // TRPC_KMS_TOKEN_REF
@@ -185,7 +183,7 @@ func Load() Config {
 		// to an all-interfaces bind explicitly.
 		MetricsAddr: getenv("TRPC_METRICS_ADDR", "127.0.0.1:8082"),
 		PGDSN:       getenv("TRPC_PG_DSN", "postgres://trpc:trpc-dev-only@localhost:5432/trpc?sslmode=disable"),
-		RedisAddr:   getenv("TRPC_REDIS_ADDR", "localhost:6380"), // host 6379 is often taken by other local services; compose maps 6380
+		RedisAddr:   getenv("TRPC_REDIS_ADDR", "localhost:6380"), // host port 6379 is often taken by other local services
 		LogLevel:    getenv("TRPC_LOG_LEVEL", "info"),
 		LogFormat:   getenv("TRPC_LOG_FORMAT", "console"),
 		SecretsDir:  getenv("TRPC_SECRETS_DIR", "data/secrets"),
