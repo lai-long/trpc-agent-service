@@ -32,7 +32,7 @@ const dedupRollbackTimeout = 3 * time.Second
 // and delivered via stream:outbound.
 //
 // An empty OutboundMessage.Text means "accepted, reply follows
-// asynchronously" (see the channels.Handler contract).
+// asynchronously".
 //
 // Before enqueueing, the handler resolves tenant routing (webhook_path →
 // channel_binding → tenant + app) and stamps tenant_id / app_id onto the

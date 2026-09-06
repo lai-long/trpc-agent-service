@@ -1,10 +1,5 @@
 package web
 
-// Direct unit tests for the unexported admin helpers whose defensive
-// branches cannot be reached through the HTTP surface: afterWrite with an
-// empty tenant id (phantom deletes / synthetic ops), changeDetail with both
-// sides nil, and tenantIDOf over an unparseable row image.
-
 import (
 	"context"
 	"encoding/json"

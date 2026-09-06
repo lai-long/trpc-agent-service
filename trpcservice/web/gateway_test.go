@@ -87,7 +87,7 @@ func TestEnqueueStampsTenant(t *testing.T) {
 		t.Fatalf("tenant not stamped: %+v", got)
 	}
 	// Trace fields are intentionally not asserted: they are only stamped when
-	// the OTel provider is installed, which main.go does at process startup.
+	// an OTel provider is installed.
 }
 
 // A failed enqueue must not leave the dedup key behind: the IM redelivery is

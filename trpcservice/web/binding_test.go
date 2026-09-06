@@ -35,8 +35,7 @@ func (f *fakeBindingChannel) Send(_ context.Context, _ channels.OutboundMessage)
 
 func (f *fakeBindingChannel) CallbackHandler(_ channels.Handler, creds channels.BindingCredentials) (http.HandlerFunc, error) {
 	if creds.TokenRef == "" {
-		// Mirrors the real adapters: binding-scoped callbacks must carry
-		// their own credential refs.
+		// A binding-scoped callback must carry its own credential refs.
 		return nil, errors.New("binding lacks callback credentials")
 	}
 	if creds.TokenRef == "unresolvable" {

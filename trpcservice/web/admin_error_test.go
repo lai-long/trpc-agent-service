@@ -1,8 +1,5 @@
 package web_test
 
-// Admin API error paths, driven through the schema's own constraints
-// (invalid uuid casts, varchar overflows, unique conflicts).
-
 import (
 	"context"
 	"crypto/tls"
@@ -72,8 +69,7 @@ func TestAdminCreateTenantValidation(t *testing.T) {
 
 	// A write the database refuses (name overflows varchar(128)) is a 500 that
 	// names the operation and nothing else: never a panic, never a silent drop,
-	// and never the driver's own text — see
-	// TestAdminInternalErrorHidesDriverText.
+	// and never the driver's own text.
 	code, out = doJSON(t, mux, http.MethodPost, "/admin/tenants",
 		fmt.Sprintf(`{"name":%q}`, strings.Repeat("x", 129)))
 	wantCode(t, code, http.StatusInternalServerError, out)
@@ -608,12 +604,8 @@ func TestAdminInternalErrorHidesDriverText(t *testing.T) {
 
 // A list query that fails must not answer 200 with an empty array. pgx defers
 // a bind- or execute-time failure past Query, which returns a nil error and a
-// Rows that simply ends, so the failure is only visible on rows.Err() — and
-// every one of these endpoints skipped that check, answering "there is
-// nothing" instead of "the read failed". An empty list is indistinguishable
-// from a genuinely empty table: an ops console shows no apps, no bindings, and
-// an audit query reports no events during exactly the incident that made
-// someone ask.
+// Rows that simply ends, so the failure is only visible on rows.Err() — an
+// empty list is indistinguishable from a genuinely empty table.
 //
 // listTenants carries the same check but has no parameter to break, so its
 // branch is only reachable through a connection dropping mid-iteration.
@@ -629,8 +621,8 @@ func TestAdminListFailureIsNotAnEmptyList(t *testing.T) {
 		{"/admin/audit?tenant_id=not-a-uuid", "query_audit"},
 	}
 	for _, tc := range cases {
-		// Before the rows.Err() check this answered 200 with `[]`, which is
-		// not even the error shape doJSON decodes into.
+		// A failed list must answer 500: an empty array is not the error shape
+		// doJSON decodes into.
 		code, out := doJSON(t, mux, http.MethodGet, tc.path, "")
 		wantCode(t, code, http.StatusInternalServerError, out)
 		msg, _ := out["error"].(string)

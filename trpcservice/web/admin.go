@@ -103,8 +103,7 @@ func (a *AdminAPI) auth(next http.HandlerFunc) http.HandlerFunc {
 }
 
 // validateModelConfig enforces the platform model-endpoint allowlist on
-// tenant.model_config. Every write path that can set base_url goes through
-// this helper or validateAppConfig, so none of them becomes a bypass.
+// tenant.model_config.
 func (a *AdminAPI) validateModelConfig(w http.ResponseWriter, raw json.RawMessage) bool {
 	if err := agent.ValidateModelConfig(raw, a.ModelHosts); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -122,10 +121,6 @@ func (a *AdminAPI) validateAppConfig(w http.ResponseWriter, raw json.RawMessage)
 	}
 	return true
 }
-
-// ---------------------------------------------------------------------------
-// Tenants
-// ---------------------------------------------------------------------------
 
 func (a *AdminAPI) createTenant(w http.ResponseWriter, r *http.Request) {
 	var in struct {
@@ -288,10 +283,6 @@ func (a *AdminAPI) updateTenant(w http.ResponseWriter, r *http.Request) {
 	a.afterWrite(r, "update_tenant", r.PathValue("id"), before, in)
 	writeJSON(w, http.StatusOK, map[string]any{"updated": true})
 }
-
-// ---------------------------------------------------------------------------
-// Apps
-// ---------------------------------------------------------------------------
 
 func (a *AdminAPI) createApp(w http.ResponseWriter, r *http.Request) {
 	var in struct {
@@ -526,10 +517,6 @@ func (a *AdminAPI) publish(ctx context.Context, appID string) (string, error) {
 	return tenantID, tx.Commit(ctx)
 }
 
-// ---------------------------------------------------------------------------
-// Bindings
-// ---------------------------------------------------------------------------
-
 func (a *AdminAPI) createBinding(w http.ResponseWriter, r *http.Request) {
 	var in struct {
 		Channel     string          `json:"channel"`
@@ -589,15 +576,9 @@ func (a *AdminAPI) createBinding(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	var id, tenantID, webhookPath string
-	// Only a published app is bindable: binding a draft would route traffic
-	// around the gray-release flow.
-	//
-	// An empty webhook_path is filled with the canonical binding-scoped
-	// callback path /callback/{channel}/{binding_id}; the id
-	// is generated in the same statement that writes the row, so the path
-	// the dispatcher resolves is self-consistent — the caller cannot know a
-	// DB-generated id up front, which made the binding-scoped path
-	// unreachable through this API.
+	// Only a published app is bindable; an empty webhook_path is filled with
+	// the canonical binding-scoped callback path /callback/{channel}/{binding_id}
+	// using the id this insert generates.
 	err := a.pool.QueryRow(r.Context(),
 		`WITH new_id AS (SELECT gen_random_uuid()::text AS id)
 		 INSERT INTO channel_binding (id, tenant_id, channel, app_id, webhook_path, token_ref, aeskey_ref, config)
@@ -746,10 +727,6 @@ func (a *AdminAPI) deleteBinding(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"deleted": true})
 }
 
-// ---------------------------------------------------------------------------
-// Knowledge ingestion
-// ---------------------------------------------------------------------------
-
 // addKnowledgeDocument ingests one inline document into the shared knowledge
 // store. tenant_id / app_id are forced into the document metadata so agent
 // searches filtered by them stay tenant-isolated.
@@ -797,10 +774,6 @@ func (a *AdminAPI) addKnowledgeDocument(w http.ResponseWriter, r *http.Request) 
 	a.afterWrite(r, "add_knowledge_document", tenantID, nil, map[string]any{"name": in.Name})
 	writeJSON(w, http.StatusCreated, map[string]any{"ingested": in.Name})
 }
-
-// ---------------------------------------------------------------------------
-// Storage migrations
-// ---------------------------------------------------------------------------
 
 // createMigration starts a backend migration for one tenant. The row appears
 // in the resolver snapshot within seconds (invalidation broadcast), and from
@@ -906,10 +879,6 @@ func parseSessionBackendOverride(raw []byte) string {
 	return c.Session.Type
 }
 
-// ---------------------------------------------------------------------------
-// Audit query
-// ---------------------------------------------------------------------------
-
 func (a *AdminAPI) queryAudit(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	limit, _ := strconv.Atoi(q.Get("limit"))
@@ -956,10 +925,6 @@ func (a *AdminAPI) queryAudit(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, out)
 }
-
-// ---------------------------------------------------------------------------
-// helpers
-// ---------------------------------------------------------------------------
 
 // OperatorID names who performed a write, for the change audit. With mTLS on
 // the admin listener the verified client certificate CN is the identity — a

@@ -1,11 +1,5 @@
 package web_test
 
-// Gateway admission and failure paths that the happy-path suite does not
-// reach: missing routing, dedup failures and duplicates, the tenant rate
-// policy override, the Redis-hiccup fail-open, dedup rollback without a
-// deduper, dedup rollback after the request context dies, and the enqueue
-// failure with backpressure disabled.
-
 import (
 	"context"
 	"errors"

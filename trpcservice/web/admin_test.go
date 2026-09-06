@@ -56,9 +56,7 @@ func doJSON(t *testing.T, mux *http.ServeMux, method, path, body string) (int, m
 // TestAdminModelAllowlist enforces the platform model-endpoint allowlist on
 // every config write path. The API is built with a nil pool: the
 // allowlist check precedes any query, so a rejected request proves the gate
-// without needing PG. publishApp applies the same validator inside its
-// transaction; the agent-side ValidateAppConfig unit tests cover that branch,
-// the HTTP-level variant rides the integration suite.
+// without needing PG.
 func TestAdminModelAllowlist(t *testing.T) {
 	mux := http.NewServeMux()
 	web.NewAdminAPI(nil, nil, nil, adminTestToken).RegisterRoutes(mux)
@@ -203,9 +201,8 @@ func TestAdminLifecycle(t *testing.T) {
 		t.Fatalf("exactly one published version expected, got %d", published)
 	}
 
-	// Rollback (no body): re-publishes v2, the next-lower version is wrong —
-	// v1 is current, so previous is none... v2 IS higher. Rollback from v1
-	// must fail (no earlier version); publish v2 again then roll back to v1.
+	// Rollback with no body: from v1 there is no earlier version, so publish
+	// v2 again and roll back to v1.
 	code, _ = doJSON(t, mux, http.MethodPost, "/admin/apps/"+appV1+"/rollback", "")
 	if code != http.StatusConflict {
 		t.Fatalf("rollback from v1 must have no earlier version, got %d", code)
@@ -219,10 +216,9 @@ func TestAdminLifecycle(t *testing.T) {
 		t.Fatalf("rollback to v1: %d %v", code, out)
 	}
 
-	// Bindings: create, list, delete. The supplied path is the wxkf adapter's
-	// own legacy mount — with the binding-scoped route auto-filled from the
-	// generated id, it is the only caller-supplied webhook_path the platform
-	// serves. The wecom and mock legacy paths are taken by the seed rows.
+	// Bindings: create, list, delete. The supplied path is the channel's
+	// env-global mount — the only caller-supplied webhook_path the platform
+	// serves; the wecom and mock mounts are already taken.
 	code, out = doJSON(t, mux, http.MethodPost, "/admin/apps/"+appV1+"/bindings",
 		`{"channel":"wxkf","webhook_path":"/wxkf/callback"}`)
 	if code != http.StatusCreated {
@@ -630,8 +626,7 @@ func TestValidateWecomwsBinding(t *testing.T) {
 	// Other channels keep their own rules: the same payload shape without the
 	// wecomws channel is not subject to the /wecomws/ path contract, and an
 	// empty webhook_path is filled with the binding-scoped route the
-	// dispatcher serves (see TestCreateBindingRejectsUnmountedWebhookPath for
-	// the paths it refuses).
+	// dispatcher serves.
 	code, out = doJSON(t, mux, http.MethodPost, bindPath,
 		`{"channel":"mock","config":{"bot_id":"ignored"}}`)
 	if code != http.StatusCreated {

@@ -1,13 +1,5 @@
 package web_test
 
-// Binding-config write gate: the per-channel outbound identity a binding
-// carries in channel_binding.config is validated at create time, because a
-// config the adapter cannot parse would fail every send under that binding
-// later (the adapters fail closed rather than reply under the env-global
-// identity). Unknown fields are refused outright: the config jsonb lands
-// verbatim in the audit detail, so a "secret" key would smuggle a plaintext
-// credential into the audit trail.
-
 import (
 	"context"
 	"encoding/json"
