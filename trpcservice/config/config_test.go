@@ -25,6 +25,17 @@ func TestLoadDefaults(t *testing.T) {
 	}
 }
 
+// TestKMSTokenRefDefaultsToDeployedName pins the fallback Load() uses when
+// TRPC_KMS_TOKEN_REF is unset. It is a file name, not a credential; defaulting
+// to it means a dropped env var still resolves to the deployed bootstrap token
+// instead of a path that exists nowhere.
+func TestKMSTokenRefDefaultsToDeployedName(t *testing.T) {
+	_ = os.Unsetenv("TRPC_KMS_TOKEN_REF")
+	if got := Load().KMSTokenRef; got != "kms-bootstrap-token" {
+		t.Errorf("KMSTokenRef default = %q, want kms-bootstrap-token", got)
+	}
+}
+
 func TestLoadFromEnv(t *testing.T) {
 	t.Setenv("TRPC_HTTP_ADDR", ":9090")
 	t.Setenv("TRPC_LOG_FORMAT", "json")
