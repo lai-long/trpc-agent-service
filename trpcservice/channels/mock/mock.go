@@ -24,8 +24,8 @@ import (
 const ChannelName = "mock"
 
 // CallbackPath is the webhook path mounted on the platform mux; it must match
-// the channel_binding.webhook_path row for tenant routing. Exported for the
-// Admin API's webhook_path validation, as in the wecom adapter.
+// the channel_binding.webhook_path row for tenant routing. Exported so a
+// caller-supplied webhook_path can be validated against the served routes.
 const CallbackPath = "/mock/callback"
 
 // callbackRequest is the callback payload pushed by the simulated IM platform.
@@ -108,8 +108,7 @@ func (c *Channel) CallbackHandler(h channels.Handler, _ channels.BindingCredenti
 			return
 		}
 
-		// Empty reply = accepted, the reply is delivered asynchronously
-		// (see the Handler contract: sync ack + async consume).
+		// An empty reply text means the reply is delivered asynchronously.
 		if out.Text == "" {
 			writeReply(w, "accepted", "")
 			return

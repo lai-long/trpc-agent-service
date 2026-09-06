@@ -183,8 +183,7 @@ func TestSendBindingPartialConfigFallsBackPerField(t *testing.T) {
 	}
 }
 
-// An empty config (bindings created before per-binding outbound config) keeps
-// the legacy single-identity behavior.
+// An empty config keeps the legacy single-identity behavior.
 func TestSendEmptyBindingConfigUsesGlobalIdentity(t *testing.T) {
 	fake := newIdentityFake()
 	srv := httptest.NewServer(fake.handler())
@@ -327,8 +326,7 @@ func TestSendBindingLookupErrorFailsClosed(t *testing.T) {
 	}
 }
 
-// A config jsonb the adapter cannot parse fails the send (the admin API gates
-// writes, but rows can predate the gate).
+// A config jsonb the adapter cannot parse fails the send.
 func TestSendMalformedBindingConfigFailsClosed(t *testing.T) {
 	fake := newIdentityFake()
 	srv := httptest.NewServer(fake.handler())

@@ -272,8 +272,7 @@ type OutboundBinding struct {
 
 // BindingProvider answers binding-id → OutboundBinding for the outbound path.
 // Inbound credentials ride BindingCredentials through the dispatcher; a reply
-// only carries the BindingID, so the adapter resolves the row itself. main.go
-// adapts the tenant resolver (cache-backed, no per-send DB hit); a nil
+// only carries the BindingID, so the adapter resolves the row itself. A nil
 // provider keeps the adapter on its env-global identity — the legacy
 // single-binding deployment's path.
 type BindingProvider interface {

@@ -1,8 +1,8 @@
 // Package wecom implements the WeCom channel adapter.
 //
 // Inbound: the IM platform posts AES-encrypted XML callbacks; the adapter
-// verifies the signature and decrypts via wxbizmsgcrypt (vendored at
-// ./wxbizmsgcrypt), normalizes the message and hands it to the Handler, which
+// verifies the signature and decrypts via wxbizmsgcrypt, normalizes the
+// message and hands it to the Handler, which
 // acks within the 5-second window (sync ack + async consume).
 //
 // Outbound: replies go through the app message/send API (direct chats) or
@@ -40,10 +40,10 @@ import (
 const ChannelName = "wecom"
 
 // CallbackPath is the webhook path mounted on the platform mux; it must match
-// the channel_binding.webhook_path row for tenant routing. Exported because
-// the Admin API validates a caller-supplied webhook_path against the routes
-// the platform actually serves: a path no handler is mounted on answers 404
-// forever while the binding row itself looks healthy.
+// the channel_binding.webhook_path row for tenant routing. Exported so a
+// caller-supplied webhook_path can be validated against the routes the
+// platform serves: a path no handler is mounted on answers 404 forever while
+// the binding row itself looks healthy.
 const CallbackPath = "/wecom/callback"
 
 // defaultAPIBase is the WeCom API endpoint; overridable for tests.
@@ -161,7 +161,7 @@ func New(cfg Config, resolver config.SecretResolver) (*Channel, error) {
 // corp / self-built app carries them here. Every field falls back to the
 // env-global Config when absent, so an empty (or corp_id-only) config keeps
 // the legacy single-identity behavior. corp_id doubles as the inbound crypt
-// receiver id the dispatcher reads.
+// receiver id a callback verifies against.
 type bindingConfig struct {
 	CorpID    string `json:"corp_id"`
 	AgentID   int    `json:"agent_id"`
@@ -195,7 +195,7 @@ type outboundID struct {
 
 // outboundIDFor resolves the identity for msg: the binding's own config when
 // the message is binding-scoped, field by field falling back to the
-// env-global identity (the legacy env path, and bindings that predate
+// env-global identity (the legacy env path, and bindings that carry no
 // per-binding outbound config). An unresolvable binding or config fails the
 // send — replying under the global identity instead could deliver one
 // tenant's message as another corp's bot.
@@ -427,7 +427,7 @@ func (c *Channel) hand(ctx context.Context, w http.ResponseWriter, h channels.Ha
 	if _, err := h.Handle(ctx, msg); err != nil {
 		if errors.Is(err, channels.ErrDuplicate) {
 			// ErrDuplicate is a success outcome, not a failure: answer 200 so
-			// the platform stops redelivering (see the Handler contract).
+			// the platform stops redelivering.
 			plog.Warnf("wecom duplicate message %s dropped", msgID)
 			writeSuccess(w)
 			return
@@ -544,11 +544,9 @@ func writeSuccess(w http.ResponseWriter) {
 // Send implements channels.Channel: direct chats go to message/send, group
 // chats to appchat/send. Long texts are split into sequential segments within
 // this one call, so concurrent senders cannot interleave segments of the same
-// reply.
-// Send delivers the reply. The WeCom message/send API accepts no caller
-// idempotency key, so the platform cannot dedup a retried send (unlike the
-// wxkf send_msg msgid): duplicate suppression relies on the sender's sent:
-// marker window, and a crash inside that window can surface a duplicate.
+// reply. The WeCom message/send API accepts no caller idempotency key, so
+// duplicate suppression relies on the sender's sent: marker window, and a
+// crash inside that window can surface a duplicate.
 func (c *Channel) Send(ctx context.Context, msg channels.OutboundMessage) error {
 	// One identity lookup for the whole reply: every segment of one message
 	// goes out under the same binding identity.
@@ -738,8 +736,6 @@ func (c *Channel) invalidateToken(corpID, secretRef string) {
 }
 
 // splitText breaks s into segments of at most n bytes, on rune boundaries.
-// The implementation lives in the channels package (channels.SplitText) so
-// other size-limited channels share it.
 func splitText(s string, n int) []string {
 	return channels.SplitText(s, n)
 }

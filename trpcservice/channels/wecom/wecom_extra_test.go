@@ -286,9 +286,8 @@ func TestReceiveAuthenticatedButUnreadableIsNotAcked(t *testing.T) {
 
 // The declared message length is read out of the decrypted buffer, so a
 // corrupted or wrongly-keyed callback can carry 0xFFFFFFFF: 20+msg_len wraps to
-// 19 in uint32, the guard written as "text_len < 20+msg_len" let it through, and
-// the slice expression panicked on inverted bounds — one callback taking the
-// whole process down. It must be a bounds error like any other unreadable body.
+// 19 in uint32, which slips past a "text_len < 20+msg_len" guard and inverts
+// the slice bounds. It must be a bounds error like any other unreadable body.
 func TestReceiveOverflowingMsgLenDoesNotPanic(t *testing.T) {
 	c := testChannel(t, "")
 	body, query := craftCallback(t, overflowPlaintext())

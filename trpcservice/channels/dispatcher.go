@@ -44,7 +44,7 @@ func e2eAttr(msg OutboundMessage) otelmetric.RecordOption {
 }
 
 // DefaultSenderGroup is the consumer group a Sender reads when Group is
-// empty; the assembly binary's EnsureGroup uses the same constant.
+// empty.
 const DefaultSenderGroup = "senders"
 
 // Sender consumes the outbound stream as part of a consumer group (Group,
@@ -153,8 +153,8 @@ func (s *Sender) maxIdle() time.Duration {
 	// The takeover latency of a rate-limited or wedged send, and the safety
 	// bound against claiming an in-flight send, are the same number: it must
 	// exceed the worst-case send (sendWait 30s pacing + the IM API timeout
-	// per segment); 2min leaves ample slack while keeping requeue delay
-	// bounded instead of the previous 10min.
+	// per segment); 2min leaves ample slack and keeps the requeue delay
+	// bounded.
 	return 2 * time.Minute
 }
 
@@ -215,8 +215,8 @@ func (s *Sender) reap(ctx context.Context) {
 	}
 	for _, m := range msgs {
 		// Read-only: the counter tracks genuine delivery failures (recorded by
-		// handle), not takeovers. Counting takeovers dead-lettered replies that
-		// were merely paced by the rate limiter or delayed by a Redis hiccup.
+		// handle), not takeovers — a reply paced by the rate limiter or
+		// delayed by a Redis hiccup is not a failure.
 		attempts, err := s.Stream.Attempts(ctx, s.inStream(), s.group(), m.ID)
 		if err != nil {
 			plog.Warnf("sender %s count attempts %s: %v", s.Name, m.ID, err)
@@ -295,12 +295,11 @@ func (s *Sender) handle(ctx context.Context, m storage.Message) {
 		return
 	}
 
-	// Pace the send on the {channel, tenant} bucket. On
-	// exhaustion the message is left pending for the reaper's takeover: a
-	// re-queue under a new stream ID reset the attempts counter and the
-	// maxAttempts dead-letter could never fire, so sustained rate limiting
-	// re-queued forever. The bucket refills in milliseconds;
-	// the reaper's maxIdle is the outer bound of the delay.
+	// Pace the send on the {channel, tenant} bucket; on exhaustion the
+	// message stays pending for the reaper's takeover instead of being
+	// re-queued under a new stream ID, which would hand it a fresh attempts
+	// counter. The bucket refills in milliseconds; the reaper's maxIdle is
+	// the outer bound of the delay.
 	if s.Limiter != nil {
 		qps, burst := s.sendQPS(), s.sendBurst()
 		if s.SendPolicyFor != nil && msg.TenantID != "" {

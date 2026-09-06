@@ -155,9 +155,9 @@ func scopedReplyToken(epoch uint64, reqID string) string {
 }
 
 // parseReplyToken splits a scoped reply token back into its epoch and req_id.
-// An epoch of 0 means the token predates epoch-scoping (a message in flight
-// across a rolling deploy): it is sent as-is, the pre-scheme behavior, since
-// its owning connection cannot be identified anymore.
+// An epoch of 0 means the token carries no epoch (a message in flight across
+// a rolling deploy): it is sent as-is, since its owning connection cannot be
+// identified anymore.
 func parseReplyToken(token string) (epoch uint64, reqID string) {
 	i := strings.IndexByte(token, ':')
 	if i < 0 {

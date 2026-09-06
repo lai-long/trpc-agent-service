@@ -163,12 +163,11 @@ func TestSendEmptyReplyToken(t *testing.T) {
 }
 
 // TestSendStaleReplyTokenAfterReconnect: a req_id is only deliverable on the
-// connection that received its callback. After a reconnect the write on the
-// successor would succeed while the platform drops the uncorrelatable frame —
-// under that behavior the sender recorded the reply as sent and the user never
-// saw it. Send must reject the stale token as an error and write nothing,
-// while a fresh token on the live connection still delivers, and a bare
-// pre-scheme token (in flight across a rolling deploy) keeps sending as-is.
+// connection that received its callback, so Send must reject a token from a
+// replaced connection as an error and write nothing — a write on the successor
+// would succeed while the platform drops the uncorrelatable frame. A fresh
+// token on the live connection still delivers, and a bare token that carries
+// no epoch (in flight across a rolling deploy) keeps sending as-is.
 func TestSendStaleReplyTokenAfterReconnect(t *testing.T) {
 	f := newFakePlatform(t, "bot-1", "s3cr3t")
 	h := &recordingHandler{}
@@ -226,8 +225,8 @@ func TestSendStaleReplyTokenAfterReconnect(t *testing.T) {
 		t.Fatalf("the frame must echo the bare req_id, got %+v", resp)
 	}
 
-	// A token without an epoch (written before the scheme existed) keeps the
-	// old fail-open behavior: sent verbatim.
+	// A token without an epoch carries no connection identity, so it is sent
+	// verbatim.
 	if err := ch.Send(context.Background(), channels.OutboundMessage{
 		Channel: "wecomws", BindingID: "b1", MsgID: "m-legacy", ReplyToken: "req-legacy",
 		UserID: "u1", Text: "rolling deploy",

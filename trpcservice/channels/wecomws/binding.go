@@ -24,8 +24,8 @@ type RoutesProvider interface {
 	RoutesByChannel(ctx context.Context, channel string) ([]Binding, error)
 }
 
-// bindingConfig is channel_binding.config for wecomws bindings — the first
-// use of the jsonb config column: one bot per binding. The secret stays as a
+// bindingConfig is channel_binding.config for wecomws bindings: one bot per
+// binding. The secret stays as a
 // reference and is resolved through the SecretResolver at every (re)connect,
 // so a rotation takes effect on the next reconnect.
 type bindingConfig struct {

@@ -363,8 +363,7 @@ func TestSenderSkip(t *testing.T) {
 
 	// The gated Send freezes the first delivery while both entries sit in
 	// the PEL. The wecomws spy makes the Skip branch load-bearing: without
-	// it the sender would deliver skip-b through the spy (the unknown-
-	// channel ack-and-drop no longer masks a removed Skip), failing the
+	// it the sender would deliver skip-b through the spy, failing the
 	// spy.Calls assertion below.
 	ch := &countingChannel{gate: make(chan struct{})}
 	ws := &countingChannel{name: "wecomws"}
@@ -436,7 +435,7 @@ func TestSenderGroup(t *testing.T) {
 		Channels: map[string]channels.Channel{"wecomws": ch},
 		Name:     "test-ws", InStream: outbound,
 		Group: "senders-ws",
-		// The ws sender only delivers wecomws, symmetric with main.go.
+		// This sender delivers wecomws only.
 		Skip: func(msg channels.OutboundMessage) bool { return msg.Channel != "wecomws" },
 	}
 	go func() { _ = sender.Run(ctx) }()

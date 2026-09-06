@@ -2,11 +2,10 @@
 //
 // Inbound: the IM platform posts AES-encrypted JSON callbacks
 // ({"encrypt": "..."}); the adapter verifies the msg_signature and decrypts
-// via wxbizmsgcrypt (vendored at ./wxbizmsgcrypt — same algorithm family as
-// WeCom, different envelope format), normalizes the message and hands it to
+// via wxbizmsgcrypt (the WeWork crypt algorithm over a JSON envelope),
+// normalizes the message and hands it to
 // the Handler. GET callbacks carry the URL-verification challenge (echostr).
-// Unlike WeCom there is no 5-second reply window; the async chain is shared
-// unchanged.
+// There is no 5-second reply window: replies go out on the async chain.
 //
 // Outbound: replies go through the customer-service send_msg API — the only
 // reply path, allowed only within 48 hours of the user's last message; window
@@ -43,9 +42,10 @@ import (
 const ChannelName = "wxkf"
 
 // CallbackPath is the webhook path mounted on the platform mux; it must match
-// the channel_binding.webhook_path row for tenant routing. Exported for the
-// Admin API's webhook_path validation, as in the wecom adapter: a path no
-// handler is mounted on answers 404 forever while the row looks healthy.
+// the channel_binding.webhook_path row for tenant routing. Exported so a
+// caller-supplied webhook_path can be validated against the served routes: a
+// path no handler is mounted on answers 404 forever while the row looks
+// healthy.
 const CallbackPath = "/wxkf/callback"
 
 // defaultAPIBase is the WeCom API endpoint the KF APIs hang under; overridable
@@ -157,7 +157,7 @@ func New(cfg Config, resolver config.SecretResolver) (*Channel, error) {
 // corp / KF account carries them here. Every field falls back to the
 // env-global Config when absent, so an empty (or corp_id-only) config keeps
 // the legacy single-identity behavior. corp_id doubles as the inbound crypt
-// receiver id the dispatcher reads.
+// receiver id a callback verifies against.
 type bindingConfig struct {
 	CorpID    string `json:"corp_id"`
 	KfAccount string `json:"kf_account"`
@@ -191,7 +191,7 @@ type outboundID struct {
 
 // outboundIDFor resolves the identity for msg: the binding's own config when
 // the message is binding-scoped, field by field falling back to the
-// env-global identity (the legacy env path, and bindings that predate
+// env-global identity (the legacy env path, and bindings that carry no
 // per-binding outbound config). An unresolvable binding or config fails the
 // send — replying under the global identity instead could deliver one
 // tenant's message as another KF account.
@@ -349,14 +349,14 @@ func (c *Channel) receive(w http.ResponseWriter, r *http.Request, crypt *wxbizms
 	q := r.URL.Query()
 	plain, cerr := crypt.DecryptMsg(q.Get("msg_signature"), q.Get("timestamp"), q.Get("nonce"), xmlEnvelope(envelope.Encrypt))
 	if cerr != nil {
-		// Two failures, two answers — the same split as the WeCom adapter. An
-		// unverified callback (bad signature, envelope that is not XML) is
-		// indistinguishable from internet junk: ack it, redelivery cannot make it
-		// readable. A verified one we still cannot read is the platform's and
-		// broken on our side — wrong or misshapen AES key, ciphertext truncated
-		// in transit, receiver_id naming another corp — so acking it would drop
-		// the user's message behind one warn line. 5xx makes the platform
-		// redeliver, and fixing the credential recovers it.
+		// Two failures, two answers. An unverified callback (bad signature,
+		// envelope that is not XML) is indistinguishable from internet junk:
+		// ack it, redelivery cannot make it readable. A verified one we still
+		// cannot read is broken on our side — wrong or misshapen AES key,
+		// ciphertext truncated in transit, receiver_id naming another corp —
+		// so acking it would drop the user's message behind one warn line.
+		// 5xx makes the platform redeliver, and fixing the credential
+		// recovers it.
 		if cerr.ErrCode == wxbizmsgcrypt.ValidateSignatureError || cerr.ErrCode == wxbizmsgcrypt.ParseXmlError {
 			plog.Warnf("wxkf drop unverified callback: %s", cerr.ErrMsg)
 			writeSuccess(w)
@@ -403,7 +403,7 @@ func (c *Channel) receive(w http.ResponseWriter, r *http.Request, crypt *wxbizms
 	if _, err := h.Handle(r.Context(), msg); err != nil {
 		if errors.Is(err, channels.ErrDuplicate) {
 			// ErrDuplicate is a success outcome, not a failure: answer 200 so
-			// the platform stops redelivering (see the Handler contract).
+			// the platform stops redelivering.
 			plog.Warnf("wxkf duplicate message %s dropped", cm.MsgID)
 			writeSuccess(w)
 			return
@@ -632,9 +632,8 @@ func (c *Channel) invalidateToken(corpID, secretRef string) {
 	delete(c.tokens, key)
 }
 
-// splitText breaks s into segments of at most n bytes, on rune boundaries.
-// Deliberately a local copy of the WeCom rule: the two adapters evolve on
-// different platform limits and must not couple. A non-positive n means no
+// splitText breaks s into segments of at most n bytes, on rune boundaries,
+// sized for this adapter's own platform limit. A non-positive n means no
 // limit, so s comes back unsplit — without that guard n == 0 would spin forever
 // on a zero-length prefix and n < 0 would panic in the slice expression.
 func splitText(s string, n int) []string {

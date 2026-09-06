@@ -31,10 +31,8 @@ func (*kickedError) Error() string { return "wecomws: disconnected by platform" 
 
 // staleReplyError marks a reply whose token was stamped by a connection that
 // is no longer live: the platform correlates replies per connection, so the
-// req_id is undeliverable on any successor. Retrying cannot heal it — the
-// sender's attempts bound it into the dead-letter — and the reply must not be
-// recorded as sent, which is what a plain successful write on the successor
-// connection would have done.
+// req_id is undeliverable on any successor. Retrying cannot heal it, and the
+// reply must not be recorded as sent.
 type staleReplyError struct{ reqID string }
 
 func (e *staleReplyError) Error() string {
@@ -486,8 +484,8 @@ func (c *botConn) writeLockedOn(ctx context.Context, ws *websocket.Conn, data []
 }
 
 // write is the Send-facing serializer: one frame, bounded write timeout.
-// wantEpoch is the connection epoch the reply token was stamped with (0 for a
-// pre-scheme token); checked under the same lock as the write, so a reconnect
+// wantEpoch is the connection epoch the reply token was stamped with (0 for
+// a token that carries no epoch); checked under the same lock as the write, so a reconnect
 // between the check and the write cannot let a dead token slip onto the
 // successor connection.
 func (c *botConn) write(ctx context.Context, env envelope, wantEpoch uint64) error {
@@ -544,8 +542,7 @@ func readEnvelope(ctx context.Context, ws *websocket.Conn) (envelope, error) {
 	return env, nil
 }
 
-// Sleep waits for d exactly; false on ctx cancel. Exported for the
-// wecomws-leader loop in the assembly binary, which shares the cadence.
+// Sleep waits for d exactly; false on ctx cancel.
 func Sleep(ctx context.Context, d time.Duration) bool {
 	timer := time.NewTimer(d)
 	defer timer.Stop()

@@ -34,7 +34,7 @@ const ChannelName = "wecomws"
 // platform-wide leader runs for this channel's replies.
 const SenderGroup = "senders-ws"
 
-// Default knobs, shared by New and the assembly binary's env fallbacks.
+// Default knobs applied by New.
 const (
 	DefaultPingInterval   = 30 * time.Second
 	DefaultSegmentBytes   = 2048
@@ -60,7 +60,7 @@ type Channel struct {
 
 	// Connection timing knobs (reconnect 1s ×2 cap 60s; platform kick
 	// restarts at 5s; subscribe rejection cap 5min; inbound retry 1s ×2
-	// cap 30s). Tests compress them directly.
+	// cap 30s).
 	reconnectBase    time.Duration
 	reconnectCap     time.Duration
 	kickedBase       time.Duration
