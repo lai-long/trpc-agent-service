@@ -149,8 +149,6 @@ func TestAdminMTLSHandshake(t *testing.T) {
 	}
 }
 
-// --- tiny x509 test CA ----------------------------------------------------
-
 // testCA is a self-signed CA used to mint server/client certificates.
 type testCA struct {
 	cert *x509.Certificate

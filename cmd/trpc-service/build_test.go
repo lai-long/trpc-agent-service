@@ -84,8 +84,6 @@ func newTestRedis(t *testing.T) *redis.Client {
 	return rdb
 }
 
-// --- buildSecretResolver ---------------------------------------------------
-
 func TestBuildSecretResolverFileBackend(t *testing.T) {
 	dir := testSecretsDir(t)
 	r, err := buildSecretResolver(context.Background(),
@@ -132,10 +130,8 @@ func TestBuildSecretResolverKMSBackend(t *testing.T) {
 }
 
 // TestBuildSecretResolverKMSFailsClosed pins the refusal: a KMS backend that
-// cannot be built stops startup instead of degrading to the file resolver. Both
-// cases are configuration errors that retrying cannot fix, and the old fallback
-// spent the whole process lifetime resolving plaintext secrets from disk behind
-// one warn line — including credentials already rotated away in the KMS.
+// cannot be built stops startup instead of degrading to the file resolver.
+// Both cases are configuration errors that retrying cannot fix.
 func TestBuildSecretResolverKMSFailsClosed(t *testing.T) {
 	dir := testSecretsDir(t)
 	cases := []struct {
@@ -162,8 +158,6 @@ func TestBuildSecretResolverKMSFailsClosed(t *testing.T) {
 		})
 	}
 }
-
-// --- buildSummarizer / buildEmbedder / buildKnowledge ----------------------
 
 func TestBuildSummarizer(t *testing.T) {
 	ctx := context.Background()
@@ -251,8 +245,6 @@ func TestBuildKnowledge(t *testing.T) {
 	}
 }
 
-// --- buildArtifact ----------------------------------------------------------
-
 func TestBuildArtifact(t *testing.T) {
 	if svc := buildArtifact(config.Config{}, nil); svc != nil {
 		t.Fatal("no S3 endpoint must disable artifacts")
@@ -286,8 +278,6 @@ func TestBuildArtifact(t *testing.T) {
 		t.Fatalf("reachable MinIO must build the artifact store, got %T", svc)
 	}
 }
-
-// --- buildSessionServices ---------------------------------------------------
 
 func TestBuildSessionServicesWithoutPG(t *testing.T) {
 	ctx := context.Background()
@@ -363,13 +353,10 @@ func TestBuildSessionServicesWithPG(t *testing.T) {
 	}
 }
 
-// --- buildProcessor ----------------------------------------------------------
-
 func TestBuildProcessorEchoFallback(t *testing.T) {
 	ctx := context.Background()
-	// Guarded.Process audits through the async lane; serve always hands
-	// buildProcessor a live auditor (even PG-degraded starts get one via the
-	// lazy pool), so the test does the same.
+	// Guarded.Process audits through the async lane, so the test supplies a
+	// live auditor.
 	pool := newTestPool(t)
 	auditor := storage.NewAuditor(pool)
 	auditor.Start()
@@ -487,8 +474,6 @@ func TestBuildProcessorFull(t *testing.T) {
 	}
 	cleanup3()
 }
-
-// --- start* channel builders --------------------------------------------------
 
 func TestStartWecom(t *testing.T) {
 	secrets := config.NewFileResolver(testSecretsDir(t))
@@ -656,8 +641,6 @@ func TestWSRoutesByChannel(t *testing.T) {
 	}
 }
 
-// --- startPGConsumers ---------------------------------------------------------
-
 func TestStartPGConsumers(t *testing.T) {
 	ctx := context.Background()
 
@@ -684,8 +667,6 @@ func TestStartPGConsumers(t *testing.T) {
 	}
 	cleanup3()
 }
-
-// --- runWecomwsLeader ---------------------------------------------------------
 
 // fakeStarter implements channels.Starter for the leader-loop tests: Start
 // blocks until its context is canceled, like the wecomws connection loop.

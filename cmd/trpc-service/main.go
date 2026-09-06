@@ -118,8 +118,6 @@ func serve(role string) error {
 		_ = shutdownTrace()
 	}()
 
-	// Infra connections are created here and injected into the role's
-	// components.
 	rdb, err := storage.NewRedis(ctx, cfg.RedisAddr)
 	if err != nil {
 		return err
@@ -139,11 +137,8 @@ func serve(role string) error {
 		return err
 	}
 
-	// PG serves three consumers: the Auditor (async batch lane for routine
-	// events, sync lane for critical decisions), the tenant Resolver (gateway
-	// routing), and the session store when SessionBackend=postgres. PG down at
-	// startup degrades audit and routing to off with a warning — the message
-	// pipeline must not depend on them.
+	// PG down at startup degrades audit and routing to off with a warning —
+	// the message pipeline must not depend on them.
 	auditor, resolver, pgPool, pgCleanup := startPGConsumers(ctx, cfg)
 	defer pgCleanup()
 	// Every role watches config invalidations (publish/rollback/migration
@@ -165,7 +160,6 @@ func serve(role string) error {
 		kb = buildKnowledge(ctx, cfg, secrets)
 	}
 
-	// Worker-side infrastructure: session backends, artifact store, processor.
 	var (
 		sessByType  map[string]session.Service
 		defaultSess string
@@ -208,7 +202,6 @@ func serve(role string) error {
 	g, gctx := errgroup.WithContext(ctx)
 	consumer := fmt.Sprintf("%s-%s-%d", role, instanceID(), os.Getpid())
 
-	// --- Gateway role: IM callbacks in, replies out -------------------------
 	if wantGateway {
 		enqueue := web.EnqueueHandler{
 			Stream:       stream,
@@ -363,7 +356,6 @@ func serve(role string) error {
 		}
 	}
 
-	// --- Worker role: consume, run agents, drain on shutdown ----------------
 	if wantWorker {
 		worker := &agent.Worker{
 			Stream: stream, Lock: storage.NewLock(rdb), Processor: processor,
@@ -381,7 +373,6 @@ func serve(role string) error {
 		}
 	}
 
-	// --- Admin role: management API + housekeeping --------------------------
 	if wantAdmin {
 		if pgPool == nil {
 			plog.Warnf("admin role degraded: PG unreachable, Admin API and archiver disabled")
@@ -588,8 +579,9 @@ func startWecom(cfg config.Config, media channels.MediaStore, secrets config.Sec
 	return wc
 }
 
-// startWxkf builds the WeChat KF channel from env config;
-// same degradation rule as startWecom.
+// startWxkf builds the WeChat KF channel from env config; it returns nil
+// (with a warning) when the channel is not configured or its secrets are
+// missing, so the other channels keep serving.
 func startWxkf(cfg config.Config, secrets config.SecretResolver, bindings channels.BindingProvider) *wxkf.Channel {
 	if cfg.WxkfCorpID == "" || cfg.WxkfKfAccount == "" {
 		return nil
@@ -616,9 +608,9 @@ func startWxkf(cfg config.Config, secrets config.SecretResolver, bindings channe
 }
 
 // startWecomws builds the WeCom smart-bot WebSocket channel from env config;
-// nil (silently) when TRPC_WECOMWS_ADDR is unset — same missing-key gating
-// as startWecom. Bots and their secret references live in channel_binding
-// rows enumerated through the routes adapter.
+// nil (silently) when TRPC_WECOMWS_ADDR is unset. Bots and their secret
+// references live in channel_binding rows enumerated through the routes
+// adapter.
 func startWecomws(cfg config.Config, secrets config.SecretResolver, routes wecomws.RoutesProvider) *wecomws.Channel {
 	if cfg.WecomwsAddr == "" {
 		return nil
@@ -969,8 +961,8 @@ func instanceID() string {
 	return h
 }
 
-// parseInt / parseFloat / parseDuration parse env string values, falling back
-// to def with a warning on invalid input.
+// parseInt, parseFloat and parseDuration parse env string values, falling
+// back to def with a warning on invalid input.
 func parseInt(s string, def int) int {
 	v, err := strconv.Atoi(s)
 	if err != nil || v <= 0 {
@@ -1030,13 +1022,11 @@ func adminTLSConfig(cfg config.Config) (*tls.Config, error) {
 // (its bearer token bootstraps from the file resolver), and in both cases the
 // short-TTL cache that absorbs a KMS blip.
 //
-// A misconfigured KMS fails startup rather than falling back to files — the
-// rule checkAdminToken applies above. Both failures here are configuration (an
-// unreadable bootstrap token, an empty endpoint), so retrying cannot fix them,
-// and degrading would spend the whole process lifetime on plaintext-on-disk
-// secrets behind one warn line: whoever set kms asked for the secrets not to
-// live on this disk, and a deployment keeping a plaintext copy anyway would
-// keep resolving through it, credentials rotated away included.
+// A misconfigured KMS fails startup rather than falling back to files. Both
+// failures here are configuration (an unreadable bootstrap token, an empty
+// endpoint) that retrying cannot fix, and degrading would spend the whole
+// process lifetime on plaintext-on-disk secrets behind one warn line —
+// including credentials already rotated away in the KMS.
 func buildSecretResolver(ctx context.Context, cfg config.Config) (config.SecretResolver, error) {
 	file := config.NewFileResolver(cfg.SecretsDir)
 	base := config.SecretResolver(file)

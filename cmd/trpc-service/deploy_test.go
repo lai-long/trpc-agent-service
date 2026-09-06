@@ -8,22 +8,14 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/config"
 )
 
-// TestK8sManifestsProvideKMSToken pins the contract between deploy/k8s and
-// buildSecretResolver's fail-closed KMS branch: with resolver=kms the process
-// refuses to start unless the bootstrap token file exists under SecretsDir, so
-// manifests that ask for kms must also deliver that file — the ConfigMap names
-// the dir and the token ref, and every role Deployment mounts a Secret volume
-// at the dir carrying the ref's file. Nothing in the toolchain checks YAML
-// against Go: without this test the manifests can declare kms and starve every
-// pod of its token while every build stays green.
-//
-// The third leg is the in-code fallback: what Load() resolves to when the
-// ConfigMap entry is absent. A default disagreeing with the deployed file name
-// turns one dropped env var into a resolver hunting a file nobody ever mounted
-// — a CrashLoop whose error names a path that exists nowhere in the cluster.
-// This asserts the value Load() actually produces rather than a shared
-// constant, because re-inlining a stale literal in Load() is exactly the drift
-// being guarded against and a constant comparison would sail through it.
+// TestK8sManifestsProvideKMSToken pins the KMS bootstrap contract: with
+// resolver=kms the process refuses to start unless the bootstrap token file
+// exists under SecretsDir, so a deployment that asks for kms must also mount a
+// Secret volume at that dir carrying the token ref's file. The in-code
+// fallback for the ref must agree with the deployed value: a default
+// disagreeing with the mounted file name turns one dropped env var into a
+// CrashLoop. Nothing in the toolchain checks YAML against Go, so this test
+// guards the drift.
 func TestK8sManifestsProvideKMSToken(t *testing.T) {
 	cfg := readManifest(t, "../../deploy/k8s/config.yaml")
 	if !strings.Contains(cfg, `TRPC_SECRET_RESOLVER: "kms"`) {
@@ -49,13 +41,11 @@ func TestK8sManifestsProvideKMSToken(t *testing.T) {
 }
 
 // TestK8sIngressIsTheOnlyPublicEntry pins the external topology: the gateway
-// Service stays cluster-internal and ingress.yaml is what the IM platforms
-// actually reach. Both halves matter. A Service that omits `type:` is ClusterIP
-// by default, so gateway.yaml must declare ClusterIP explicitly; an Ingress
-// whose backend name or port drifts from that
-// Service fails the same way, from the other direction.
+// Service stays cluster-internal and declares ClusterIP explicitly on port 80,
+// the Ingress is the single public entry, carries a TLS block, and its backend
+// matches that Service.
 //
-// It also pins what must NOT be exposed. The mock channel's callback is an
+// It also pins what must NOT be exposed: the mock channel's callback is an
 // unauthenticated message injector, so a public path for it would hand out a
 // way to forge inbound messages for any binding.
 func TestK8sIngressIsTheOnlyPublicEntry(t *testing.T) {
