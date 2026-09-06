@@ -226,12 +226,8 @@ func TestReceiveUnverifiedCallbackIsAcked(t *testing.T) {
 }
 
 // A callback whose signature verifies is provably the platform's, so failing to
-// read it is our fault: a wrong or misshapen AES key, a ciphertext truncated in
-// transit, a receiver_id naming another corp. It used to be acked exactly like
-// junk, which lost the user's message with one warn line as the only trace; it
-// must answer 5xx so the platform redelivers and a fixed credential recovers the
-// backlog. The shared crypto library's own bounds panic is pinned by the WeCom
-// adapter's TestReceiveOverflowingMsgLenDoesNotPanic.
+// read it is our fault: it must answer 5xx so the platform redelivers and a
+// fixed credential recovers the backlog.
 func TestReceiveAuthenticatedButUnreadableIsNotAcked(t *testing.T) {
 	c := testChannel(t, "")
 	body, query := craftCallback(t, "short")
