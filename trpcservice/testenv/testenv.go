@@ -19,12 +19,10 @@ import (
 	plog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
 )
 
-// RedisAddr is the test Redis address (TRPC_TEST_REDIS_ADDR); the default
-// matches docker-compose.yml's mapped port.
+// RedisAddr is the test Redis address (TRPC_TEST_REDIS_ADDR).
 func RedisAddr() string { return getenv("TRPC_TEST_REDIS_ADDR", "localhost:6380") }
 
-// PGDSN is the test PostgreSQL DSN (TRPC_TEST_PG_DSN); the default matches
-// the compose stack's dev credentials.
+// PGDSN is the test PostgreSQL DSN (TRPC_TEST_PG_DSN).
 func PGDSN() string {
 	return getenv("TRPC_TEST_PG_DSN", "postgres://trpc:trpc-dev-only@localhost:5432/trpc?sslmode=disable")
 }
