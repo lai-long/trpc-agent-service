@@ -1,10 +1,7 @@
 package web_test
 
-// Error-path coverage for the Admin API: every validation branch and every
-// DB-backed failure the schema lets us trigger deterministically (invalid
-// uuid casts, varchar(128) overflows, unique-constraint conflicts). The
-// remaining DB-failure branches (query/scan/tx errors on healthy data) are
-// not reachable without breaking the database out from under the handler.
+// Admin API error paths, driven through the schema's own constraints
+// (invalid uuid casts, varchar overflows, unique conflicts).
 
 import (
 	"context"
@@ -572,9 +569,8 @@ func TestAdminInternalErrorHidesDriverText(t *testing.T) {
 	stop := testenv.CaptureLogs(t, "error")
 
 	// Each of these makes the id column's uuid cast fail, so the handler
-	// answers from its driver-error branch with a real Postgres error behind
-	// it — `ERROR: invalid input syntax for type uuid: "not-a-uuid"
-	// (SQLSTATE 22P02)`, all of which used to reach the caller verbatim.
+	// answers from its driver-error branch; the real Postgres error must not
+	// reach the caller.
 	cases := []struct{ method, path, op string }{
 		{http.MethodGet, "/admin/tenants/not-a-uuid", "get_tenant"},
 		{http.MethodPost, "/admin/apps/not-a-uuid/publish", "publish_app"},
