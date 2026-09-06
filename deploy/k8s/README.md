@@ -24,13 +24,23 @@ kubectl wait --for=condition=complete job/trpc-db-init --timeout=120s
 kubectl apply -f deploy/k8s/gateway.yaml
 kubectl apply -f deploy/k8s/worker.yaml
 kubectl apply -f deploy/k8s/admin.yaml
+
+# 对外入口：IM 平台只接受「可信证书的 HTTPS 回调地址」，所以 TLS 必须在 Ingress 上终止。
+# 先把 ingress.yaml 里的 host / secretName / ingressClassName 改成你环境的值。
+kubectl create secret tls trpc-tls --cert=<你的证书> --key=<你的私钥>
+kubectl apply -f deploy/k8s/ingress.yaml
+# 回调地址即 https://<host>/callback/{channel}/{binding_id}，
+# 与 channel_binding.webhook_path 自动填充的形态一致。
 ```
 
 要点：
 
-- **角色与端口**：gateway 对外（IM webhook 经 LB/Ingress 进来），但对外的口上只有回调；
-  每个角色另起一个内网 metrics 监听（TRPC_METRICS_ADDR，默认 `127.0.0.1:8082`，k8s 清单
-  里显式设为 `:8082` 供 kubelet 探针与 Prometheus 抓取），探针与
+- **对外入口**：gateway Service 是 `ClusterIP`，公网入口只有 `ingress.yaml` 一处，
+  且只放行 `/callback` 与两个 legacy 单绑定路径——`/mock/callback` 是无鉴权消息注入器，
+  绝不能出现在 Ingress 上。没有 ingress controller 的集群改用 `type: LoadBalancer`
+  （TLS 走云厂商证书注解）或 NodePort，见 `gateway.yaml` 里的注释。
+- **角色与端口**：每个角色另起一个内网 metrics 监听（TRPC_METRICS_ADDR，默认 `127.0.0.1:8082`，
+  k8s 清单里显式设为 `:8082` 供 kubelet 探针与 Prometheus 抓取），探针与
   Prometheus 都抓它——导出的序列带租户维度流量、token 消耗和队列积压，挂在公网可达的
   回调 mux 上等于白送侦察材料。admin 仅 ClusterIP（内网）且只承载 `/admin/*`（逐路由
   token 鉴权），需要更强管控时上 TRPC_ADMIN_TLS_CERT/KEY/CLIENT_CA 三件套启用 mTLS。

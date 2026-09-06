@@ -1,5 +1,6 @@
-# Agent Gateway: IM callbacks in, replies out. Stateless, scales freely,
-# fronted by a LoadBalancer the IM platforms webhook to.
+# Agent Gateway: IM callbacks in, replies out. Stateless, scales freely.
+# The public entry point is the Ingress in ingress.yaml — this Service stays
+# cluster-internal and the Ingress terminates the TLS the IM platforms require.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -29,8 +30,8 @@ spec:
             - {name: TRPC_METRICS_ADDR, value: ":8082"}
           ports:
             - {containerPort: 8080, name: http}
-            # Internal only: not in the Service below, so it never reaches the
-            # LoadBalancer the IM platforms webhook to.
+            # Internal only: no Service selects it, so it never reaches the
+            # Ingress the IM platforms webhook through.
             - {containerPort: 8082, name: metrics}
           securityContext:
             runAsNonRoot: true
@@ -53,7 +54,14 @@ kind: Service
 metadata:
   name: trpc-gateway
 spec:
+  # Stated explicitly, mirroring admin.yaml; omission would also yield
+  # ClusterIP. This Service is internal — the only public entry is ingress.yaml.
+  #
+  # Clusters without an ingress controller: switch to LoadBalancer (terminating
+  # TLS through your provider's certificate annotations) or NodePort, and
+  # delete ingress.yaml. The IM platforms only webhook to HTTPS with a trusted
+  # certificate, so plain TCP passthrough is not an option.
+  type: ClusterIP
   selector: {app: trpc-gateway}
   ports:
     - {port: 80, targetPort: http}
-  # The IM platforms' webhooks target this service through your LB/Ingress.
