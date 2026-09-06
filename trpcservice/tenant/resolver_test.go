@@ -285,8 +285,8 @@ func TestFirstLoadFailure(t *testing.T) {
 	}
 }
 
-// A pub/sub invalidation drops the cache before TTL expiry. Needs the Redis
-// from compose (localhost:6380); skips when unreachable.
+// A pub/sub invalidation drops the cache before TTL expiry; skips when Redis
+// is unreachable.
 func TestWatchInvalidations(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

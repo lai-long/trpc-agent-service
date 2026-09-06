@@ -11,10 +11,10 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/testenv"
 )
 
-// TestPGStoreLoadAll exercises the real schema (deploy/db/init.sql): the test
-// inserts its own rows (unique per run) into tenant / agent_app /
-// channel_binding / storage_migration and finds them in the loaded snapshot.
-// Cleanup removes the rows again, so the shared database stays untouched.
+// TestPGStoreLoadAll exercises the real schema: the test inserts its own rows
+// (unique per run) into tenant / agent_app / channel_binding /
+// storage_migration and finds them in the loaded snapshot. Cleanup removes the
+// rows again, so the shared database stays untouched.
 func TestPGStoreLoadAll(t *testing.T) {
 	pool := testenv.PG(t)
 	ctx := context.Background()

@@ -235,12 +235,8 @@ func (r *Resolver) WatchInvalidations(ctx context.Context, rdb *redis.Client) {
 	}()
 }
 
-// stale reports whether the snapshot has to be reloaded. Callers must hold
-// r.mu. A failed reload postpones the next attempt until retryAt: the snapshot
-// is already past its TTL, so without that the very next request retries, and
-// every request after it — each one a four-table load serialized behind the
-// write lock, which is exactly the convoy you do not want during the outage
-// that made the reload fail.
+// stale reports whether the snapshot has to be reloaded. A failed reload
+// postpones the next attempt until retryAt. Callers must hold r.mu.
 func (r *Resolver) stale(now time.Time) bool {
 	if !r.loaded {
 		return true
@@ -317,12 +313,8 @@ func (r *Resolver) ActiveMigration(tenantID, resource string) *Migration {
 	return &cp
 }
 
-// BindingByID looks up one channel binding by its ID, for the callback
-// dispatcher at /callback/{channel}/{binding_id}: the path identifies the
-// binding row directly, and the adapter needs the row's credential references
-// to verify the callback. Status enforcement stays on the routing path
-// (EnqueueHandler.Resolve) which re-checks binding, tenant and app before a
-// message enters the pipeline.
+// BindingByID looks up one channel binding by its ID from the cached
+// snapshot.
 func (r *Resolver) BindingByID(ctx context.Context, id string) (ChannelBinding, error) {
 	if err := r.refresh(ctx); err != nil {
 		return ChannelBinding{}, err
