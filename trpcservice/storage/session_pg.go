@@ -25,11 +25,8 @@ import (
 //   - session_event is append-only; the UNIQUE (session_id, event_seq)
 //     constraint keeps events ordered and gapless, and violating it fails the
 //     whole append transaction so the journal and the state snapshot can never
-//     drift apart. Execution-layer idempotency for Stream redeliveries lives
-//     one level up, in the worker's done:{channel}:{msg_id} marker — a
-//     redelivered message re-runs the model and produces NEW framework event
-//     IDs, so the constraint alone could never catch it (see
-//     storage.ProcessedMarker).
+//     drift apart. Redeliveries are handled one level up, so this constraint
+//     only orders events within a single session.
 //   - session.state is a materialized snapshot for fast reads; the event
 //     stream is the source of truth a crashed session can be replayed from.
 //   - summary compresses old events: GetSession replays only the events
@@ -416,11 +413,10 @@ func (s *PGSessionService) AppendEvent(ctx context.Context, sess *session.Sessio
 			sessID).Scan(&seq); err != nil {
 			return fmt.Errorf("next event_seq: %w", err)
 		}
-		// No ON CONFLICT: a collision now means an invariant broke (a writer
-		// outside the session lock), and DO NOTHING used to drop the live event
-		// while the snapshot below still advanced, leaving the state ahead of
-		// the journal. Failing rolls both back, so they move together and the
-		// redelivery re-appends under a fresh seq.
+		// No ON CONFLICT: a collision means an invariant broke (a writer
+		// outside the session lock), so failing rolls the journal and the
+		// snapshot back together instead of leaving the state ahead of the
+		// journal.
 		if _, err := tx.Exec(ctx,
 			`INSERT INTO session_event (session_id, event_seq, event) VALUES ($1, $2, $3)`,
 			sessID, seq, eventJSON); err != nil {
@@ -670,10 +666,8 @@ func (s *PGSessionService) Close() error {
 //
 // The insert uses ON CONFLICT DO NOTHING with one bounded re-select instead
 // of a bare INSERT: two concurrent first messages of the same new session
-// (lock TTL expiry, two replicas) used to race past the SELECT and one of
-// them died on the unique constraint, aborting its whole event transaction.
-// With the conflict path, the loser re-locks the winner's row
-// and proceeds.
+// (lock TTL expiry, two replicas) can both miss the SELECT, and the conflict
+// path lets the loser re-lock the winner's row and proceed.
 func (s *PGSessionService) ensureSession(ctx context.Context, tx pgx.Tx, key session.Key, stateJSON []byte) (string, error) {
 	for attempt := 0; attempt < 3; attempt++ {
 		var sessID string

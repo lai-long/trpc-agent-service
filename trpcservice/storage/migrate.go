@@ -478,16 +478,8 @@ func (m *Migrator) fullJournalRedis(ctx context.Context, key session.Key) ([]eve
 // rather than sess.Events because the caller may have read them past
 // GetSession's summary/archive truncation.
 //
-// Positional upserts assumed the target's existing rows were the source's
-// prefix. Dual write breaks that assumption from the moment the migration row
-// is created: the fanout appends the live tail to a still-EMPTY target, so the
-// target's seqs 1..k hold the source's NEWEST k events. The positional ON
-// CONFLICT (session_id, event_seq) DO NOTHING then dropped the source's first
-// k events on the floor (their seqs were already taken), left the tail
-// duplicated at both ends of the journal, and still added up to the source's
-// row count — the count-based consistency check passed, the read switch
-// flipped, and the new backend served a scrambled journal with no error
-// anywhere.
+// Position cannot work: the fanout may append the live tail to an empty
+// target, so the target's seqs no longer form the source's prefix.
 //
 // The reconcile runs under the session row lock (the same FOR UPDATE
 // AppendEvent's ensureSession takes), so a dual-write append racing this copy
