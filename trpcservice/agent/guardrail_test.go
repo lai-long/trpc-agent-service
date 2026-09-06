@@ -444,10 +444,8 @@ func TestGuardedBudgetGate(t *testing.T) {
 	}
 }
 
-// Exactly one terminal audit per message: the allow audit used to run before
-// the output checks, so a denied reply left an allow row AND a deny row in
-// audit_log and the interception-rate accounting double-counted. The deny
-// case must carry exactly one sync deny row and no async allow row.
+// Exactly one terminal audit per message: a denied reply must carry exactly
+// one sync deny row and no async allow row.
 func TestGuardedOutputDenySingleAudit(t *testing.T) {
 	aud := &fakeAuditor{}
 	g := &Guarded{
@@ -595,8 +593,8 @@ func TestGuardedApprovalAnswerHitsOutputDenyWords(t *testing.T) {
 }
 
 // A user dropped from the tenant allowlist must not be able to confirm a
-// dangerous call that was intercepted while they were still on it: the answer
-// branch used to run ahead of the allowlist gate.
+// dangerous call intercepted while they were still on it: the answer runs
+// behind the allowlist gate.
 func TestGuardedAllowlistBlocksApprovalAnswer(t *testing.T) {
 	ap, rdb := approverForTest(t)
 	sessionKey := "test:approval:" + t.Name()

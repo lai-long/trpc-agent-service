@@ -254,11 +254,9 @@ func (g *Guarded) Process(ctx context.Context, msg channels.InboundMessage) (cha
 	if signaled {
 		return g.deliverSignal(ctx, span, msg, policy, sig, out), nil
 	}
-	// Terminal allow audit — deliberately last: it used to run before the
-	// output checks and the approval-signal handling, leaving one message
-	// with an allow row AND a deny/review row in audit_log, which corrupted
-	// the interception-rate accounting. Exactly one terminal audit per message,
-	// from here or from the branches above.
+	// Terminal allow audit — deliberately last: each message gets exactly one
+	// terminal audit, from here or from the branches above, so a denied reply
+	// is not double-counted as an allow.
 	span.SetAttributes(attribute.String("decision", "allow"))
 	g.asyncAudit(msg, out, started, nil)
 	return out, nil

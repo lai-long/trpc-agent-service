@@ -195,7 +195,7 @@ func TestSummarizeTruncatesOnRuneBoundaries(t *testing.T) {
 
 // truncate steps back off a partial rune instead of emitting half of one.
 func TestTruncateWalksBackOffAPartialRune(t *testing.T) {
-	const s = "abc汉def" // 汉 occupies bytes 3..5
+	const s = "abc汉def" // the multibyte rune occupies bytes 3..5
 	for _, tc := range []struct {
 		max  int
 		want string
@@ -203,9 +203,9 @@ func TestTruncateWalksBackOffAPartialRune(t *testing.T) {
 		{len(s), s},  // no truncation
 		{200, s},     // cap above the length
 		{6, "abc汉…"}, // cut on a rune boundary
-		{5, "abc…"},  // cut inside 汉: walks back
-		{4, "abc…"},  // cut inside 汉: walks back
-		{3, "abc…"},  // cut exactly before 汉
+		{5, "abc…"},  // cut inside the multibyte rune: walks back
+		{4, "abc…"},  // cut inside the multibyte rune: walks back
+		{3, "abc…"},  // cut exactly before the multibyte rune
 	} {
 		got := truncate(s, tc.max)
 		if got != tc.want {
