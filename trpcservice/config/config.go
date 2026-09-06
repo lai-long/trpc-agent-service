@@ -120,7 +120,11 @@ type Config struct {
 	// KMS bearer token is itself a secret, resolved from TRPC_KMS_TOKEN_REF
 	// through the file resolver. Every backend is wrapped in the short-TTL
 	// process cache (TRPC_SECRET_CACHE_TTL).
-	SecretResolverType string // TRPC_SECRET_RESOLVER
+	//
+	// KMSTokenRef's default names the file deploy/k8s mounts the
+	// trpc-kms-bootstrap Secret at, so a dropped env var still resolves instead
+// of sending the resolver hunting a path that exists nowhere in the cluster.
+SecretResolverType string // TRPC_SECRET_RESOLVER
 	KMSEndpoint        string // TRPC_KMS_ENDPOINT
 	KMSTokenRef        string // TRPC_KMS_TOKEN_REF
 	SecretCacheTTL     string // TRPC_SECRET_CACHE_TTL
@@ -226,7 +230,7 @@ func Load() Config {
 
 		SecretResolverType: getenv("TRPC_SECRET_RESOLVER", "file"),
 		KMSEndpoint:        getenv("TRPC_KMS_ENDPOINT", ""),
-		KMSTokenRef:        getenv("TRPC_KMS_TOKEN_REF", "kms-token"),
+		KMSTokenRef:        getenv("TRPC_KMS_TOKEN_REF", "kms-bootstrap-token"),
 		SecretCacheTTL:     getenv("TRPC_SECRET_CACHE_TTL", "1m"),
 
 		GatewayRateQPS:   getenv("TRPC_GATEWAY_RATE_QPS", "50"),
