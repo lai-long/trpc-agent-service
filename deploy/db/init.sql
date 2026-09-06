@@ -1,11 +1,17 @@
 -- Database initialization script for trpc-agent-service.
 --
--- Role boundary: this is a genesis script, executed once by the postgres
--- container on first startup of an empty data volume (the
--- /docker-entrypoint-initdb.d/ mechanism). All later schema changes go
--- through an incremental migration tool (golang-migrate / goose); this file
--- is the 000001 baseline and must only change incrementally, never
--- destructively.
+-- Role boundary: this is the GENESIS script — the 000001 baseline. It runs once
+-- against an empty database, from three places: the postgres container
+-- (/docker-entrypoint-initdb.d/), the k8s db-init Job, and CI.
+--
+-- It is frozen. Never edit the DDL below to change a schema that already
+-- exists in some environment — that silently forks fresh databases from live
+-- ones. Every change after this baseline is a numbered pair of files under
+-- deploy/db/migrations/, applied by deploy/db/migrate.sh (golang-migrate).
+--
+-- The last block in this file stamps schema_migrations at version 1 so
+-- `migrate up` resumes from 000002 instead of replaying the baseline.
+-- Conventions and recovery steps: deploy/db/migrations/README.md.
 
 -- pgvector: vector search for Knowledge.
 CREATE EXTENSION IF NOT EXISTS vector;
@@ -252,3 +258,24 @@ CREATE TABLE audit_log_archive (
     created_at        timestamptz  NOT NULL
 );
 CREATE INDEX idx_audit_archive_tenant_time ON audit_log_archive (tenant_id, created_at);
+
+-- ---------------------------------------------------------------------------
+-- Migration bookkeeping
+--
+-- The genesis script above IS version 1, so stamp it. Without this row a
+-- database created by compose, the db-init Job or CI looks un-migrated to
+-- `migrate up`, which then starts counting from 0 with no idea the baseline
+-- already ran.
+--
+-- Table shape is golang-migrate's postgres driver default: one row holding the
+-- current version, not one row per applied migration. The guarded insert keeps
+-- that invariant (and stays idempotent) rather than assuming an empty table.
+-- Do not rename the table or its columns.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    version bigint  NOT NULL PRIMARY KEY,
+    dirty   boolean NOT NULL
+);
+INSERT INTO schema_migrations (version, dirty)
+SELECT 1, false
+WHERE NOT EXISTS (SELECT 1 FROM schema_migrations);
