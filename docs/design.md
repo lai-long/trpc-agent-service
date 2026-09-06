@@ -835,13 +835,16 @@ Guardrail 命中需审批的工具调用时走带内确认，不引入带外审�
 
 入站自愈与语义边界：
 
-- 读循环内 `Handle` 返回 error（限流 / 背压 / Redis 抖动）时封顶退避重试（1s→…→30s）
-  直至成功；`ErrDuplicate` 视为成功。
+- 读循环内 `Handle` 返回 error（限流 / 背压 / Redis 抖动）时退避重试（1s 倍增、封顶 30s），
+  **最多 `inboundRetryMax` = 5 次**；`ErrDuplicate` 视为成功。设上限的理由：派发 worker 是串行的，
+  无界重试会让一条毒消息（确定性 handler 失败）或一次长基础设施故障**劫持该连接上所有后续消息**，
+  直到队列填满、心跳杀连接重连——而重连只会把同一帧再放一遍。超限后**大声丢弃**（记 error 日志、
+  带 bot/msgID/尝试次数），用户可重发、bot 保持存活、连接不会被重试循环本身拆掉。
 - `disconnected_event`（被新连接踢线）→ 关连接、5s 起退避重连；subscribe 应答 `errcode≠0`
   视为凭据错误，退避封顶 5min 防坏 secret 自旋；心跳 30s 带新 req_id，下个 tick 前未收到
   匹配应答即断开重连。
-- **语义边界声明**：WS 入站无平台重投，`Handle` 持续重试期间进程崩溃会丢该条消息——
-  一期接受（窗口小、量级低），二期方向为失败消息落独立 Redis list 重放。
+- **语义边界声明**：WS 入站无平台重投，两条丢失路径——① 5 次重试耗尽后主动丢弃（可观测、有日志）；
+  ② 重试期间进程崩溃。一期接受（窗口小、量级低），二期方向为失败消息落独立 Redis list 重放。
 - 媒体消息一期降级为占位文本（`[图片]（暂不支持媒体消息）`）；`enter_chat` /
   `template_card_event` 事件记日志跳过。
 
@@ -869,7 +872,7 @@ Admin 校验：`channel == "wecomws"` 的 binding 创建/更新时，`config` �
 | R1 | 踢线竞态：失锁瞬间新旧 leader 重连互斗 | Extend 确认易主即关 lost → cancel 全部连接；收到 disconnected_event 也断开；退避抖动收敛。网络分区下 Extend 持续失败的极小概率互斗表现为企微侧反复踢线，可接受并记录 |
 | R2 | `senders-ws` 无消费者积压 | 队列采集器覆盖该组，`stream_pending{group="senders-ws"}` 告警（5.2.4）；leader 竞选结果打显式日志 |
 | R3 | req_id 24h 窗口 vs 出站重试 | 重试路径最长 ~50min ≪ 24h；超窗即不可达，进死信 + 显式 error 日志，不引入 send_msg 回退 |
-| R4 | Handle 重试期间崩溃丢消息 | 见上文语义边界声明，一期接受 |
+| R4 | Handle 重试耗尽后丢弃、或重试期间崩溃丢消息 | 见上文语义边界声明；重试有上限（5 次）且丢弃记 error 日志，可观测可告警，一期接受 |
 | R5 | 30 条/分钟/会话限频 vs 租户级令牌桶 | 单连接串行 + 对话节奏难触顶；errcode≠0 → Send error → 留 PEL 重试；高频租户用 `rate_policy.send_qps` 收紧 |
 | R6 | 出站 attempts 计数器跨组共享（key 不含 group） | 主组对 wecomws 消息 Skip-ack（计数仅 +1），无实质影响；Skip 必须 ack 的不变量见决策 2 |
 | R7 | binding 删除/禁用后存量 PEL 消息循环重试 | 可重试至死信兜底（binding 可能恢复，区别于未知 channel 立即丢弃）；Manager 15s 对账停连，告警可见 |
@@ -1015,14 +1018,14 @@ updateApp / publish 事务内）与 Worker 装配时双重校验——会话原�
 | 8 | 密钥或敏感信息泄漏进日志/trace | 安全合规 | 触碰第 1 节审计合规红线 | 密钥只存引用（决策三）；日志脱敏中间件；OTel span 属性白名单制；上线前扫描日志样本 |
 | 9 | 租户误改 `storage_config` 导致读写路由到错误后端 | 运维 | 会话/记忆读不到，表现为数据丢失 | 变更走迁移流程（双写过渡、按租户灰度），禁止直接改配置生切；变更操作记审计 |
 | 10 | wecomws 每 bot 仅允许一条连接，多副本重连互斗或 leader 失联 | 技术（并发/可用性） | 企微侧反复踢线，或 WS 通道在 leader 切换窗口内停摆 | `lock:leader:wecomws` 全局单持有者 + 失锁即关连接 + 退避重竞选；`senders-ws` 积压告警（5.3.4 R1/R2） |
-| 11 | WS 入站无平台重推 | 技术（可靠性） | `Handle` 持续失败期间进程崩溃丢消息 | 读循环内封顶退避重试；一期接受极小窗口并在 5.3.4 声明语义边界，二期落 Redis list 重放（5.3.4 R4） |
+| 11 | WS 入站无平台重推 | 技术（可靠性） | `Handle` 重试 5 次耗尽后主动丢弃该条消息，或重试期间进程崩溃 | 退避重试设上限（`inboundRetryMax`=5）并在超限时记 error 日志（bot/msgID/尝试次数），丢弃可观测可告警；设上限是因为派发 worker 串行，无界重试会让一条毒消息劫持该连接上全部后续消息；一期接受并在 5.3.4 声明语义边界，二期落 Redis list 重放（5.3.4 R4） |
 | 12 | wecomws 出站回复依赖 `req_id` 时效与分条部分失败 | 技术（外部依赖） | 超窗或中间段失败导致回复缺失/残缺 | 重试路径 ≪24h、超窗死信告警；分段失败报 partial delivery 并留 PEL（5.3.4 R3、决策 5） |
 
 回滚方案：
 
 - 应用配置回滚：旧版本重新置 `published` + pub/sub 广播失效，秒级生效（见 5.2.3）。
 - 平台版本回滚：Gateway/Worker 无状态，K8s 滚动回退上一镜像；在途消息由 Stream pending 机制交接，不丢。
-- 数据层回滚：schema 变更只做增量（加列、加表、加索引），不做破坏性变更；必须改列时先加新列双写、迁移后删旧列。
+- 数据层回滚：schema 变更只做增量（加列、加表、加索引），不做破坏性变更；必须改列时先加新列双写、迁移后删旧列。`deploy/db/init.sql` 是冻结的 000001 基线并把 `schema_migrations` 标到版本 1，之后的变更以编号迁移落在 `deploy/db/migrations/`，由 `deploy/db/migrate.sh`（golang-migrate）应用、CI 同步执行——因为只做增量，回滚镜像不需要回滚 schema。
 
 ### 8.1 已知限制与质量门禁
 
@@ -1044,5 +1047,6 @@ updateApp / publish 事务内）与 Worker 装配时双重校验——会话原�
    仍依赖单副本 admin 角色的部署约定。
 
 质量门禁：CI（`.github/workflows/test.yml`）以 pgvector PG + Redis + MinIO 真实服务跑
-全量测试，**skip>0 即失败**（集成测试经 `TRPC_TEST_*` 环境变量门控），覆盖率基线 40%
-（实测 62.1%），覆盖率只升不降。
+全量测试，**skip>0 即失败**（集成测试经 `TRPC_TEST_*` 环境变量门控），覆盖率基线 85%
+（实测 87.5%），覆盖率只升不降。基线口径以 CI 为准：本地不带依赖服务跑会因集成测试
+跳过而只报约 55%，那不是有效测量。
