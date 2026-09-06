@@ -36,8 +36,8 @@ func init() {
 	}
 }
 
-// StreamStats is the read side of a stream queue the collector needs
-// (*storage.Stream satisfies it).
+// StreamStats is the read side of a stream queue the collector needs: stream
+// length and pending-entry queries.
 type StreamStats interface {
 	Len(ctx context.Context, stream string) (int64, error)
 	Pending(ctx context.Context, stream, group string) (count int64, oldestIdle time.Duration, err error)

@@ -1,5 +1,4 @@
-// Tracing init and traceparent propagation helpers (package doc lives in
-// metrics.go).
+// Tracing init and traceparent propagation helpers.
 package metrics
 
 import (
