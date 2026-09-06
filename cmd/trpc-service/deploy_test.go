@@ -4,6 +4,8 @@ import (
 	"os"
 	"strings"
 	"testing"
+
+	"github.com/liuzengh/trpc-agent-service/trpcservice/config"
 )
 
 // TestK8sManifestsProvideKMSToken pins the contract between deploy/k8s and
@@ -13,8 +15,15 @@ import (
 // the dir and the token ref, and every role Deployment mounts a Secret volume
 // at the dir carrying the ref's file. Nothing in the toolchain checks YAML
 // against Go: without this test the manifests can declare kms and starve every
-// pod of its token while every build stays green, which is three CrashLooping
-// Deployments on release day (the exact gap this test was added to close).
+// pod of its token while every build stays green.
+//
+// The third leg is the in-code fallback: what Load() resolves to when the
+// ConfigMap entry is absent. A default disagreeing with the deployed file name
+// turns one dropped env var into a resolver hunting a file nobody ever mounted
+// — a CrashLoop whose error names a path that exists nowhere in the cluster.
+// This asserts the value Load() actually produces rather than a shared
+// constant, because re-inlining a stale literal in Load() is exactly the drift
+// being guarded against and a constant comparison would sail through it.
 func TestK8sManifestsProvideKMSToken(t *testing.T) {
 	cfg := readManifest(t, "../../deploy/k8s/config.yaml")
 	if !strings.Contains(cfg, `TRPC_SECRET_RESOLVER: "kms"`) {
@@ -22,6 +31,11 @@ func TestK8sManifestsProvideKMSToken(t *testing.T) {
 	}
 	dir := manifestEnv(t, cfg, "TRPC_SECRETS_DIR")
 	ref := manifestEnv(t, cfg, "TRPC_KMS_TOKEN_REF")
+
+	t.Setenv("TRPC_KMS_TOKEN_REF", "") // getenv treats empty as unset
+	if got := config.Load().KMSTokenRef; got != ref {
+		t.Errorf("config.yaml sets TRPC_KMS_TOKEN_REF=%q but config.Load() falls back to %q: the code default and the manifests disagree, so losing the env var silently points the resolver at a file that is never mounted", ref, got)
+	}
 
 	for _, role := range []string{"gateway", "worker", "admin"} {
 		manifest := readManifest(t, "../../deploy/k8s/"+role+".yaml")
@@ -32,6 +46,60 @@ func TestK8sManifestsProvideKMSToken(t *testing.T) {
 			t.Errorf("%s.yaml: no Secret item files %q into TRPC_SECRETS_DIR — the resolver reads the token by that name", role, ref)
 		}
 	}
+}
+
+// TestK8sIngressIsTheOnlyPublicEntry pins the external topology: the gateway
+// Service stays cluster-internal and ingress.yaml is what the IM platforms
+// actually reach. Both halves matter. A Service that omits `type:` is ClusterIP
+// by default, so gateway.yaml must declare ClusterIP explicitly; an Ingress
+// whose backend name or port drifts from that
+// Service fails the same way, from the other direction.
+//
+// It also pins what must NOT be exposed. The mock channel's callback is an
+// unauthenticated message injector, so a public path for it would hand out a
+// way to forge inbound messages for any binding.
+func TestK8sIngressIsTheOnlyPublicEntry(t *testing.T) {
+	gw := stripComments(readManifest(t, "../../deploy/k8s/gateway.yaml"))
+	ing := stripComments(readManifest(t, "../../deploy/k8s/ingress.yaml"))
+
+	if !strings.Contains(gw, "type: ClusterIP") {
+		t.Errorf("gateway.yaml: the gateway Service must declare `type: ClusterIP` so ingress.yaml stays the single public entry; a cluster with no ingress controller needs LoadBalancer plus TLS annotations and a deliberate deletion of ingress.yaml and this test")
+	}
+	if !strings.Contains(gw, "- {port: 80, targetPort: http}") {
+		t.Errorf("gateway.yaml: expected the Service to publish port 80 -> http, which is what ingress.yaml routes to by number")
+	}
+
+	// channel_binding.webhook_path is auto-filled with
+	// /callback/{channel}/{binding_id}, so this is the route that has to be
+	// reachable from the internet for tenant callbacks to land at all.
+	if !strings.Contains(ing, "path: /callback") {
+		t.Errorf("ingress.yaml: no `/callback` path — web.BindingDispatcher's multi-tenant route is unreachable and every IM webhook 404s")
+	}
+	if !strings.Contains(ing, "name: trpc-gateway") {
+		t.Errorf("ingress.yaml: backend does not point at the trpc-gateway Service")
+	}
+	if !strings.Contains(ing, "port: {number: 80}") {
+		t.Errorf("ingress.yaml: backend port is not the Service's port 80")
+	}
+	if !strings.Contains(ing, "secretName:") {
+		t.Errorf("ingress.yaml: no TLS block — the IM platforms only webhook to HTTPS served with a trusted certificate")
+	}
+	if strings.Contains(ing, "/mock/callback") {
+		t.Errorf("ingress.yaml must not expose /mock/callback: the mock channel is an unauthenticated message injector (off unless TRPC_MOCK_CHANNEL=true), and a public path for it lets anyone forge inbound messages for any binding")
+	}
+}
+
+// stripComments drops whole-line YAML comments, so a check for whether a path
+// is exposed cannot be satisfied by a comment explaining that it is not.
+func stripComments(manifest string) string {
+	var keep []string
+	for _, line := range strings.Split(manifest, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "#") {
+			continue
+		}
+		keep = append(keep, line)
+	}
+	return strings.Join(keep, "\n")
 }
 
 // readManifest reads one repo manifest; a missing file is a broken checkout,

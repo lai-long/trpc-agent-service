@@ -81,12 +81,7 @@ func main() {
 // serve runs one deployment role: "all" packs everything into
 // one process (local/demo); "gateway" serves IM callbacks and outbound
 // delivery; "worker" consumes the inbound stream and runs agents; "admin"
-// serves the Admin API and housekeeping (archival). Roles share the Redis
-// Streams and PG/Redis state, so any mix of replicas forms one platform.
-//
-// Chain (sync ack + async consume):
-//
-//	IM callback → EnqueueHandler → stream:inbound → Worker(Runner) → stream:outbound → Sender → channel.Send
+// serves the Admin API and housekeeping (archival).
 func serve(role string) error {
 	cfg := config.Load()
 	plog.Init(cfg.LogLevel, cfg.LogFormat != "json")
@@ -113,9 +108,8 @@ func serve(role string) error {
 		return err
 	}
 
-	// Tracing goes up before anything that emits spans. Endpoint comes from
-	// OTEL_EXPORTER_OTLP_ENDPOINT; the platform adds spans around the callback,
-	// the Stream hop and the send, on top of the framework's own spans.
+	// Tracing goes up before anything that emits spans; the endpoint comes
+	// from OTEL_EXPORTER_OTLP_ENDPOINT.
 	shutdownTrace, err := metrics.InitTracing(ctx)
 	if err != nil {
 		return err
@@ -124,8 +118,8 @@ func serve(role string) error {
 		_ = shutdownTrace()
 	}()
 
-	// Infra connections are created here at the entry point, then injected;
-	// business packages never dial by themselves.
+	// Infra connections are created here and injected into the role's
+	// components.
 	rdb, err := storage.NewRedis(ctx, cfg.RedisAddr)
 	if err != nil {
 		return err
