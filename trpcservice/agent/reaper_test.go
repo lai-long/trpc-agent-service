@@ -95,9 +95,7 @@ func TestWorkerDeadLettersPoisonMessage(t *testing.T) {
 	defer cancel()
 
 	// No defer Close here: testenv.Redis registers the close as a cleanup, so it
-	// runs after the Del cleanups below. Closing early made every cleanup a
-	// no-op on a dead client, and the fixed stream name then accumulated pending
-	// entries across runs — a later run could pass on an earlier run's leftovers.
+	// runs after the Del cleanups below.
 	rdb := testenv.Redis(t)
 	stream := storage.NewStream(rdb)
 	uid := fmt.Sprintf("%d", time.Now().UnixNano())

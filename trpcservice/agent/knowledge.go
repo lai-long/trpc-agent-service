@@ -21,7 +21,7 @@ import (
 // so knowledge stays tenant-isolated inside the shared table.
 //
 // The store is returned alongside the knowledge base so the caller can run
-// RekeyLegacyDocuments over it once (see buildKnowledge).
+// RekeyLegacyDocuments over it once.
 func NewKnowledgeBase(pgDSN, table string, dim int, emb embedder.Embedder) (*knowledge.BuiltinKnowledge, *pgvector.VectorStore, error) {
 	vs, err := pgvector.New(
 		pgvector.WithPGVectorClientDSN(pgDSN),
@@ -90,8 +90,7 @@ func (s *DocSource) ReadDocuments(context.Context) ([]*document.Document, error)
 // ScopedDocID is the document ID scheme: a length-prefixed fnv64a over the
 // owning tenant, app, document name and content. A length prefix keeps the
 // boundaries unambiguous: without it ("t1","a1x") and ("t1a","1x") would hash
-// alike. Extraction exists because RekeyLegacyDocuments must recompute a
-// stored row's ID from exactly the parts ReadDocuments hashed it from.
+// alike.
 func ScopedDocID(tenantID, appID, docName, content string) string {
 	h := fnv.New64a()
 	for _, part := range []string{tenantID, appID, docName, content} {
@@ -103,19 +102,16 @@ func ScopedDocID(tenantID, appID, docName, content string) string {
 }
 
 // RekeyLegacyDocuments walks the whole knowledge table once and re-keys every
-// document whose ID is not the scoped ID of its own tenant/app/name/content —
-// the rows written before the ID scheme gained its tenant scope, when the ID
-// was fnv64a of name+content alone. Those rows are stranded: re-ingesting the
-// same document now hashes to the scoped ID and inserts a SECOND row, so one
-// tenant retrieves the same document twice, and with no delete endpoint the
-// legacy row cannot be removed any other way.
+// document whose ID is not the scoped ID of its own tenant/app/name/content.
+// Such a row cannot be reached by re-ingest, which hashes to the scoped ID
+// and inserts a second row, and with no delete endpoint it could never be
+// removed.
 //
 // The re-key carries the stored embedding verbatim (Get returns it, Add writes
-// it back — no embedder call), the metadata, and the old scheme's semantics:
-// content changes always created new rows, so a legacy row keeps its own
-// identity even when a scoped twin already exists — the Add upserts the same
-// bytes over the twin and the legacy row is dropped, leaving exactly one row.
-// Two replicas running the pass concurrently converge: Add is an upsert and
+// it back — no embedder call) and the metadata. An unscoped row keeps its own
+// identity even when a scoped twin exists: Add upserts the same bytes over
+// the twin and the unscoped row is dropped, leaving exactly one row. Two
+// replicas running the pass concurrently converge: Add is an upsert and
 // Delete of an already-re-keyed row is a no-op.
 func RekeyLegacyDocuments(ctx context.Context, vs vectorstore.VectorStore) (int, error) {
 	meta, err := vs.GetMetadata(ctx)

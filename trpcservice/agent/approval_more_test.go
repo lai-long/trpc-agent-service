@@ -12,8 +12,6 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/testenv"
 )
 
-// Degraded-mode and error paths of the approval chain.
-
 // A nil rdb disables the approval store: dangerous calls are blocked outright
 // instead of being pended for a confirmation that could never be stored.
 func TestBeforeToolBlocksWhenStoreUnavailable(t *testing.T) {

@@ -66,18 +66,6 @@ type BudgetGate interface {
 //	recall → tenant policy → allowlist → approval answer → input denylist
 //	→ budget gate → inner processor → budget accounting → output checks
 //	(redact/denylist) → approval confirmation composition
-//
-// The allowlist precedes the approval answer so that a user dropped from it
-// cannot confirm a dangerous call intercepted while they were still allowed,
-// and every reply the guardrail emits passes the output checks — the model's,
-// the approval answer's and the interception notice alike, because the latter
-// two embed raw tool arguments and results no model-side filter ever saw.
-//
-// The guardrail owns message-level auditing: routine messages get an async
-// allow event, guardrail decisions (deny / review / review_timeout /
-// dangerous-tool execution) are written synchronously — the compliance red
-// line is that critical decisions are never lost. Exactly one terminal audit
-// row is written per message.
 type Guarded struct {
 	Inner    Processor
 	Approver *Approver   // nil disables tool-approval handling

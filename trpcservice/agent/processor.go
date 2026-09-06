@@ -48,8 +48,7 @@ type RunnerProcessor struct {
 }
 
 // RunnerConfig is the minimal parameter set for assembling a Runner.
-// APIKey must be resolved via a SecretResolver before being passed in; this
-// package never touches refs or files.
+// APIKey must be resolved via a SecretResolver before being passed in.
 type RunnerConfig struct {
 	AppName        string // Runner app name, the first segment of the framework session.Key
 	BaseURL        string // OpenAI-compatible endpoint
@@ -191,11 +190,8 @@ func (p *RunnerProcessor) Process(ctx context.Context, msg channels.InboundMessa
 			return out, infra.Err
 		}
 		if ctx.Err() != nil {
-			// Shutdown/drain cancellation is infrastructure, not a model
-			// failure: returning it raw keeps it off the ModelError path, so
-			// the guardrail does not degrade into a busy reply and the
-			// worker does not Ack — the redelivery that a surviving replica
-			// takes over still owns this message.
+			// Cancellation is infrastructure, not a model failure: return
+			// it raw so the message stays pending for redelivery.
 			return out, ctx.Err()
 		}
 	}

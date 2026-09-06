@@ -342,11 +342,9 @@ func (a *Assembler) assemble(ctx context.Context, app tenant.AgentApp, t tenant.
 		return nil, err
 	}
 	spec := mergeModel(a.cfg.Defaults, parseModelSpec(t.ModelConfig), ac.Model)
-	// Defense in depth: the Admin API gates every config write,
-	// but rows reach the store by other roads too (direct SQL, versions
-	// published before the gate existed). The platform default endpoint is
-	// the operator's own choice and skips the check; anything a tenant or
-	// app config overrode must pass.
+	// Defense in depth: rows reach the store by other roads than the Admin
+	// API too (direct SQL), so the allowlist is re-checked here. The platform
+	// default endpoint skips the check; any tenant or app override must pass.
 	if spec.BaseURL != a.cfg.Defaults.BaseURL {
 		if err := ValidateModelSpec(spec, a.cfg.ModelHosts); err != nil {
 			return nil, fmt.Errorf("app %s model endpoint rejected: %w", app.ID, err)

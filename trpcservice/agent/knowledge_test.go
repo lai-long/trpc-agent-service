@@ -156,8 +156,7 @@ func TestKnowledgeBaseRejectsBadDSN(t *testing.T) {
 	}
 }
 
-// legacyDocID is the pre-scoping scheme: fnv64a of name+content alone. Rows
-// written before 449994c carry this ID.
+// legacyDocID is the unscoped scheme: fnv64a of name+content alone.
 func legacyDocID(name, content string) string {
 	h := fnv.New64a()
 	_, _ = h.Write([]byte(name))
@@ -174,13 +173,12 @@ func vectorAt(dim, slot int, val float64) []float64 {
 	return v
 }
 
-// Documents written under the pre-scoping ID scheme are stranded: a re-ingest
-// hashes to the scoped ID and inserts a second row (one tenant, the same
-// document, duplicate retrieval), and with no delete endpoint the legacy row
-// cannot be removed any other way. RekeyLegacyDocuments must move every
-// legacy row to its scoped ID — embedding carried verbatim, no embedder
-// involved — and collapse the re-ingested duplicate back to one row, after
-// which re-ingesting is an upsert again.
+// A document keyed by the unscoped ID cannot be removed any other way (there
+// is no delete endpoint) and is duplicated by a re-ingest, which hashes to the
+// scoped ID and inserts a second row. RekeyLegacyDocuments must move every
+// unscoped row to its scoped ID — embedding carried verbatim, no embedder
+// involved — and collapse the duplicate back to one row, after which
+// re-ingesting is an upsert again.
 func TestRekeyLegacyDocuments(t *testing.T) {
 	ctx := context.Background()
 	pool := testenv.PG(t)
@@ -203,9 +201,9 @@ func TestRekeyLegacyDocuments(t *testing.T) {
 
 	md := map[string]any{agent.MetadataTenantID: "t-rekey", agent.MetadataAppID: "a-rekey"}
 
-	// stranded: ingested before the scheme change, never re-ingested. Its
-	// embedding (slot 3) differs from anything the fake embedder would make,
-	// so the re-key carrying it verbatim is observable.
+	// An unscoped-ID row with no scoped twin. Its embedding (slot 3) differs
+	// from anything the fake embedder would make, so the re-key carrying it
+	// verbatim is observable.
 	stranded := &agent.DocSource{DocName: "配送范围", Content: "仅限同城配送", Metadata: md}
 	strandedID := legacyDocID(stranded.DocName, stranded.Content)
 	if err := vs.Add(ctx, &document.Document{
@@ -214,8 +212,8 @@ func TestRekeyLegacyDocuments(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// duplicated: the legacy row plus a post-change re-ingest of the same
-	// document — the two rows one tenant now retrieves twice.
+	// duplicated: an unscoped-ID row plus its scoped twin — the same document
+	// one tenant retrieves twice.
 	duplicated := &agent.DocSource{DocName: "发票说明", Content: "支持电子发票", Metadata: md}
 	dupID := legacyDocID(duplicated.DocName, duplicated.Content)
 	if err := vs.Add(ctx, &document.Document{

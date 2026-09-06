@@ -13,8 +13,7 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/testenv"
 )
 
-// errAuditor fails every synchronous write, and errBudget fails the budget
-// check, to exercise the guardrail's failure handling.
+// errAuditor fails every synchronous write.
 type errAuditor struct {
 	fakeAuditor
 	syncErr error

@@ -1,7 +1,3 @@
-// Package agent owns agent definitions and Runner assembly.
-//
-// The Worker consumes stream:inbound, processes each message through a
-// Processor, and produces replies to stream:outbound.
 package agent
 
 import (
@@ -378,9 +374,9 @@ func (w *Worker) reap(ctx context.Context) {
 		return
 	}
 	for _, m := range msgs {
-		// Read-only: the counter tracks genuine processing failures (recorded by
-		// handle), not takeovers. Counting takeovers dead-lettered messages that
-		// were merely waiting on a busy session or a Redis hiccup.
+		// Read-only: the counter tracks genuine processing failures (recorded
+		// by handle), not takeovers — a message waiting on a busy session or
+		// a Redis hiccup must not count toward the dead-letter bound.
 		attempts, err := w.Stream.Attempts(ctx, w.inStream(), "workers", m.ID)
 		if err != nil {
 			plog.Warnf("worker %s count attempts %s: %v", w.Name, m.ID, err)
@@ -426,9 +422,8 @@ func (w *Worker) acquireSession(ctx context.Context, m storage.Message, appID, s
 		}
 		if time.Now().After(deadline) {
 			// Leave the entry pending for the reaper instead of re-queueing a
-			// copy: the copy rode a new stream ID whose attempts counter
-			// started at zero, so a wedged session could re-queue forever
-			// and the maxAttempts dead-letter never fired.
+			// copy: a copy would carry a fresh attempts counter and could
+			// re-queue forever without ever reaching the dead-letter bound.
 			plog.Infof("worker %s leaves %s pending: session %s is busy, reaper takes over",
 				w.Name, m.ID, sessionKey)
 			return "", nil, false

@@ -33,12 +33,9 @@ const approvalKeyGrace = 5 * time.Minute
 const approvalToolTimeout = time.Minute
 
 // PendingApproval is a dangerous tool call waiting for in-band user
-// confirmation. It is stored in Redis (key approval:{app_id}:{session_key})
-// rather than in framework session.state: same node-shared durability, but
-// with a native TTL and readable without loading the whole session. The app
-// dimension matches the session identity (app_id, session_key): two tenants'
-// users carrying the same channel:user session key must never see — let alone
-// confirm — each other's pending dangerous calls.
+// confirmation, stored in Redis under approval:{app_id}:{session_key}. The
+// app dimension matches the session identity so two tenants' users sharing a
+// channel:user session key never see each other's pending calls.
 type PendingApproval struct {
 	CallID    string          `json:"call_id"`
 	ToolName  string          `json:"tool_name"`
