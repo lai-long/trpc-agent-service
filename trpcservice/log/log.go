@@ -101,9 +101,8 @@ func With(fields ...zap.Field) *zap.Logger {
 	return zap.L().With(fields...)
 }
 
-// The package-level functions mirror the sugar-style signatures of
-// trpc-agent-go's log.Logger, so framework logs can be routed into the same
-// redacting Core. Both paths go through redaction.
+// The package-level functions route through the same redacting Core as
+// zap.L(), so framework logs share the redaction path.
 
 // Debug logs at DebugLevel.
 func Debug(args ...any) { sugar.Debug(args...) }

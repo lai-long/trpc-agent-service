@@ -94,7 +94,8 @@ func TestSetLevelAtRuntime(t *testing.T) {
 	}
 }
 
-// The package-level functions' caller must point here, not inside log.go.
+// The package-level functions' caller must point at the call site, not inside
+// the log package.
 func TestPackageFuncsCallerSkip(t *testing.T) {
 	core, logs := observer.New(zapcore.DebugLevel)
 	sugar = zap.New(redactCore{core}, zap.AddCaller(), zap.AddCallerSkip(1)).Sugar()
