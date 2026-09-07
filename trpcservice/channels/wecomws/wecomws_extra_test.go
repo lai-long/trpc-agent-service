@@ -616,7 +616,7 @@ func TestStandardCaseTransportRewritesHandshakeHeaders(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	raw := make(chan string, 1)
 	go func() {
@@ -624,7 +624,7 @@ func TestStandardCaseTransportRewritesHandshakeHeaders(t *testing.T) {
 		if err != nil {
 			return
 		}
-		defer c.Close()
+		defer func() { _ = c.Close() }()
 		_ = c.SetDeadline(time.Now().Add(5 * time.Second))
 		b := make([]byte, 4096)
 		n, _ := c.Read(b)
@@ -649,7 +649,7 @@ func TestStandardCaseTransportRewritesHandshakeHeaders(t *testing.T) {
 	if err != nil {
 		t.Fatalf("round trip: %v", err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	got := <-raw
 	for _, want := range []string{"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==", "Sec-WebSocket-Version: 13"} {
