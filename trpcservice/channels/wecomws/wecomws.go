@@ -190,13 +190,16 @@ func (c *Channel) Send(ctx context.Context, msg channels.OutboundMessage) error 
 		return errors.New("wecomws: missing reply token (req_id)")
 	}
 	epoch, reqID := parseReplyToken(msg.ReplyToken)
-	msgType := "text"
-	if msg.TextType == channels.TextTypeMarkdown {
-		msgType = channels.TextTypeMarkdown
+	// One reply is one stream: segments share the id, the last one finishes
+	// it. TextType is irrelevant here — the stream content carries markdown
+	// as-is (channels without markdown support downgrade elsewhere).
+	streamID, err := newStreamID()
+	if err != nil {
+		return err
 	}
 	segments := channels.SplitText(msg.Text, c.segment)
 	for i, seg := range segments {
-		frame, err := respondFrame(reqID, msgType, seg)
+		frame, err := respondFrame(reqID, streamID, seg, i == len(segments)-1)
 		if err != nil {
 			return err
 		}

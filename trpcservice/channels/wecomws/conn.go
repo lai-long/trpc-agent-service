@@ -267,7 +267,7 @@ func (c *botConn) heartbeat(ctx context.Context, ws *websocket.Conn, kill func()
 			_ = ws.CloseNow()
 			return
 		}
-		reqID, err := newReqID()
+		reqID, err := heartbeatReqID()
 		if err == nil {
 			var data []byte
 			data, err = json.Marshal(pingFrame(reqID))
@@ -311,9 +311,9 @@ func (c *botConn) readLoop(ctx context.Context, ws *websocket.Conn, frames chan<
 		}
 		switch env.Cmd {
 		case "":
-			// An ack to one of our own requests (see readEnvelope):
-			// correlated by req_id at the sender, nothing to dispatch.
-		case cmdPong:
+			// An ack to one of our own requests: the heartbeat ack clears the
+			// outstanding ping (its req_id echoes ours), anything else has
+			// nothing to dispatch.
 			c.mu.Lock()
 			if env.Headers.ReqID != "" && env.Headers.ReqID == c.pingOut {
 				c.pingOut = ""

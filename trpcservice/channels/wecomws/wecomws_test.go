@@ -12,30 +12,26 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
 )
 
-// respondContent extracts the content of a recorded aibot_respond_msg frame.
-func respondContent(t *testing.T, env envelope) (msgType, content string) {
+// respondStream extracts the stream body of a recorded aibot_respond_msg
+// frame.
+func respondStream(t *testing.T, env envelope) (streamID, content string, finish bool) {
 	t.Helper()
 	var body struct {
 		MsgType string `json:"msgtype"`
-		Text    struct {
+		Stream  struct {
+			ID      string `json:"id"`
 			Content string `json:"content"`
-		} `json:"text"`
-		Markdown struct {
-			Content string `json:"content"`
-		} `json:"markdown"`
+			Finish  bool   `json:"finish"`
+		} `json:"stream"`
 	}
 	if err := json.Unmarshal(env.Body, &body); err != nil {
 		t.Fatalf("respond body: %v (%s)", err, env.Body)
 	}
-	switch body.MsgType {
-	case "text":
-		return body.MsgType, body.Text.Content
-	case "markdown":
-		return body.MsgType, body.Markdown.Content
-	default:
-		t.Fatalf("unexpected msgtype %q in %s", body.MsgType, env.Body)
-		return "", ""
+	if body.MsgType != "stream" {
+		t.Fatalf("the platform rejects every respond msgtype except stream (errcode 40008), got %q in %s",
+			body.MsgType, env.Body)
 	}
+	return body.Stream.ID, body.Stream.Content, body.Stream.Finish
 }
 
 func startSubscribed(t *testing.T) (*fakePlatform, *fakeConn, *Channel) {
@@ -47,8 +43,9 @@ func startSubscribed(t *testing.T) (*fakePlatform, *fakeConn, *Channel) {
 	return f, conn, ch
 }
 
-// TestSendRespondPassthrough: the reply rides aibot_respond_msg frames that
-// echo the callback's req_id verbatim, with text and markdown body shapes.
+// TestSendRespondPassthrough: the reply rides aibot_respond_msg stream
+// frames that echo the callback's req_id verbatim; markdown rides the stream
+// content as-is.
 func TestSendRespondPassthrough(t *testing.T) {
 	_, conn, ch := startSubscribed(t)
 	ctx := context.Background()
@@ -64,8 +61,8 @@ func TestSendRespondPassthrough(t *testing.T) {
 	if resp.Cmd != cmdRespond || resp.Headers.ReqID != "req-42" {
 		t.Fatalf("reply must echo the callback req_id verbatim: %+v", resp)
 	}
-	if msgType, content := respondContent(t, resp); msgType != "text" || content != "你好" {
-		t.Fatalf("text reply shape: msgtype=%q content=%q", msgType, content)
+	if _, content, finish := respondStream(t, resp); content != "你好" || !finish {
+		t.Fatalf("single-segment reply must be finished content=%q finish=%v", content, finish)
 	}
 
 	if err := ch.Send(ctx, channels.OutboundMessage{
@@ -76,8 +73,8 @@ func TestSendRespondPassthrough(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitFor(t, func() bool { return len(conn.respondFrames()) == 2 })
-	if msgType, content := respondContent(t, conn.respondFrames()[1]); msgType != "markdown" || content != "**bold**" {
-		t.Fatalf("markdown reply shape: msgtype=%q content=%q", msgType, content)
+	if _, content, _ := respondStream(t, conn.respondFrames()[1]); content != "**bold**" {
+		t.Fatalf("markdown must ride the stream content verbatim, got %q", content)
 	}
 }
 
@@ -100,11 +97,13 @@ func TestSendSplit(t *testing.T) {
 
 	frames := conn.respondFrames()
 	var joined strings.Builder
+	streamIDs := map[string]int{}
 	for i, resp := range frames {
 		if resp.Headers.ReqID != "req-split" {
 			t.Fatalf("segment %d must echo the callback req_id, got %q", i, resp.Headers.ReqID)
 		}
-		_, content := respondContent(t, resp)
+		id, content, finish := respondStream(t, resp)
+		streamIDs[id]++
 		if len(content) > 32 {
 			t.Fatalf("segment %d exceeds the cap: %d bytes", i, len(content))
 		}
@@ -114,7 +113,13 @@ func TestSendSplit(t *testing.T) {
 		if content != want[i] {
 			t.Fatalf("segment %d = %q, want %q", i, content, want[i])
 		}
+		if wantFinish := i == len(frames)-1; finish != wantFinish {
+			t.Fatalf("segment %d finish=%v, want %v", i, finish, wantFinish)
+		}
 		joined.WriteString(content)
+	}
+	if len(streamIDs) != 1 {
+		t.Fatalf("segments of one reply must share one stream id, got %v", streamIDs)
 	}
 	if joined.String() != text {
 		t.Fatal("segments must reassemble the original reply")

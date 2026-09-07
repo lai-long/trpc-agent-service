@@ -8,13 +8,13 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // WeCom aibot WebSocket protocol commands.
 const (
 	cmdSubscribe     = "aibot_subscribe"      // client → platform credential handshake
 	cmdPing          = "ping"                 // client → platform heartbeat
-	cmdPong          = "pong"                 // platform → client heartbeat answer (echoes req_id)
 	cmdRespond       = "aibot_respond_msg"    // client → platform reply; headers.req_id must be the callback's req_id verbatim
 	cmdMsgCallback   = "aibot_msg_callback"   // platform → client message callback
 	cmdEventCallback = "aibot_event_callback" // platform → client event callback
@@ -78,10 +78,19 @@ func pingFrame(reqID string) envelope {
 // the headers verbatim — the platform correlates a reply to its question by
 // it and rejects (or drops) mismatches. msgType doubles as the content key
 // ("markdown": {...} / "text": {...}).
-func respondFrame(reqID, msgType, content string) (envelope, error) {
+// respondFrame builds one aibot_respond_msg frame. The platform rejects a
+// plain "text" respond with errcode 40008 ("invalid message type") — the only
+// text-shaped reply it accepts is a stream segment, so every reply rides
+// msgtype "stream". Segments of one reply share streamID; only the last sets
+// finish, which is what makes the platform render the message as complete.
+func respondFrame(reqID, streamID, content string, finish bool) (envelope, error) {
 	body, err := json.Marshal(map[string]any{
-		"msgtype": msgType,
-		msgType:   map[string]string{"content": content},
+		"msgtype": "stream",
+		"stream": map[string]any{
+			"id":      streamID,
+			"finish":  finish,
+			"content": content,
+		},
 	})
 	if err != nil {
 		return envelope{}, err
@@ -149,6 +158,29 @@ func newReqID() (string, error) {
 		return "", fmt.Errorf("new req_id: %w", err)
 	}
 	return hex.EncodeToString(b[:]), nil
+}
+
+// heartbeatReqID spells the heartbeat's req_id the way the platform expects,
+// {cmd}_{unixmilli}_{random} with the cmd prefix: a heartbeat whose req_id
+// does not start with "ping" is never answered at all — not even an error —
+// so the connection dies on the client's own missed-pong watchdog. The
+// subscribe ack, by contrast, echoes any req_id.
+func heartbeatReqID() (string, error) {
+	var b [4]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", fmt.Errorf("heartbeat req_id: %w", err)
+	}
+	return fmt.Sprintf("ping_%d_%s", time.Now().UnixMilli(), hex.EncodeToString(b[:])), nil
+}
+
+// newStreamID names the stream one reply rides; the platform groups the
+// frames of a reply by it, so uniqueness is the only requirement.
+func newStreamID() (string, error) {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", fmt.Errorf("new stream id: %w", err)
+	}
+	return fmt.Sprintf("stream_%d_%s", time.Now().UnixMilli(), hex.EncodeToString(b[:])), nil
 }
 
 // scopedReplyToken couples the callback's req_id with the epoch of the

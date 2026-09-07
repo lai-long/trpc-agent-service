@@ -66,6 +66,8 @@ type fakeConn struct {
 	heldSubs []envelope // subscribe frames whose ack is withheld (holdAcks)
 	responds []envelope // received aibot_respond_msg frames
 	pings    int        // received pings
+
+	pingReqIDs []string // req_id of every received heartbeat
 }
 
 func newFakePlatform(t *testing.T, botID, secret string) *fakePlatform {
@@ -211,11 +213,14 @@ func (c *fakeConn) run(botID, secret string, f *fakePlatform) {
 		case cmdPing:
 			c.mu.Lock()
 			c.pings++
+			c.pingReqIDs = append(c.pingReqIDs, env.Headers.ReqID)
 			c.mu.Unlock()
 			if f.mutePongs.Load() {
 				continue
 			}
-			_ = write(envelope{Cmd: cmdPong, Headers: frameHeaders{ReqID: env.Headers.ReqID}})
+			// The real platform acks the heartbeat with a cmd-less frame
+			// echoing the req_id; only a ping_-prefixed req_id gets one.
+			_ = write(envelope{Headers: frameHeaders{ReqID: env.Headers.ReqID}, ErrMsg: "ok"})
 		case cmdRespond:
 			c.mu.Lock()
 			c.responds = append(c.responds, env)
@@ -309,6 +314,12 @@ func (c *fakeConn) pingCount() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.pings
+}
+
+func (c *fakeConn) pingIDs() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string(nil), c.pingReqIDs...)
 }
 
 // staticRoutes serves a fixed binding list.
@@ -702,5 +713,34 @@ func TestSleep(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed >= 5*time.Second {
 		t.Errorf("mid-wait cancellation took %v, must return early", elapsed)
+	}
+}
+
+// The platform only answers a heartbeat whose req_id follows the SDK
+// convention of starting with the cmd name ("ping_..."): any other spelling
+// is met with silence, and the client's own missed-pong watchdog then kills a
+// perfectly healthy connection roughly every two ping intervals.
+func TestHeartbeatReqIDFollowsPlatformConvention(t *testing.T) {
+	f := newFakePlatform(t, "bot-1", "s3cr3t")
+	newTestChannel(t, f.addr(), []Binding{mustBinding(t, "b1", "bot-1", "s3cr3t")}, "s3cr3t", &recordingHandler{})
+
+	conn := f.waitConn(t, 1)
+	// A couple of heartbeat intervals must go by without the connection
+	// being torn down, and every ping must carry a ping_-prefixed req_id.
+	deadline := time.Now().Add(700 * time.Millisecond)
+	for time.Now().Before(deadline) && conn.pingCount() < 2 {
+		time.Sleep(20 * time.Millisecond)
+	}
+	ids := conn.pingIDs()
+	if len(ids) < 1 {
+		t.Fatal("no heartbeat received")
+	}
+	for _, id := range ids {
+		if !strings.HasPrefix(id, "ping_") {
+			t.Errorf("heartbeat req_id %q must start with %q", id, "ping_")
+		}
+	}
+	if f.connCount() != 1 {
+		t.Fatalf("answered heartbeats must keep the connection up, got %d connections", f.connCount())
 	}
 }
