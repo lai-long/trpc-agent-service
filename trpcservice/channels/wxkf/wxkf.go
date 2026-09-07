@@ -1,11 +1,16 @@
 // Package wxkf implements the WeChat KF channel adapter.
 //
-// Inbound: the IM platform posts AES-encrypted JSON callbacks
-// ({"encrypt": "..."}); the adapter verifies the msg_signature and decrypts
-// via wxbizmsgcrypt (the WeWork crypt algorithm over a JSON envelope),
-// normalizes the message and hands it to
-// the Handler. GET callbacks carry the URL-verification challenge (echostr).
-// There is no 5-second reply window: replies go out on the async chain.
+// Inbound: the platform pushes only a pointer — one encrypted XML event
+// (kf_msg_or_event) naming the KF account that holds new content and the
+// Token to fetch it with. The messages themselves are pulled with
+// kf/sync_msg, paged by a server-side cursor the adapter persists per KF
+// account (CursorStore): a lost cursor re-pulls up to three days of history
+// and inbound dedup absorbs the repeats, while sharing none would
+// double-pull them live. The pull runs inside the callback handler, so the
+// callback answer doubles as the pull's failure signal — 5xx makes the
+// platform redeliver the event and the next pull resumes from the last
+// saved cursor (at-least-once here, exactly-once downstream). GET callbacks
+// carry the URL-verification challenge.
 //
 // Outbound: replies go through the customer-service send_msg API — the only
 // reply path, allowed only within 48 hours of the user's last message; window
@@ -20,6 +25,7 @@ import (
 	"container/list"
 	"context"
 	"encoding/json"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
@@ -66,6 +72,22 @@ const maxCryptCacheEntries = 32
 // maxTokenCacheEntries bounds the identity-keyed access_token cache.
 const maxTokenCacheEntries = 32
 
+// syncLimit is the kf/sync_msg page size (the API maximum).
+const syncLimit = 1000
+
+// syncMaxPages bounds the drain one callback performs. The page cap trades a
+// bounded callback latency against draining everything now: the cursor is
+// saved per page, so whatever remains is pulled by the next event for this
+// account, and a 5xx here would redeliver an event about to hit the cap again.
+const syncMaxPages = 5
+
+// originCustomer marks msg_list entries a WeChat customer sent; the other
+// origins are system pushes and servicer replies the agent must not see.
+const originCustomer = 3
+
+// eventKfMsgOrEvent is the only callback event this channel acts on.
+const eventKfMsgOrEvent = "kf_msg_or_event"
+
 // Config holds the WeChat KF channel configuration. Secret material is
 // carried as references and resolved through the SecretResolver, never logged.
 type Config struct {
@@ -79,6 +101,18 @@ type Config struct {
 	// secret) at Send time; nil keeps every reply on the env-global identity
 	// above — the legacy single-binding deployment's path.
 	Bindings channels.BindingProvider
+	// Cursors persists the kf/sync_msg pull position per KF account. Required:
+	// without it every event re-pulls up to three days of history.
+	Cursors CursorStore
+}
+
+// CursorStore persists the kf/sync_msg pull position per KF account. Cursors
+// must outlive the process and be shared by every replica: losing one
+// re-pulls up to three days of history (dedup absorbs the repeats), while
+// keeping it process-local double-pulls them live after every restart.
+type CursorStore interface {
+	Get(ctx context.Context, openKfID string) (string, error)
+	Set(ctx context.Context, openKfID string, cursor string) error
 }
 
 // Channel is the WeChat KF implementation of channels.Channel.
@@ -89,6 +123,8 @@ type Channel struct {
 	// bindings resolves the outbound identity of a binding-scoped reply; nil
 	// (legacy single-binding deployment) keeps the env-global identity.
 	bindings channels.BindingProvider
+	// cursors persists the sync_msg pull position per KF account.
+	cursors CursorStore
 
 	// crypts caches one WXBizMsgCrypt per credential set
 	// (corp|tokenRef|aesKeyRef): multi-tenant callbacks arrive with
@@ -131,6 +167,9 @@ func New(cfg Config, resolver config.SecretResolver) (*Channel, error) {
 	if cfg.CorpID == "" || cfg.KfAccount == "" {
 		return nil, fmt.Errorf("wxkf: CorpID and KfAccount are required")
 	}
+	if cfg.Cursors == nil {
+		return nil, fmt.Errorf("wxkf: Cursors (CursorStore) is required (sync_msg cursors must outlive the process)")
+	}
 	if cfg.APIBase == "" {
 		cfg.APIBase = defaultAPIBase
 	}
@@ -146,6 +185,7 @@ func New(cfg Config, resolver config.SecretResolver) (*Channel, error) {
 		secret:     resolver,
 		client:     &http.Client{Timeout: 10 * time.Second},
 		bindings:   cfg.Bindings,
+		cursors:    cfg.Cursors,
 		crypts:     map[string]*wxbizmsgcrypt.WXBizMsgCrypt{},
 		tokens:     map[string]tokenEntry{},
 		tokenOrder: list.New(),
@@ -196,18 +236,24 @@ type outboundID struct {
 // send — replying under the global identity instead could deliver one
 // tenant's message as another KF account.
 func (c *Channel) outboundIDFor(ctx context.Context, msg channels.OutboundMessage) (outboundID, error) {
+	return c.bindingIdentity(ctx, msg.BindingID)
+}
+
+// bindingIdentity resolves the identity one send (or one sync_msg pull)
+// authenticates under, from the binding's config with the env-global fallback.
+func (c *Channel) bindingIdentity(ctx context.Context, bindingID string) (outboundID, error) {
 	id := outboundID{corpID: c.cfg.CorpID, secretRef: c.cfg.SecretRef, kfAccount: c.cfg.KfAccount}
-	if msg.BindingID == "" || c.bindings == nil {
+	if bindingID == "" || c.bindings == nil {
 		return id, nil
 	}
-	b, err := c.bindings.BindingByID(ctx, msg.BindingID)
+	b, err := c.bindings.BindingByID(ctx, bindingID)
 	if err != nil {
-		return outboundID{}, fmt.Errorf("wxkf: resolve binding %s for outbound identity: %w", msg.BindingID, err)
+		return outboundID{}, fmt.Errorf("wxkf: resolve binding %s for outbound identity: %w", bindingID, err)
 	}
 	var cfg bindingConfig
 	if len(b.Config) > 0 {
 		if err := json.Unmarshal(b.Config, &cfg); err != nil {
-			return outboundID{}, fmt.Errorf("wxkf: binding %s config: %w", msg.BindingID, err)
+			return outboundID{}, fmt.Errorf("wxkf: binding %s config: %w", bindingID, err)
 		}
 	}
 	if cfg.CorpID != "" {
@@ -265,7 +311,7 @@ func (c *Channel) cryptFor(corpID, tokenRef, aesKeyRef string) (*wxbizmsgcrypt.W
 func (c *Channel) Name() string { return ChannelName }
 
 // RegisterRoutes implements channels.Channel: GET verifies the callback URL,
-// POST receives encrypted messages. The path is the env-configured
+// POST receives the encrypted event pointer. The path is the env-configured
 // single-binding default; tenant bindings are served through
 // CallbackHandler at /callback/{channel}/{binding_id}.
 func (c *Channel) RegisterRoutes(mux *http.ServeMux, h channels.Handler) {
@@ -304,7 +350,7 @@ func (c *Channel) CallbackHandler(h channels.Handler, creds channels.BindingCred
 		case http.MethodGet:
 			c.verifyURL(w, r, crypt)
 		case http.MethodPost:
-			c.receive(w, r, crypt, h)
+			c.receive(w, r, crypt, h, creds)
 		default:
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		}
@@ -324,30 +370,53 @@ func (c *Channel) verifyURL(w http.ResponseWriter, r *http.Request, crypt *wxbiz
 	_, _ = w.Write(echo)
 }
 
-// receive handles one encrypted message callback.
-func (c *Channel) receive(w http.ResponseWriter, r *http.Request, crypt *wxbizmsgcrypt.WXBizMsgCrypt, h channels.Handler) {
+// kfEvent is the decrypted XML of a WeChat KF callback. The platform pushes
+// only a pointer — the pull token and the KF account holding new content —
+// never the messages themselves.
+type kfEvent struct {
+	XMLName    xml.Name `xml:"xml"`
+	ToUserName string   `xml:"ToUserName"`
+	CreateTime int64    `xml:"CreateTime"`
+	MsgType    string   `xml:"MsgType"`
+	Event      string   `xml:"Event"`
+	Token      string   `xml:"Token"`
+	OpenKfID   string   `xml:"OpenKfId"`
+}
+
+// syncPage is one kf/sync_msg response.
+type syncPage struct {
+	ErrCode    int         `json:"errcode"`
+	ErrMsg     string      `json:"errmsg"`
+	NextCursor string      `json:"next_cursor"`
+	HasMore    int         `json:"has_more"`
+	MsgList    []syncedMsg `json:"msg_list"`
+}
+
+// syncedMsg is one msg_list entry. origin 3 is a WeChat customer's message —
+// the only kind the agent answers; origin 4 is a system push and 5 a
+// servicer's own reply, both of which must never re-enter the pipeline.
+type syncedMsg struct {
+	MsgID          string `json:"msgid"`
+	OpenKfID       string `json:"open_kfid"`
+	ExternalUserID string `json:"external_userid"`
+	SendTime       int64  `json:"send_time"`
+	Origin         int    `json:"origin"`
+	MsgType        string `json:"msgtype"`
+	Text           struct {
+		Content string `json:"content"`
+	} `json:"text"`
+}
+
+// receive handles one encrypted callback: decrypt, and when it announces new
+// content for a KF account, drain that account (see pullMessages).
+func (c *Channel) receive(w http.ResponseWriter, r *http.Request, crypt *wxbizmsgcrypt.WXBizMsgCrypt, h channels.Handler, creds channels.BindingCredentials) {
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 1<<20))
 	if err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
-	var envelope struct {
-		Encrypt string `json:"encrypt"`
-	}
-	// A malformed callback is not retryable: ack so the platform does not
-	// redeliver, and log for investigation.
-	if err := json.Unmarshal(body, &envelope); err != nil {
-		plog.Warnf("wxkf bad callback json: %v", err)
-		writeSuccess(w)
-		return
-	}
-	if envelope.Encrypt == "" {
-		plog.Warnf("wxkf callback missing encrypt field")
-		writeSuccess(w)
-		return
-	}
 	q := r.URL.Query()
-	plain, cerr := crypt.DecryptMsg(q.Get("msg_signature"), q.Get("timestamp"), q.Get("nonce"), xmlEnvelope(envelope.Encrypt))
+	plain, cerr := crypt.DecryptMsg(q.Get("msg_signature"), q.Get("timestamp"), q.Get("nonce"), body)
 	if cerr != nil {
 		// Two failures, two answers. An unverified callback (bad signature,
 		// envelope that is not XML) is indistinguishable from internet junk:
@@ -367,73 +436,145 @@ func (c *Channel) receive(w http.ResponseWriter, r *http.Request, crypt *wxbizms
 		return
 	}
 
-	var cm callbackMessage
-	if err := json.Unmarshal(plain, &cm); err != nil {
-		plog.Warnf("wxkf parse callback json: %v", err)
+	var ev kfEvent
+	//nolint:gosec // G709: plain is the signature-verified, decrypted platform callback
+	if err := xml.Unmarshal(plain, &ev); err != nil {
+		plog.Warnf("wxkf parse callback xml: %v", err)
 		writeSuccess(w)
 		return
 	}
 	// The signature never expires, so freshness is the only replay bound that
 	// outlives the inbound dedup TTL. A stale callback is acked, not 5xx'd:
 	// the platform would redeliver a capture we will always refuse.
-	if channels.StaleCallback(cm.CreateTime, time.Now()) {
-		plog.Warnf("wxkf drop stale callback (create_time %d, msg %s)", cm.CreateTime, cm.MsgID)
+	if channels.StaleCallback(ev.CreateTime, time.Now()) {
+		plog.Warnf("wxkf drop stale callback (create_time %d, event %s)", ev.CreateTime, ev.Event)
 		writeSuccess(w)
 		return
 	}
-	// Only text messages enter the pipeline; events (enter_session, ...) and
-	// media messages (image/voice/file/link/miniprogram) are acked and skipped
-	// (media handling is a follow-up). Text without a msgid cannot be
-	// deduplicated — skip it too.
-	if cm.MsgType != "text" || cm.MsgID == "" {
-		plog.Infof("wxkf skip msgtype=%s msgid=%s (non-text/event or missing msgid)", cm.MsgType, cm.MsgID)
+	// Only new-content pointers trigger a pull; other events (account
+	// changes, ...) are acked and skipped.
+	if ev.MsgType != "event" || ev.Event != eventKfMsgOrEvent {
+		plog.Infof("wxkf skip callback msgtype=%s event=%s", ev.MsgType, ev.Event)
 		writeSuccess(w)
 		return
 	}
-
-	msg := channels.InboundMessage{
-		Channel:     c.Name(),
-		MsgID:       cm.MsgID,
-		SessionKey:  channels.SessionKey(c.Name(), cm.OpenID, ""), // KF is direct-chat only
-		UserID:      cm.OpenID,
-		Text:        cm.Text.Content,
-		WebhookPath: r.URL.Path,
-		ReceivedAt:  time.Now(),
-	}
-	if _, err := h.Handle(r.Context(), msg); err != nil {
-		if errors.Is(err, channels.ErrDuplicate) {
-			// ErrDuplicate is a success outcome, not a failure: answer 200 so
-			// the platform stops redelivering.
-			plog.Warnf("wxkf duplicate message %s dropped", cm.MsgID)
-			writeSuccess(w)
-			return
-		}
-		// 5xx makes the platform redeliver; the gateway rolls the dedup key
-		// back first so that retry is not swallowed.
-		plog.Errorf("wxkf handle msg %s: %v", cm.MsgID, err)
-		http.Error(w, "handle error", http.StatusInternalServerError)
+	if err := c.pullMessages(r.Context(), ev, creds, r.URL.Path, h); err != nil {
+		// 5xx makes the platform redeliver the event; the pull resumes from
+		// the last persisted cursor and inbound dedup absorbs the overlap.
+		plog.Errorf("wxkf pull for %s failed: %v", ev.OpenKfID, err)
+		http.Error(w, "sync failed", http.StatusInternalServerError)
 		return
 	}
 	writeSuccess(w)
 }
 
-// callbackMessage is the decrypted inner JSON of a WeChat KF callback.
-type callbackMessage struct {
-	MsgID      string `json:"msgid"`
-	OpenID     string `json:"openid"`
-	MsgType    string `json:"msgtype"`
-	CreateTime int64  `json:"create_time"`
-	Text       struct {
-		Content string `json:"content"`
-	} `json:"text"`
-}
+// pullMessages drains the event's KF account: sync_msg pages by the persisted
+// cursor until has_more drops, each page handed to the handler BEFORE the
+// cursor is saved. The order is the correctness contract — a crash or failure
+// between the two re-pulls the page and inbound dedup absorbs the overlap;
+// the reverse order would silently drop messages. Responses can arrive with
+// has_more=1 and an empty msg_list, so only has_more ends the loop.
+func (c *Channel) pullMessages(ctx context.Context, ev kfEvent, creds channels.BindingCredentials, webhookPath string, h channels.Handler) error {
+	id, err := c.bindingIdentity(ctx, creds.BindingID)
+	if err != nil {
+		return err
+	}
+	openKfID := ev.OpenKfID
+	if openKfID == "" {
+		openKfID = id.kfAccount
+	}
+	token, err := c.getAccessToken(ctx, id.corpID, id.secretRef)
+	if err != nil {
+		return err
+	}
+	sync := func(tok string) (syncPage, error) {
+		reqBody := map[string]any{"limit": syncLimit, "open_kfid": openKfID}
+		saved, gerr := c.cursors.Get(ctx, openKfID)
+		if gerr != nil {
+			return syncPage{}, fmt.Errorf("wxkf: load cursor for %s: %w", openKfID, gerr)
+		}
+		if saved != "" {
+			reqBody["cursor"] = saved
+		}
+		// The body token is the EVENT's pull token, not the access_token —
+		// that one rides the URL query only.
+		if ev.Token != "" {
+			reqBody["token"] = ev.Token
+		}
+		payload, perr := json.Marshal(reqBody)
+		if perr != nil {
+			return syncPage{}, perr
+		}
+		req, rerr := http.NewRequestWithContext(ctx, http.MethodPost,
+			c.cfg.APIBase+"/cgi-bin/kf/sync_msg?access_token="+url.QueryEscape(tok), bytes.NewReader(payload))
+		if rerr != nil {
+			return syncPage{}, rerr
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, derr := c.client.Do(req)
+		if derr != nil {
+			return syncPage{}, fmt.Errorf("wxkf sync_msg request: %w", channels.ScrubError(derr))
+		}
+		defer func() { _ = resp.Body.Close() }()
+		var page syncPage
+		if derr := json.NewDecoder(resp.Body).Decode(&page); derr != nil {
+			return syncPage{}, fmt.Errorf("wxkf sync_msg decode: %w", derr)
+		}
+		return page, nil
+	}
 
-// xmlEnvelope re-wraps the JSON ciphertext into the XML envelope the vendored
-// wxbizmsgcrypt parses (base64 carries no XML-special characters). This keeps
-// signature verification and AES decryption inside the vendored library,
-// shared with the WeCom adapter.
-func xmlEnvelope(encrypt string) []byte {
-	return []byte("<xml><Encrypt>" + encrypt + "</Encrypt></xml>")
+	for page := 0; page < syncMaxPages; page++ {
+		result, err := sync(token)
+		if err != nil {
+			return err
+		}
+		if result.ErrCode == 40014 || result.ErrCode == 42001 { // token expired/invalid: refresh once and retry
+			c.invalidateToken(id.corpID, id.secretRef)
+			if token, err = c.getAccessToken(ctx, id.corpID, id.secretRef); err != nil {
+				return err
+			}
+			if result, err = sync(token); err != nil {
+				return err
+			}
+		}
+		if result.ErrCode != 0 {
+			return fmt.Errorf("wxkf sync_msg for %s: errcode %d", openKfID, result.ErrCode)
+		}
+		for _, m := range result.MsgList {
+			if m.Origin != originCustomer || m.MsgType != "text" || m.MsgID == "" {
+				continue // servicer/system entries, media and events are follow-ups
+			}
+			msg := channels.InboundMessage{
+				Channel:     c.Name(),
+				MsgID:       m.MsgID,
+				SessionKey:  channels.SessionKey(c.Name(), m.ExternalUserID, ""), // KF is direct-chat only
+				UserID:      m.ExternalUserID,
+				Text:        m.Text.Content,
+				Type:        channels.TypeText,
+				WebhookPath: webhookPath,
+				ReceivedAt:  time.Unix(m.SendTime, 0),
+			}
+			if _, err := h.Handle(ctx, msg); err != nil {
+				if errors.Is(err, channels.ErrDuplicate) {
+					// Re-pulled after a crash between handler and cursor
+					// save: a success outcome, keep draining.
+					continue
+				}
+				// This page's cursor is not saved, so the redelivery the 5xx
+				// triggers re-pulls it; dedup absorbs what already landed.
+				return fmt.Errorf("wxkf handle msg %s: %w", m.MsgID, err)
+			}
+		}
+		if err := c.cursors.Set(ctx, openKfID, result.NextCursor); err != nil {
+			return fmt.Errorf("wxkf: save cursor for %s: %w", openKfID, err)
+		}
+		if result.HasMore == 0 {
+			return nil
+		}
+	}
+	plog.Warnf("wxkf sync for %s hit the %d-page cap with more pending; the next event resumes the drain",
+		openKfID, syncMaxPages)
+	return nil
 }
 
 func writeSuccess(w http.ResponseWriter) {

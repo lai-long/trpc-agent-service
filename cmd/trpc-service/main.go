@@ -241,7 +241,7 @@ func serve(role string) error {
 			wc.RegisterRoutes(mux, enqueue)
 			channelSet[wc.Name()] = wc
 		}
-		if kf := startWxkf(cfg, secrets, outboundBindings); kf != nil {
+		if kf := startWxkf(cfg, secrets, outboundBindings, wxkfCursorStore{rdb}); kf != nil {
 			kf.RegisterRoutes(mux, enqueue)
 			channelSet[kf.Name()] = kf
 		}
@@ -582,7 +582,7 @@ func startWecom(cfg config.Config, media channels.MediaStore, secrets config.Sec
 // startWxkf builds the WeChat KF channel from env config; it returns nil
 // (with a warning) when the channel is not configured or its secrets are
 // missing, so the other channels keep serving.
-func startWxkf(cfg config.Config, secrets config.SecretResolver, bindings channels.BindingProvider) *wxkf.Channel {
+func startWxkf(cfg config.Config, secrets config.SecretResolver, bindings channels.BindingProvider, cursors wxkf.CursorStore) *wxkf.Channel {
 	if cfg.WxkfCorpID == "" || cfg.WxkfKfAccount == "" {
 		return nil
 	}
@@ -598,6 +598,7 @@ func startWxkf(cfg config.Config, secrets config.SecretResolver, bindings channe
 		SecretRef: cfg.WxkfSecretRef,
 		APIBase:   cfg.WxkfAPIBase,
 		Bindings:  bindings,
+		Cursors:   cursors,
 	}, secrets)
 	if err != nil {
 		plog.Warnf("wxkf channel disabled: %v", err)
@@ -667,6 +668,23 @@ func (b bindingProvider) BindingByID(ctx context.Context, id string) (channels.O
 		return channels.OutboundBinding{}, err
 	}
 	return channels.OutboundBinding{ID: binding.ID, Config: binding.Config}, nil
+}
+
+// wxkfCursorStore persists the wxkf sync_msg pull position per KF account in
+// Redis. No TTL: a stale cursor only re-pulls history the platform still
+// serves (three days), and inbound dedup absorbs the overlap.
+type wxkfCursorStore struct{ rdb *redis.Client }
+
+func (s wxkfCursorStore) Get(ctx context.Context, openKfID string) (string, error) {
+	v, err := s.rdb.Get(ctx, "wxkf:cursor:"+openKfID).Result()
+	if errors.Is(err, redis.Nil) {
+		return "", nil
+	}
+	return v, err
+}
+
+func (s wxkfCursorStore) Set(ctx context.Context, openKfID, cursor string) error {
+	return s.rdb.Set(ctx, "wxkf:cursor:"+openKfID, cursor, 0).Err()
 }
 
 // Re-campaign pacing: the base wait doubles per consecutive quick failure

@@ -113,7 +113,7 @@ func bindingChannel(t *testing.T, apiBase string, bindings channels.BindingProvi
 	c, err := New(Config{
 		CorpID: testCorpID, KfAccount: testKfAccount,
 		TokenRef: "tok", AESKeyRef: "aes", SecretRef: "secret", APIBase: apiBase,
-		Bindings: bindings,
+		Bindings: bindings, Cursors: newCursorStore(),
 	}, mapResolver{
 		"tok": testToken, "aes": testAESKey, "secret": "kf-secret",
 		"secret-b": "kf-secret-b", "secret-c": "kf-secret-c",
@@ -383,6 +383,7 @@ func tokenTestChannel(t *testing.T, f *identityFake) *Channel {
 	c, err := New(Config{
 		CorpID: testCorpID, KfAccount: testKfAccount,
 		TokenRef: "tok", AESKeyRef: "aes", SecretRef: "secret", APIBase: srv.URL,
+		Cursors: newCursorStore(),
 	}, mapResolver{"tok": testToken, "aes": testAESKey, "secret": "s"})
 	if err != nil {
 		t.Fatal(err)

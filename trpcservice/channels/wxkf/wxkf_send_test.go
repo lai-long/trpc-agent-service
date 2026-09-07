@@ -54,7 +54,7 @@ func TestSendCachesToken(t *testing.T) {
 	fake := &fakeKfAPI{}
 	srv := httptest.NewServer(fake.handler())
 	defer srv.Close()
-	c := testChannel(t, srv.URL)
+	c, _ := testChannel(t, srv.URL)
 
 	for i := 0; i < 2; i++ {
 		if err := c.Send(t.Context(), channels.OutboundMessage{
@@ -80,7 +80,7 @@ func TestSendRefreshesExpiredToken(t *testing.T) {
 	fake := &fakeKfAPI{failNextTok: true}
 	srv := httptest.NewServer(fake.handler())
 	defer srv.Close()
-	c := testChannel(t, srv.URL)
+	c, _ := testChannel(t, srv.URL)
 
 	if err := c.Send(t.Context(), channels.OutboundMessage{
 		Channel: "wxkf", MsgID: "1", UserID: "oUSER1", Text: "你好",
@@ -96,7 +96,7 @@ func TestSendSplitsLongText(t *testing.T) {
 	fake := &fakeKfAPI{}
 	srv := httptest.NewServer(fake.handler())
 	defer srv.Close()
-	c := testChannel(t, srv.URL)
+	c, _ := testChannel(t, srv.URL)
 
 	long := strings.Repeat("汉", 1500) // 4500 bytes → 3 segments
 	if err := c.Send(t.Context(), channels.OutboundMessage{
@@ -136,7 +136,7 @@ func TestSendErrorSurfaces(t *testing.T) {
 	fake := &fakeKfAPI{rejectErrcode: 95020}
 	srv := httptest.NewServer(fake.handler())
 	defer srv.Close()
-	c := testChannel(t, srv.URL)
+	c, _ := testChannel(t, srv.URL)
 
 	err := c.Send(t.Context(), channels.OutboundMessage{
 		Channel: "wxkf", MsgID: "1", UserID: "oUSER1", Text: "你好",

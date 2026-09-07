@@ -516,23 +516,29 @@ func TestStartWecom(t *testing.T) {
 	}
 }
 
+// stubCursors is a no-op wxkf.CursorStore for configs that never pull.
+type stubCursors struct{}
+
+func (stubCursors) Get(context.Context, string) (string, error) { return "", nil }
+func (stubCursors) Set(context.Context, string, string) error   { return nil }
+
 func TestStartWxkf(t *testing.T) {
 	secrets := config.NewFileResolver(testSecretsDir(t))
-	if ch := startWxkf(config.Config{}, secrets, nil); ch != nil {
+	if ch := startWxkf(config.Config{}, secrets, nil, nil); ch != nil {
 		t.Fatal("unset wxkf env must disable the channel")
 	}
-	if ch := startWxkf(config.Config{WxkfCorpID: "corp"}, secrets, nil); ch != nil {
+	if ch := startWxkf(config.Config{WxkfCorpID: "corp"}, secrets, nil, nil); ch != nil {
 		t.Fatal("missing KF account must disable the channel")
 	}
 	if ch := startWxkf(config.Config{
 		WxkfCorpID: "corp", WxkfKfAccount: "wk0001",
 		WxkfTokenRef: "missing", WxkfAESKeyRef: "missing",
-	}, config.NewFileResolver(t.TempDir()), nil); ch != nil {
+	}, config.NewFileResolver(t.TempDir()), nil, stubCursors{}); ch != nil {
 		t.Fatal("unresolvable secrets must disable the channel")
 	}
 	if ch := startWxkf(config.Config{
 		WxkfCorpID: "corp", WxkfKfAccount: "wk0001", WxkfAPIBase: "http://127.0.0.1:1",
-	}, secrets, nil); ch != nil {
+	}, secrets, nil, stubCursors{}); ch != nil {
 		t.Fatal("an http API base must disable the channel (secret rides the query)")
 	}
 
@@ -541,7 +547,7 @@ func TestStartWxkf(t *testing.T) {
 		WxkfTokenRef: "wxkf-token", WxkfAESKeyRef: "wxkf-aeskey",
 		WxkfAPIBase: "https://127.0.0.1:1",
 	}
-	ch := startWxkf(cfg, secrets, nil)
+	ch := startWxkf(cfg, secrets, nil, stubCursors{})
 	if ch == nil {
 		t.Fatal("valid config must enable the wxkf channel")
 	}

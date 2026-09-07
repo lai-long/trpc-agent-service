@@ -21,14 +21,6 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
 )
 
-// postForged forges one encrypted JSON callback for innerJSON and serves it on
-// a binding-scoped handler; the recorder carries the answer.
-func postForged(t *testing.T, c *Channel, h channels.Handler, innerJSON string) *httptest.ResponseRecorder {
-	t.Helper()
-	body, query := forgeCallback(t, innerJSON)
-	return postRaw(t, c, h, body, query)
-}
-
 // postRaw serves one callback body under the test binding's credentials.
 func postRaw(t *testing.T, c *Channel, h channels.Handler, body []byte, query string) *httptest.ResponseRecorder {
 	t.Helper()
@@ -73,10 +65,9 @@ func craftCallback(t *testing.T, plaintext string) (body []byte, query string) {
 
 	const timestamp, nonce = "1700000000", "nonce-1"
 	signature := sha1Hex(testToken, timestamp, nonce, encrypt)
-	body = []byte(fmt.Sprintf(`{"encrypt":%q}`, encrypt))
 	query = fmt.Sprintf("msg_signature=%s&timestamp=%s&nonce=%s",
 		url.QueryEscape(signature), timestamp, nonce)
-	return body, query
+	return []byte(fmt.Sprintf("<xml><Encrypt>%s</Encrypt></xml>", encrypt)), query
 }
 
 // sha1Hex is the platform's signature rule: sort the four parts, concatenate,
@@ -98,10 +89,11 @@ func TestNewValidation(t *testing.T) {
 		cfg  Config
 		want string
 	}{
-		{"missing corpid", Config{KfAccount: testKfAccount, TokenRef: "tok", AESKeyRef: "aes"}, "CorpID and KfAccount are required"},
-		{"missing kf account", Config{CorpID: testCorpID, TokenRef: "tok", AESKeyRef: "aes"}, "CorpID and KfAccount are required"},
-		{"unresolvable token", Config{CorpID: testCorpID, KfAccount: testKfAccount, TokenRef: "nope", AESKeyRef: "aes"}, "resolve token"},
-		{"unresolvable aes key", Config{CorpID: testCorpID, KfAccount: testKfAccount, TokenRef: "tok", AESKeyRef: "nope"}, "resolve aes key"},
+		{"missing corpid", Config{KfAccount: testKfAccount, TokenRef: "tok", AESKeyRef: "aes", Cursors: newCursorStore()}, "CorpID and KfAccount are required"},
+		{"missing kf account", Config{CorpID: testCorpID, TokenRef: "tok", AESKeyRef: "aes", Cursors: newCursorStore()}, "CorpID and KfAccount are required"},
+		{"missing cursor store", Config{CorpID: testCorpID, KfAccount: testKfAccount, TokenRef: "tok", AESKeyRef: "aes"}, "Cursors"},
+		{"unresolvable token", Config{CorpID: testCorpID, KfAccount: testKfAccount, TokenRef: "nope", AESKeyRef: "aes", Cursors: newCursorStore()}, "resolve token"},
+		{"unresolvable aes key", Config{CorpID: testCorpID, KfAccount: testKfAccount, TokenRef: "tok", AESKeyRef: "nope", Cursors: newCursorStore()}, "resolve aes key"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -113,7 +105,7 @@ func TestNewValidation(t *testing.T) {
 }
 
 func TestCryptFor(t *testing.T) {
-	c := testChannel(t, "")
+	c, _ := testChannel(t, "")
 
 	// Empty refs fall back to the env single-binding default, and the same
 	// resolved credential set must be served from the cache on the second call.
@@ -166,7 +158,7 @@ func TestRegisterRoutesMountFailure(t *testing.T) {
 }
 
 func TestCallbackHandlerRejectsBadCredentials(t *testing.T) {
-	c := testChannel(t, "")
+	c, _ := testChannel(t, "")
 	h := channels.HandlerFunc(func(context.Context, channels.InboundMessage) (channels.OutboundMessage, error) {
 		return channels.OutboundMessage{}, nil
 	})
@@ -179,7 +171,7 @@ func TestCallbackHandlerRejectsBadCredentials(t *testing.T) {
 }
 
 func TestCallbackMethodNotAllowed(t *testing.T) {
-	c := testChannel(t, "")
+	c, _ := testChannel(t, "")
 	handler, err := c.CallbackHandler(channels.HandlerFunc(func(context.Context, channels.InboundMessage) (channels.OutboundMessage, error) {
 		t.Error("handler must not run for other methods")
 		return channels.OutboundMessage{}, nil
@@ -195,7 +187,7 @@ func TestCallbackMethodNotAllowed(t *testing.T) {
 }
 
 func TestVerifyURLRejectsBadSignature(t *testing.T) {
-	c := testChannel(t, "")
+	c, _ := testChannel(t, "")
 	handler, err := c.CallbackHandler(channels.HandlerFunc(func(context.Context, channels.InboundMessage) (channels.OutboundMessage, error) {
 		t.Error("handler must not run for a failed verification")
 		return channels.OutboundMessage{}, nil
@@ -215,11 +207,12 @@ func TestVerifyURLRejectsBadSignature(t *testing.T) {
 // readable, and a 5xx would let any scanner turn this public endpoint into an
 // error-rate firehose.
 func TestReceiveUnverifiedCallbackIsAcked(t *testing.T) {
-	c := testChannel(t, "")
+	c, _ := testChannel(t, "")
+	body, _ := forgeEvent(t, testEvent("evt-token-1"))
 	rec := postRaw(t, c, channels.HandlerFunc(func(context.Context, channels.InboundMessage) (channels.OutboundMessage, error) {
 		t.Error("handler must not run for an unverified callback")
 		return channels.OutboundMessage{}, nil
-	}), []byte(`{"encrypt":"abcd"}`), "msg_signature=tampered&timestamp=1700000000&nonce=n")
+	}), body, "msg_signature=tampered&timestamp=1700000000&nonce=nonce-1")
 	if rec.Code != http.StatusOK || rec.Body.String() != "success" {
 		t.Fatalf("an unverified callback must be acked, got %d %q", rec.Code, rec.Body.String())
 	}
@@ -229,7 +222,7 @@ func TestReceiveUnverifiedCallbackIsAcked(t *testing.T) {
 // read it is our fault: it must answer 5xx so the platform redelivers and a
 // fixed credential recovers the backlog.
 func TestReceiveAuthenticatedButUnreadableIsNotAcked(t *testing.T) {
-	c := testChannel(t, "")
+	c, _ := testChannel(t, "")
 	body, query := craftCallback(t, "short")
 	rec := postRaw(t, c, channels.HandlerFunc(func(context.Context, channels.InboundMessage) (channels.OutboundMessage, error) {
 		t.Error("handler must not run for an unreadable callback")
@@ -243,7 +236,7 @@ func TestReceiveAuthenticatedButUnreadableIsNotAcked(t *testing.T) {
 // A callback whose body cannot be read (over the 1 MiB cap) is a bad request,
 // not an ack: the platform must redeliver a truncated callback.
 func TestReceiveOversizedBody(t *testing.T) {
-	c := testChannel(t, "")
+	c, _ := testChannel(t, "")
 	handler, err := c.CallbackHandler(channels.HandlerFunc(func(context.Context, channels.InboundMessage) (channels.OutboundMessage, error) {
 		t.Error("handler must not run for an unreadable body")
 		return channels.OutboundMessage{}, nil
@@ -259,10 +252,10 @@ func TestReceiveOversizedBody(t *testing.T) {
 	}
 }
 
-// A callback envelope that is not JSON is acked (no redelivery) and never
+// A callback envelope that is not XML is acked (no redelivery) and never
 // enters the pipeline.
 func TestReceiveUnparsableEnvelope(t *testing.T) {
-	c := testChannel(t, "")
+	c, _ := testChannel(t, "")
 	handler, err := c.CallbackHandler(channels.HandlerFunc(func(context.Context, channels.InboundMessage) (channels.OutboundMessage, error) {
 		t.Error("handler must not run for unparsable envelope")
 		return channels.OutboundMessage{}, nil
@@ -271,22 +264,9 @@ func TestReceiveUnparsableEnvelope(t *testing.T) {
 		t.Fatal(err)
 	}
 	rec := httptest.NewRecorder()
-	handler(rec, httptest.NewRequest(http.MethodPost, "/callback/wxkf/b1", strings.NewReader(`not-json`)))
+	handler(rec, httptest.NewRequest(http.MethodPost, "/callback/wxkf/b1", strings.NewReader(`not-xml`)))
 	if rec.Code != http.StatusOK || rec.Body.String() != "success" {
 		t.Fatalf("unparsable envelope must be acked, got %d %q", rec.Code, rec.Body.String())
-	}
-}
-
-// A decryptable callback carrying garbage JSON is acked and never enters the
-// pipeline.
-func TestReceiveUnparsableInnerJSON(t *testing.T) {
-	c := testChannel(t, "")
-	rec := postForged(t, c, channels.HandlerFunc(func(context.Context, channels.InboundMessage) (channels.OutboundMessage, error) {
-		t.Error("handler must not run for unparsable json")
-		return channels.OutboundMessage{}, nil
-	}), `not-json{{`)
-	if rec.Code != http.StatusOK || rec.Body.String() != "success" {
-		t.Fatalf("unparsable inner json must be acked, got %d %q", rec.Code, rec.Body.String())
 	}
 }
 
@@ -296,7 +276,7 @@ func TestSendMarkdownDowngrades(t *testing.T) {
 	fake := &scriptKfAPI{}
 	srv := httptest.NewServer(fake.handler())
 	defer srv.Close()
-	c := testChannel(t, srv.URL)
+	c, _ := testChannel(t, srv.URL)
 
 	if err := c.Send(t.Context(), channels.OutboundMessage{
 		Channel: "wxkf", MsgID: "1", UserID: "oUSER1", Text: "**加粗** 与 `代码`", TextType: channels.TextTypeMarkdown,
@@ -332,7 +312,7 @@ func TestSendPartialDelivery(t *testing.T) {
 	}}
 	srv := httptest.NewServer(fake.handler())
 	defer srv.Close()
-	c := testChannel(t, srv.URL)
+	c, _ := testChannel(t, srv.URL)
 
 	long := strings.Repeat("汉", 1500) // 4500 bytes → 3 segments
 	err := c.Send(t.Context(), channels.OutboundMessage{
@@ -347,15 +327,19 @@ func TestSendPartialDelivery(t *testing.T) {
 }
 
 // scriptKfAPI is a configurable fake of the KF HTTP API: each call can be
-// answered by an injected body (no script entries answer success).
+// answered by an injected body (no script entries answer success). sync_msg
+// requests are recorded so tests can assert the cursor/token/open_kfid.
 type scriptKfAPI struct {
 	mu      sync.Mutex
 	tokenN  int
 	sendN   int
+	syncN   int
 	onToken func(n int) string // 1-based call index → raw response body
 	onSend  func(n int) string
+	onSync  func(n int) string
 
 	sendSeen []string
+	syncSeen []string
 }
 
 func (f *scriptKfAPI) handler() http.Handler {
@@ -385,6 +369,20 @@ func (f *scriptKfAPI) handler() http.Handler {
 		}
 		_, _ = w.Write([]byte(`{"errcode":0,"errmsg":"ok"}`))
 	})
+	mux.HandleFunc("/cgi-bin/kf/sync_msg", func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		f.syncN++
+		n := f.syncN
+		var body json.RawMessage
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		f.syncSeen = append(f.syncSeen, string(body))
+		f.mu.Unlock()
+		if f.onSync != nil {
+			_, _ = fmt.Fprint(w, f.onSync(n))
+			return
+		}
+		_, _ = w.Write([]byte(`{"errcode":0,"errmsg":"ok","next_cursor":"","has_more":0,"msg_list":[]}`))
+	})
 	return mux
 }
 
@@ -392,6 +390,18 @@ func (f *scriptKfAPI) sends() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]string(nil), f.sendSeen...)
+}
+
+func (f *scriptKfAPI) syncs() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.syncSeen...)
+}
+
+func (f *scriptKfAPI) syncCalls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.syncN
 }
 
 func (f *scriptKfAPI) tokenCalls() int {
@@ -402,7 +412,7 @@ func (f *scriptKfAPI) tokenCalls() int {
 
 func TestSendTokenFailures(t *testing.T) {
 	t.Run("unresolvable kf secret", func(t *testing.T) {
-		c, err := New(Config{CorpID: testCorpID, KfAccount: testKfAccount, TokenRef: "tok", AESKeyRef: "aes", SecretRef: "nope"},
+		c, err := New(Config{CorpID: testCorpID, KfAccount: testKfAccount, TokenRef: "tok", AESKeyRef: "aes", SecretRef: "nope", Cursors: newCursorStore()},
 			mapResolver{"tok": testToken, "aes": testAESKey})
 		if err != nil {
 			t.Fatal(err)
@@ -418,7 +428,7 @@ func TestSendTokenFailures(t *testing.T) {
 	dead.Close()
 
 	t.Run("gettoken unreachable", func(t *testing.T) {
-		c := testChannel(t, deadURL)
+		c, _ := testChannel(t, deadURL)
 		err := c.Send(t.Context(), channels.OutboundMessage{Channel: "wxkf", MsgID: "1", UserID: "u", Text: "hi"})
 		if err == nil || !strings.Contains(err.Error(), "gettoken") {
 			t.Fatalf("gettoken transport failure must surface, got %v", err)
@@ -428,7 +438,7 @@ func TestSendTokenFailures(t *testing.T) {
 		fake := &scriptKfAPI{onToken: func(int) string { return `not-json` }}
 		srv := httptest.NewServer(fake.handler())
 		defer srv.Close()
-		c := testChannel(t, srv.URL)
+		c, _ := testChannel(t, srv.URL)
 		err := c.Send(t.Context(), channels.OutboundMessage{Channel: "wxkf", MsgID: "1", UserID: "u", Text: "hi"})
 		if err == nil || !strings.Contains(err.Error(), "gettoken decode") {
 			t.Fatalf("gettoken decode failure must surface, got %v", err)
@@ -438,7 +448,7 @@ func TestSendTokenFailures(t *testing.T) {
 		fake := &scriptKfAPI{onToken: func(int) string { return `{"errcode":40013,"errmsg":"invalid corpid"}` }}
 		srv := httptest.NewServer(fake.handler())
 		defer srv.Close()
-		c := testChannel(t, srv.URL)
+		c, _ := testChannel(t, srv.URL)
 		err := c.Send(t.Context(), channels.OutboundMessage{Channel: "wxkf", MsgID: "1", UserID: "u", Text: "hi"})
 		if err == nil || !strings.Contains(err.Error(), "errcode 40013") {
 			t.Fatalf("gettoken rejection must surface, got %v", err)
@@ -452,7 +462,7 @@ func TestSendTokenFailures(t *testing.T) {
 		}}
 		srv := httptest.NewServer(fake.handler())
 		defer srv.Close()
-		c := testChannel(t, srv.URL)
+		c, _ := testChannel(t, srv.URL)
 		for i := 0; i < 2; i++ {
 			if err := c.Send(t.Context(), channels.OutboundMessage{
 				Channel: "wxkf", MsgID: fmt.Sprint(i), UserID: "oUSER1", Text: "hi",
@@ -465,7 +475,7 @@ func TestSendTokenFailures(t *testing.T) {
 		}
 	})
 	t.Run("unbuildable gettoken request", func(t *testing.T) {
-		c := testChannel(t, "://bad")
+		c, _ := testChannel(t, "://bad")
 		err := c.Send(t.Context(), channels.OutboundMessage{Channel: "wxkf", MsgID: "1", UserID: "u", Text: "hi"})
 		if err == nil {
 			t.Fatalf("unparseable API base must surface, got %v", err)
@@ -482,7 +492,7 @@ func TestSendPostMessageFailures(t *testing.T) {
 		fake := &scriptKfAPI{}
 		srv := httptest.NewServer(fake.handler())
 		defer srv.Close()
-		c := testChannel(t, srv.URL)
+		c, _ := testChannel(t, srv.URL)
 		if err := c.Send(t.Context(), channels.OutboundMessage{Channel: "wxkf", MsgID: "0", UserID: "oUSER1", Text: "warmup"}); err != nil {
 			t.Fatal(err)
 		}
@@ -497,7 +507,7 @@ func TestSendPostMessageFailures(t *testing.T) {
 		fake := &scriptKfAPI{}
 		srv := httptest.NewServer(fake.handler())
 		defer srv.Close()
-		c := testChannel(t, srv.URL)
+		c, _ := testChannel(t, srv.URL)
 		if err := c.Send(t.Context(), channels.OutboundMessage{Channel: "wxkf", MsgID: "0", UserID: "oUSER1", Text: "warmup"}); err != nil {
 			t.Fatal(err)
 		}
@@ -511,7 +521,7 @@ func TestSendPostMessageFailures(t *testing.T) {
 		fake := &scriptKfAPI{onSend: func(int) string { return `not-json` }}
 		srv := httptest.NewServer(fake.handler())
 		defer srv.Close()
-		c := testChannel(t, srv.URL)
+		c, _ := testChannel(t, srv.URL)
 		err := c.Send(t.Context(), channels.OutboundMessage{Channel: "wxkf", MsgID: "1", UserID: "oUSER1", Text: "hi"})
 		if err == nil || !strings.Contains(err.Error(), "send decode") {
 			t.Fatalf("send decode failure must surface, got %v", err)
@@ -529,7 +539,7 @@ func TestSendPostMessageFailures(t *testing.T) {
 		}
 		srv := httptest.NewServer(fake.handler())
 		defer srv.Close()
-		c := testChannel(t, srv.URL)
+		c, _ := testChannel(t, srv.URL)
 		err := c.Send(t.Context(), channels.OutboundMessage{Channel: "wxkf", MsgID: "1", UserID: "oUSER1", Text: "hi"})
 		if err == nil || !strings.Contains(err.Error(), "errcode 40001") {
 			t.Fatalf("failure of the refreshed token fetch must surface, got %v", err)
@@ -544,7 +554,7 @@ func TestSendPostMessageFailures(t *testing.T) {
 		}}
 		srv := httptest.NewServer(fake.handler())
 		defer srv.Close()
-		c := testChannel(t, srv.URL)
+		c, _ := testChannel(t, srv.URL)
 		err := c.Send(t.Context(), channels.OutboundMessage{Channel: "wxkf", MsgID: "1", UserID: "oUSER1", Text: "hi"})
 		if err == nil || !strings.Contains(err.Error(), "send decode") {
 			t.Fatalf("failure of the retried send must surface, got %v", err)
