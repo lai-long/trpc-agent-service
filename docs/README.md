@@ -385,7 +385,7 @@ PR 增量覆盖率 ≥85%。覆盖率是**只升不降的棘轮**，当前实测
 
 | 内容 | 位置 |
 |---|---|
-| **第一次使用：安装、跑通、查回复、建租户、排查** | `docs/tutorial.md` |
+| **第一次使用：10 章渐进式教程（跑通 → 查回复 → 建租户 → 审批 → 接 IM → 自定义工具与通道）+ 配置/排查/重置附录** | `docs/tutorial.md` |
 | 完整技术方案、选型论证、容量推算、协议细节 | `docs/design.md` |
 | 数据库 schema 基线 / 演示数据 | `deploy/db/init.sql`、`deploy/db/seed.sql` |
 | 增量 schema 迁移（约定、CI、接管老库） | `deploy/db/migrations/README.md`、`deploy/db/migrate.sh` |
