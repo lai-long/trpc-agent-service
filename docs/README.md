@@ -238,12 +238,20 @@ user_id、内容类型、reply_token），差异收敛在适配器内部：
 | 维度 | `wecom` 企微自建应用 | `wxkf` 微信客服 | `wecomws` 企微智能机器人 | `mock` |
 |---|---|---|---|---|
 | 连接方向 | IM 回调平台 | IM 回调平台 | **平台主动出站长连接** | 本地 HTTP |
-| 协议 | 加密 XML，AES-256-CBC + msg_signature（`wxbizmsgcrypt`） | 加密 JSON，同算法族、字段不同 | WS 帧，BotID/Secret 订阅鉴权 | 明文 JSON |
+| 协议 | 加密 XML，AES-256-CBC + msg_signature（`wxbizmsgcrypt`） | XML 事件回调 + `kf/sync_msg` 拉取（见下方实测状态） | WS 帧，BotID/Secret 订阅鉴权 | 明文 JSON |
 | 应答约束 | **5 秒内应答**，重推 ≤3 次 | 返回 200 即可，无业务时限 | 无（且无平台重推） | — |
-| 回复方式 | `message/send`（单聊）/`appchat/send`（群聊） | `kf/send_msg`，48h 窗口内 | `aibot_respond_msg`，**须透传回调 `req_id`** | 内存收件箱 |
+| 回复方式 | `message/send`（单聊）/`appchat/send`（群聊） | `kf/send_msg`，48h 窗口内 | `aibot_respond_msg` **stream** 类型，须透传回调 `req_id` | 内存收件箱 |
 | 会话形态 | 单聊 + 群聊 | 仅单聊 | 单聊 + 群聊 | 任意 |
 | 媒体 | 已支持（`media/get` → Artifact） | 仅 text（媒体是 follow-up） | 降级为占位文本 | — |
 | 启用条件 | 配 `TRPC_WECOM_CORP_ID` | 配 `TRPC_WXKF_CORP_ID`+`KF_ACCOUNT` | 配 `TRPC_WECOMWS_ADDR` | **默认关闭** |
+| **实测状态** | 未实测；协议与官方文档逐项核对无发现 | **未实测，且实现与官方协议不符**（见 §10 第 14 条） | **已端到端实测**（2026-09-07：订阅、心跳、收发、审批外链路均验证） | 实测（全链路） |
+
+> **实测状态说明**：`wecomws` 在真实企微智能机器人上完整走通（发现并修复了 5 个协议 bug：
+> 握手头大小写、订阅 ack 无 cmd、errcode 位置、心跳 req_id 前缀约定、回复必须是 stream 类型——
+> 明文 `text` 回复被平台以 errcode 40008 拒收）。`wecom` 的加解密、URL 验证、5s 应答、
+> `message/send`/`appchat/send`（均支持 markdown、内容 ≤2048B）、`media/get`、撤回事件
+> 逐项对照官方文档无发现，但**没有真实 corp 验证过**。`wxkf` 按官方文档核对后发现 inbound
+> 协议与实现假设不符，**当前实现收不到消息**，未实测。
 
 四类通道统一走「异步消费 + 主动发送」：LLM 生成 P95 远超企微 5s 应答时限，且被动回复一次回调只能回
 一条，覆盖不了分段与审批等多轮场景。
@@ -372,6 +380,12 @@ PR 增量覆盖率 ≥85%。覆盖率是**只升不降的棘轮**，当前实测
   MySQL/MongoDB/Qdrant/Milvus 未实现（Qdrant 仅接口预留）。
 - **通道**为 wecom/wxkf/wecomws/mock 四类，无 Telegram 与微信公众号；`wxkf` 仅处理 text，`wecomws`
   入站媒体降级为占位文本。
+- **通道实测状态**（2026-09-07）：`wecomws` 已在真实企微智能机器人上端到端实测（收发、心跳、审批）；
+  `mock` 全链路实测；`wecom` 未实测（协议逐项对照官方文档无发现，需真实 corp 验证）；`wxkf` **未实测
+  且 inbound 与官方协议不符**——官方协议是「XML 事件回调（`kf_msg_or_event`）+ `kf/sync_msg` 拉取
+  消息（`external_userid`、`next_cursor` 需持久化）」，当前实现假设「JSON 加密直推、解密即消息体
+  （`openid`/`text`）」，该形态不存在，**收不到任何消息**，需重写 inbound；出站 `kf/send_msg` 与
+  文档一致。协议细节见 `docs/guide.md` §3。
 - **出站发送密钥为通道级**：wecom/wxkf 发送侧 corpsecret 逐字段回退 env 全局配置（回调验签已按 binding
   隔离），同通道接多个 corp 时需补绑定级密钥；企微入站素材拉取仍用全局 token。
 - **预算窗口**为「首次使用后 48h 滑动窗」而非自然日，消息粒度前置拦截、run 中无中断点；Allow/Record

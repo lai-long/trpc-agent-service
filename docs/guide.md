@@ -128,6 +128,18 @@ Prometheus 在 <http://localhost:9090>，抓取配置是 `deploy/prometheus/prom
 
 **目标**：把消息来源从 mock 换成真实 IM。
 
+> **实测状态（2026-09-07）**：本节的 **wecomws（智能机器人 WebSocket）已在真实机器人上端到端实测**
+> ——订阅、心跳、收发、审批全链路验证通过。**wecom（自建应用 webhook）与 wxkf（微信客服）未实测**：
+> wecom 的协议逐项对照官方文档无发现，但需要公网 HTTPS 回调地址和真实 corp 才能验证；wxkf 的
+> inbound 实现与官方协议**不符**（官方是「XML 事件回调 + `kf/sync_msg` 拉取消息」，不是「JSON 加密
+> 直推消息体」），按当前代码**收不到任何消息**，接入前需先重写。
+>
+> 三个通道共有的经验教训（wecomws 实测踩出来的，另两个接入时值得先对照）：
+> 平台的协议细节和直觉经常不一致——WS 握手头对大小写敏感、ack 帧没有 `cmd` 字段、`errcode` 在帧顶层、
+> 心跳 `req_id` 必须带 `ping_` 前缀否则平台沉默、`aibot_respond_msg` 拒收 `text` 类型（必须
+> `stream`，errcode 40008）。接新通道时建议先用探针抓原始帧核对协议，再对照官方 SDK 源码，
+> 最后把测试替身改成和真实帧一致的形状。
+
 需要三样东西：**密钥文件**、**env 开关**、**公网 HTTPS 回调地址**。
 
 ```bash
@@ -156,6 +168,12 @@ TRPC_WECOM_AGENT_ID=1000002 \
 
 `TRPC_WXKF_CORP_ID` + `TRPC_WXKF_KF_ACCOUNT`，密钥文件默认名 `wxkf-token` / `wxkf-aeskey` / `wxkf-secret`。
 注意它**只处理 text 消息**（媒体是后续工作），且主动发送受 48 小时窗口限制。
+
+> **⚠️ 当前不可用，接入前需先修代码**：官方协议是「回调只推一个 XML 事件
+> （`MsgType=event`、`Event=kf_msg_or_event`，带 `Token`/`OpenKfId`），消息本体要用
+> `kf/sync_msg` 接口带 cursor 主动拉取（用户 ID 是 `external_userid`，`next_cursor` 必须持久化）」；
+> 而当前实现假设「JSON 加密直推、解密即消息体」，该协议形态不存在，**收不到任何消息**
+> （出站 `kf/send_msg` 本身与文档一致）。详见 `docs/README.md` §10「通道实测状态」。
 
 ### 企微智能机器人（wecomws，免公网回调）
 
