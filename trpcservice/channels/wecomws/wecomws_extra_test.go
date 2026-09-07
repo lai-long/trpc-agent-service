@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -603,5 +604,60 @@ func TestSendWithoutLiveConnection(t *testing.T) {
 	err = bc.write(context.Background(), envelope{Cmd: cmdRespond, Body: json.RawMessage(`{oops`)}, 0)
 	if err == nil {
 		t.Fatal("an unserializable frame must fail to send")
+	}
+}
+
+// The WeCom gateway matches the handshake header names case-sensitively, so
+// the transport's rewrite is the difference between a 101 and a 404. The
+// assertions read the raw request: a Go HTTP server canonicalizes incoming
+// header names, which would hide the very thing under test.
+func TestStandardCaseTransportRewritesHandshakeHeaders(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	raw := make(chan string, 1)
+	go func() {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		_ = c.SetDeadline(time.Now().Add(5 * time.Second))
+		b := make([]byte, 4096)
+		n, _ := c.Read(b)
+		raw <- string(b[:n])
+		// Any response will do; without one the client sees EOF.
+		_, _ = c.Write([]byte("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"))
+	}()
+
+	req, err := http.NewRequest(http.MethodGet, "http://"+ln.Addr().String(), nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	// Header.Set is what coder/websocket uses; Go canonicalizes the name.
+	req.Header.Set("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+	req.Header.Set("Sec-WebSocket-Version", "13")
+	if _, ok := req.Header["Sec-Websocket-Key"]; !ok {
+		t.Fatalf("precondition: Go must canonicalize to Sec-Websocket-Key, got %v", req.Header)
+	}
+
+	tr := standardCaseTransport{&http.Transport{DisableKeepAlives: true}}
+	resp, err := tr.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("round trip: %v", err)
+	}
+	resp.Body.Close()
+
+	got := <-raw
+	for _, want := range []string{"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==", "Sec-WebSocket-Version: 13"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("request must carry %q, got:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "Sec-Websocket-") {
+		t.Errorf("canonical spelling must not reach the server, got:\n%s", got)
 	}
 }

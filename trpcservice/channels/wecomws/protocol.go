@@ -30,9 +30,16 @@ const (
 // envelope is the outer frame shared by every command: a cmd, the headers
 // carrying the request id that correlates a response (or a reply) to its
 // request (or callback), and the command-specific body.
+//
+// Cmd is empty on an ack: the platform answers aibot_subscribe with
+// {"headers":...,"errcode":0,"errmsg":"ok"} and correlates it by req_id.
+// ErrCode/ErrMsg are the ack's top-level result — command bodies nest their
+// own errcode, so both shapes have to be read.
 type envelope struct {
-	Cmd     string          `json:"cmd"`
+	Cmd     string          `json:"cmd,omitempty"`
 	Headers frameHeaders    `json:"headers,omitempty"`
+	ErrCode int             `json:"errcode,omitempty"`
+	ErrMsg  string          `json:"errmsg,omitempty"`
 	Body    json.RawMessage `json:"body,omitempty"`
 }
 

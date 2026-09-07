@@ -58,6 +58,10 @@ type Channel struct {
 	segment        int
 	resyncInterval time.Duration
 
+	// httpClient carries the handshake header fix every dial needs; see
+	// standardCaseTransport.
+	httpClient *http.Client
+
 	// Connection timing knobs (reconnect 1s ×2 cap 60s; platform kick
 	// restarts at 5s; subscribe rejection cap 5min; inbound retry 1s ×2
 	// cap 30s).
@@ -94,6 +98,33 @@ func WithResyncInterval(d time.Duration) Option {
 	return func(c *Channel) { c.resyncInterval = d }
 }
 
+// wsHeaderCase maps Go's canonical spelling of the WebSocket handshake
+// headers back to the spelling the platform expects.
+var wsHeaderCase = map[string]string{
+	"Sec-Websocket-Key":      "Sec-WebSocket-Key",
+	"Sec-Websocket-Version":  "Sec-WebSocket-Version",
+	"Sec-Websocket-Protocol": "Sec-WebSocket-Protocol",
+}
+
+// standardCaseTransport rewrites the WebSocket handshake headers on the way
+// out. net/http canonicalizes header names, so a name set as
+// "Sec-WebSocket-Key" goes on the wire as "Sec-Websocket-Key" — and the
+// WeCom gateway matches these two names case-sensitively, answering the
+// canonical spelling with 404 instead of the 101 upgrade. The rewrite has to
+// sit in the RoundTripper: coder/websocket sets the headers with
+// Header.Set inside Dial, which re-canonicalizes them.
+type standardCaseTransport struct{ base http.RoundTripper }
+
+func (t standardCaseTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	for from, to := range wsHeaderCase {
+		if v, ok := r.Header[from]; ok {
+			delete(r.Header, from)
+			r.Header[to] = v
+		}
+	}
+	return t.base.RoundTrip(r)
+}
+
 // New creates the channel; connections are only dialed by Start.
 func New(secret config.SecretResolver, opts ...Option) (*Channel, error) {
 	if secret == nil {
@@ -112,6 +143,7 @@ func New(secret config.SecretResolver, opts ...Option) (*Channel, error) {
 		inboundRetryCap:  30 * time.Second,
 		subscribeTimeout: 10 * time.Second,
 		writeTimeout:     10 * time.Second,
+		httpClient:       &http.Client{Transport: standardCaseTransport{http.DefaultTransport}},
 	}
 	for _, opt := range opts {
 		opt(c)

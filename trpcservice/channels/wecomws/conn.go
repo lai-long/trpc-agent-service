@@ -116,7 +116,8 @@ func (c *botConn) serve(ctx context.Context, h channels.Handler) error {
 	if err != nil {
 		return fmt.Errorf("wecomws: resolve bot secret: %w", err)
 	}
-	ws, _, err := websocket.Dial(ctx, c.parent.addr, nil)
+	ws, _, err := websocket.Dial(ctx, c.parent.addr,
+		&websocket.DialOptions{HTTPClient: c.parent.httpClient})
 	if err != nil {
 		return fmt.Errorf("wecomws: dial: %w", err)
 	}
@@ -154,10 +155,16 @@ func (c *botConn) serve(ctx context.Context, h channels.Handler) error {
 		}
 		switch {
 		case env.Headers.ReqID == subReqID || env.Cmd == cmdSubscribe:
-			var ack errcodeBody
+			// The platform reports the result at the top level of the ack;
+			// a body errcode (the shape some bodies use) wins when present.
+			ack := errcodeBody{ErrCode: env.ErrCode, ErrMsg: env.ErrMsg}
 			if len(env.Body) > 0 {
-				if uerr := json.Unmarshal(env.Body, &ack); uerr != nil {
+				var b errcodeBody
+				if uerr := json.Unmarshal(env.Body, &b); uerr != nil {
 					return fmt.Errorf("wecomws: subscribe ack body: %w", uerr)
+				}
+				if b.ErrCode != 0 {
+					ack = b
 				}
 			}
 			if ack.ErrCode != 0 {
@@ -303,6 +310,9 @@ func (c *botConn) readLoop(ctx context.Context, ws *websocket.Conn, frames chan<
 			return err
 		}
 		switch env.Cmd {
+		case "":
+			// An ack to one of our own requests (see readEnvelope):
+			// correlated by req_id at the sender, nothing to dispatch.
 		case cmdPong:
 			c.mu.Lock()
 			if env.Headers.ReqID != "" && env.Headers.ReqID == c.pingOut {
@@ -536,7 +546,10 @@ func readEnvelope(ctx context.Context, ws *websocket.Conn) (envelope, error) {
 	if err := json.Unmarshal(data, &env); err != nil {
 		return envelope{}, fmt.Errorf("%w: %v", errBadFrame, err)
 	}
-	if env.Cmd == "" {
+	// An ack carries no cmd: the platform answers aibot_subscribe with just
+	// headers.req_id, errcode and errmsg, and matches it to the request by
+	// req_id. A frame is only unroutable when it has neither.
+	if env.Cmd == "" && env.Headers.ReqID == "" {
 		return envelope{}, fmt.Errorf("%w: missing cmd", errBadFrame)
 	}
 	return env, nil

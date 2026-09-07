@@ -190,9 +190,9 @@ func (c *fakeConn) run(botID, secret string, f *fakePlatform) {
 			_ = json.Unmarshal(env.Body, &body)
 			if body.BotID != botID || body.Secret != secret {
 				_ = write(envelope{
-					Cmd:     cmdSubscribe,
 					Headers: env.Headers,
-					Body:    json.RawMessage(`{"errcode":40001,"errmsg":"invalid bot or secret"}`),
+					ErrCode: 40001,
+					ErrMsg:  "invalid bot or secret",
 				})
 				continue
 			}
@@ -200,14 +200,13 @@ func (c *fakeConn) run(botID, secret string, f *fakePlatform) {
 				// A corrupt ack body — a marshaling-valid envelope whose body
 				// cannot unmarshal into the ack shape. The client must drop
 				// the connection and resubscribe instead of trusting it.
-				c.PushRaw(fmt.Sprintf(`{"cmd":%q,"headers":{"req_id":%q},"body":42}`, cmdSubscribe, env.Headers.ReqID))
+				c.PushRaw(fmt.Sprintf(`{"headers":{"req_id":%q},"body":42}`, env.Headers.ReqID))
 				continue
 			}
 			f.totalAcks.Add(1)
 			_ = write(envelope{
-				Cmd:     cmdSubscribe,
 				Headers: env.Headers,
-				Body:    json.RawMessage(`{"errcode":0,"errmsg":"ok"}`),
+				ErrMsg:  "ok",
 			})
 		case cmdPing:
 			c.mu.Lock()
@@ -282,9 +281,8 @@ func (c *fakeConn) releaseAcks() {
 	c.mu.Unlock()
 	for _, env := range held {
 		data, err := json.Marshal(envelope{
-			Cmd:     cmdSubscribe,
 			Headers: env.Headers,
-			Body:    json.RawMessage(`{"errcode":0,"errmsg":"ok"}`),
+			ErrMsg:  "ok",
 		})
 		if err != nil {
 			return
