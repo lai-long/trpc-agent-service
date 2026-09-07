@@ -1,305 +1,25 @@
-# 上手教程
+# 使用与开发指南
 
-跟着本教程走完，你会从「克隆仓库」到「在平台上挂一个自己写的工具、接一个自己写的 IM 通道」。
-它采用**渐进式**结构：每一章只解决一件事，最后都有一个可以立刻验证的产物，读不下去随时能停。
+这份文档承接 [`快速开始`](./quickstart.md)——那里只带你跑通第一条消息、看到回复、建一个自己的租户。
+跑通之后要做的「深一点」的事都在这里，按需查阅，不必从头读到尾。
 
----
-
-## 这是什么
-
-一个**多租户的 IM Agent 平台**：企业微信 / 微信客服里的一句 `@机器人`，经过验签、限流、去重入队，
-由无状态的 Worker 跑 tRPC-Agent-Go 的 Runner（含工具调用、记忆、知识库），再异步把回复推回 IM。
-同一套进程通过 `channel_binding` 行区分租户，租户之间会话、记忆、工具权限、审计互相不可见。
-
-一句话概括消息的一生：**同步应答、异步消费**。IM 回调立刻返回，真正的回复几十秒后由 Worker 算完再下发。
-
-## 最短路径：先跑起来
-
-只要 4 步，1 分钟内能看到第一条消息被接受（**前提**：Docker 和一个 OpenAI 兼容的 API key）。
-
-```bash
-git clone https://github.com/liuzengh/trpc-agent-service.git
-cd trpc-agent-service
-
-# ① 起依赖：pgvector(PG16) / redis(宿主 6380) / minio / jaeger / prometheus
-docker compose up -d
-
-# ② 放模型密钥（文件名必须叫这个，见附录 A 的引用机制）
-mkdir -p data/secrets
-echo -n 'sk-你的模型APIKey' > data/secrets/deepseek-apikey
-
-# ③ 构建 + 启动（all-in-one：单进程兼任 gateway + worker + admin）
-./build.sh
-TRPC_ADMIN_TOKEN=dev-insecure TRPC_MOCK_CHANNEL=true \
-TRPC_METRICS_ADDR=127.0.0.1:8083 TRPC_SESSION_BACKEND=postgres ./start.sh
-
-# ④ 发一条消息
-curl -X POST 127.0.0.1:8080/mock/callback -H 'Content-Type: application/json' \
-  -d '{"msg_id":"demo-001","user_id":"u-demo","text":"用一句话说明什么是幂等"}'
-# → {"reply":"","status":"accepted"}
-```
-
-返回 `accepted` 且 `reply` 为空**就是成功**——回复走异步链路。想看到正文，继续第 2 章。
-
-## 学习路线
-
-| 章节 | 你会得到什么 | 依赖 |
-|---|---|---|
-| [1. 跑通第一条消息](#1-跑通第一条消息) | 完整平台在跑，消息被接受 | 最短路径 |
-| [2. 看到 Agent 的回复](#2-看到-agent-的回复) | 用 SQL / 审计 / 日志三种方式确认回复真的产生了 | 1 |
-| [3. 这条消息走过了什么](#3-这条消息走过了什么) | 一个能自己排查问题的心智模型 | 1 |
-| [4. 建你自己的租户、应用和绑定](#4-建你自己的租户应用和绑定) | 一个属于你的租户，用专属回调路径对话 | 1 |
-| [5. 危险工具二次确认](#5-危险工具二次确认) | 完整走一遍带内审批的两轮对话 | 4 |
-| [6. 观测：指标、队列、追踪](#6-观测指标队列追踪) | 定位「消息没回复」的第一手手段 | 1 |
-| [7. 接真实企业微信](#7-接真实企业微信) | 真实 IM 通道收发 | 4 |
-| [8. 写一个自己的工具](#8-写一个自己的工具) | 一个被模型真实调用的业务工具 | 4 |
-| [9. 接一个新的 IM 通道](#9-接一个新的-im-通道) | 一个自定义通道出现在绑定列表里 | 4 |
-| [10. 像生产那样按角色拆进程](#10-像生产那样按角色拆进程) | 三进程部署，体会 worker 无状态 | 1 |
-
-**附录**是参考手册，用到了再查：[A 配置与密钥](#附录-a-配置与密钥机制) ·
-[B 故障排查](#附录-b-故障排查) · [C 重置开发环境](#附录-c-重置开发环境) · [D 日常命令](#附录-d-日常命令)。
-
-## 前置条件
-
-| 需要 | 版本 / 说明 | 检查命令 |
-|---|---|---|
-| Go | 1.27（见 `go.mod` 的 `go` 指令） | `go version` |
-| Docker + Compose 插件 | 起 5 个依赖容器 | `docker compose version` |
-| 一个 OpenAI 兼容的模型 API key | 默认对接 DeepSeek | — |
-| 空闲端口 | 8080 / 8081 / 8082 / 5432 / 6380 / 9000 / 9001 | `ss -ltnp \| grep -E ':(8080\|8081\|8082\|8083)\b'` |
-
----
-
-## 1. 跑通第一条消息
-
-**目标**：平台在你本机跑起来，并接受第一条 IM 消息。
-
-最短路径里的 4 步就是全部内容，这里只解释**为什么那四个环境变量是必需的**——它们都是
-「安全默认关闭」，不设不是走默认值，而是功能被关掉或进程拒绝启动。
-
-| 变量 | 不设会怎样 |
+| 章节 | 什么时候来看 |
 |---|---|
-| `TRPC_ADMIN_TOKEN=dev-insecure` | **进程拒绝启动**（fail-closed）。`dev-insecure` 是哨兵值，只在绑 loopback 时被接受 |
-| `TRPC_MOCK_CHANNEL=true` | mock 通道不挂载。它默认关，因为它是**无鉴权的消息注入器**，生产绝不能开 |
-| `TRPC_METRICS_ADDR=127.0.0.1:8083` | 默认 8082；被占用时服务不崩，只是 metrics 关闭并打一条 WARN |
-| `TRPC_SESSION_BACKEND=postgres` | 默认 `redis`，那样 PG 的 `session`/`session_event` 表是空的，你**没法用 SQL 查对话**（见第 2 章） |
+| [1. 危险工具二次确认](#1-危险工具二次确认) | 想让模型在调用危险工具前先问用户 |
+| [2. 观测：指标、队列、追踪](#2-观测指标队列追踪) | 消息没回复，要定位原因 |
+| [3. 接真实企业微信](#3-接真实企业微信) | 把消息来源从 mock 换成真实 IM |
+| [4. 写一个自己的工具](#4-写一个自己的工具) | 给 Agent 挂一个业务工具 |
+| [5. 接一个新的 IM 通道](#5-接一个新的-im-通道) | 适配一个平台还没支持的 IM |
+| [6. 像生产那样按角色拆进程](#6-像生产那样按角色拆进程) | 从 all-in-one 走向分角色部署 |
 
-**验证**：`curl` 返回 `{"reply":"","status":"accepted"}`，且 `data/trpc-service.log` 里出现
-`gateway listening {"addr":":8080"}`。
-
-> **你可能会撞上**：端口 8082 常被桌面应用监听。被占时只是没指标，换成 8083 即可：
-> `ss -ltnp | grep -E ':(8080|8081|8082|8083)\b'` 看看是谁占的。
-
-停止服务：`./stop.sh`。
-
-→ 下一步：[第 2 章](#2-看到-agent-的回复)：把回复的正文挖出来。
+**参考手册**：[§7 Admin API 速查](#7-admin-api-速查) ·
+[附录 A 配置与密钥机制](#附录-a-配置与密钥机制) ·
+[附录 B 故障排查](#附录-b-故障排查) · [附录 C 重置开发环境](#附录-c-重置开发环境) ·
+[附录 D 日常命令](#附录-d-日常命令)。
 
 ---
 
-## 2. 看到 Agent 的回复
-
-**目标**：确认模型真的生成了回复，而不是只被队列吞掉。
-
-这是第一次使用最容易困惑的地方：**mock 通道的 `Send` 只把回复记在内存里，日志只打长度不打正文**
-（`channels/mock/mock.go:128`）。所以有三种看法，按推荐度排序。
-
-### ① 查 PostgreSQL（推荐，能看到正文）
-
-前提是启动时带了 `TRPC_SESSION_BACKEND=postgres`。事件的 JSON 是 OpenAI 兼容序列化，正文路径是
-`event->'choices'->0->'message'->>'content'`（**不是** `content[0].text`）：
-
-```bash
-docker compose exec -T postgres psql -U trpc -d trpc -c "
-SELECT e.event_seq,
-       e.event->>'author'                                     AS 角色,
-       left(e.event->'choices'->0->'message'->>'content', 80) AS 内容,
-       e.event->'usage'->>'total_tokens'                      AS tokens
-FROM session_event e JOIN session s ON s.id = e.session_id
-WHERE s.session_key = 'dm:mock:u-demo'
-ORDER BY e.event_seq"
-```
-
-实测输出：
-
-```
- event_seq |   角色    |                          内容                           | tokens
------------+-----------+-------------------------------------------------------+--------
-         1 | user      | 用一句话说明什么是幂等                                  |
-         2 | assistant | 幂等是指一个操作无论执行一次还是执行多次，产生的结果都相同… | 3016
-```
-
-事件 JSON 里还有 `usage.prompt_tokens_details.cached_tokens`、`completion_tokens_details.reasoning_tokens`、
-`usage.timing_info.time_to_first_token`、`choices[0].message.reasoning_content`（思维链）、`model`、`author`、`branch`。
-
-**`session_key` 怎么来的**：`channels.SessionKey()` 定义为单聊 `dm:{channel}:{user_id}`、群聊
-`group:{channel}:{chat_id}`。所以 `user_id=u-demo` 走 mock 单聊就是 `dm:mock:u-demo`。
-
-### ② 查审计（看得到延迟/token/成本/trace，看不到正文）
-
-```bash
-curl -s -H "Authorization: Bearer dev-insecure" \
-  "127.0.0.1:8081/admin/audit?limit=5" | python3 -m json.tool
-```
-
-实测（节选）：
-
-```json
-{"channel":"mock","decision":"allow","latency_ms":1227,
- "tenant_id":"00000000-0000-0000-0000-000000000001",
- "trace_id":"04fa8fa09efaedb47114ba13a733072e","user_id":"u-demo"}
-```
-
-### ③ 查日志（只确认链路走通）
-
-```bash
-grep 'reply sent' data/trpc-service.log | tail
-# reply sent {"channel":"mock","session_key":"dm:mock:u-demo",
-#             "trace_id":"04fa8fa0…","text_len":101}
-```
-
-> **你可能会撞上**：PG 里查不到会话。原因是 `TRPC_SESSION_BACKEND` 默认 `redis`，会话存在 Redis 里，
-> 键形如 `hashidx:evtdata:{app_id}:{user_id}:{session_key}`，PG 的会话表保持为空。
-> **这不是 bug，是后端选择**——想在 PG 里查就切 `postgres`。
-
-**验证**：上面 ①②③ 任意一种能看到内容或审计行。
-
-→ 下一步：[第 3 章](#3-这条消息走过了什么)：理解为什么回复是异步的。
-
----
-
-## 3. 这条消息走过了什么
-
-**目标**：建立一个能自己排查问题的心智模型。
-
-```
-curl POST /mock/callback
-   ↓  mock 适配器归一化（channel/msg_id/session_key/user_id/text）
-Gateway :8080
-   ↓  按 webhook_path 查 channel_binding → 得到 tenant_id / app_id
-   ↓  租户令牌桶限流 → SET dedup:... NX EX 86400 去重 → XLEN 背压检查
-   ↓  XADD stream:inbound（消息体带 W3C traceparent）
-   ↓  立即返回 {"status":"accepted"}
-Redis Stream（消费组 workers）
-   ↓
-Worker
-   ↓  查 done: 幂等标记 → SET lock:sess:{app}:{session} NX EX 10（watchdog 续期）
-   ↓  加载 memory / summary
-   ↓  Guarded 治理链前置：白名单 → 审批应答 → 敏感词 → token 预算
-   ↓  Assembler 按 app 取/建 Runner → runner.Runner.Run（llmagent 调 LLM）
-   ↓  治理链后置：输出脱敏、拒绝词
-   ↓  追加 session_event → 更新 session.state → 写 audit_log
-   ↓  写 done: 标记 → XADD stream:outbound → XACK
-Sender（消费组 senders）
-   ↓  查 sent: 幂等 → 令牌桶限速 → 超 2048B 分段
-   ↓  调 channel.Send
-```
-
-**为什么必须异步**：LLM 生成 P95 远超企微 5 秒的应答时限；而且被动回复一次回调只能回一条，
-覆盖不了分段和审批这类多轮场景。
-
-关键角色对应的进程/端口：
-
-| 角色 | 端口 | 职责 |
-|---|---|---|
-| gateway | `:8080` | 接 IM 回调，验签/去重/限流/入队。**公网可达的唯一入口** |
-| worker | — | 消费队列，跑 Runner，写存储 |
-| admin | `127.0.0.1:8081` | `/admin/*` 管理 API，Bearer token 鉴权 |
-| metrics | `127.0.0.1:8082`（教程用 8083） | `/metrics`，Prometheus 与探针抓取 |
-
-三个口彼此分离本身是安全设计：Admin 和 metrics 只绑内网，回调口靠验签而非 token。
-
-`all-in-one`（`serve` 或 `serve all`）把四者放进一个进程，方便本地调试；生产按角色拆开，见第 10 章。
-
-→ 下一步：[第 4 章](#4-建你自己的租户应用和绑定)：建一套属于你的配置。
-（想先知道消息卡住时怎么查，可以跳到第 6 章。）
-
----
-
-## 4. 建你自己的租户、应用和绑定
-
-**目标**：从零建一个租户，用**它自己的回调路径**发出一条消息，不需要重启服务。
-
-`seed.sql` 已经灌了一个演示租户（`demo-tenant`）+ 一个已发布应用（`assistant`）+ 几条绑定，
-所以第 1 章能直接发消息。下面是从零建一套的完整流程，**全部实测通过**。
-
-```bash
-H='Authorization: Bearer dev-insecure'
-A=127.0.0.1:8081
-
-# ① 建租户（策略字段都可省略，省略即走平台默认）
-T=$(curl -s -X POST $A/admin/tenants -H "$H" -H 'Content-Type: application/json' \
-     -d '{"name":"acme-demo"}' | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
-echo "tenant_id = $T"
-
-# ② 建应用（新建即 draft，未发布不接客）
-APP=$(curl -s -X POST $A/admin/tenants/$T/apps -H "$H" -H 'Content-Type: application/json' \
-     -d '{"name":"support","agent_type":"llm","config":{
-            "prompt":"你是 ACME 的客服助手，回答简洁。",
-            "tools":{"allow":["get_weather","delete_user_data"]}}}' \
-     | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
-echo "app_id = $APP"
-
-# ③ 发布（原子切换：同租户同名应用最多一个 published）
-curl -s -X POST $A/admin/apps/$APP/publish -H "$H" -H 'Content-Type: application/json' \
-     -d '{"version":1}'
-# → {"published":"f365b692-cc9d-4ed5-a52d-692fc7b4026d"}
-
-# ④ 建渠道绑定（webhook_path 留空 → 自动填充为 /callback/{channel}/{binding_id}）
-curl -s -X POST $A/admin/apps/$APP/bindings -H "$H" -H 'Content-Type: application/json' \
-     -d '{"channel":"mock"}' | python3 -m json.tool
-# → {"id":"cb2fa915-…","webhook_path":"/callback/mock/cb2fa915-…"}
-
-# ⑤ 立刻用新路径发消息——不需要重启服务
-B=cb2fa915-ecab-4c39-be6e-7584367ca161
-curl -s -X POST 127.0.0.1:8080/callback/mock/$B -H 'Content-Type: application/json' \
-     -d '{"msg_id":"tut-001","user_id":"u-acme","text":"你们支持哪些渠道？一句话"}'
-# → {"reply":"","status":"accepted"}
-```
-
-**验证**：新绑定**立即可达**（配置快照 TTL 30s + Redis pub/sub 失效广播，Admin 写操作会主动广播）；
-会话落在新租户的 app 命名空间下；审计记录的 `tenant_id` 正是新建的那个。
-
-### 请求体字段速查
-
-| 接口 | 必填 | 可选 |
-|---|---|---|
-| `POST /admin/tenants` | `name` | `model_config` `tool_policy` `audit_policy` `guardrail_policy` `rate_policy` `storage_config` |
-| `POST /admin/tenants/{id}/apps` | `name` `agent_type` `config` | — |
-| `POST /admin/apps/{id}/publish` | `version` | — |
-| `POST /admin/apps/{id}/bindings` | `channel` | `webhook_path` `token_ref` `aeskey_ref` `config` |
-| `POST /admin/tenants/{id}/storage-migrations` | `resource` `to_backend` | — |
-| `POST /admin/apps/{id}/knowledge/documents` | `name` `content` | — |
-
-### 会被 400 拒掉的写法（都是有意的，不是 bug）
-
-- `webhook_path` 填一个平台没挂载的路径 → 400。否则绑定建成功、列表里也正常，但 IM 每次回调都在
-  mux 上 404，**是个静默黑洞**。留空让系统自动填充最安全。
-- `channel=mock` 却填 `webhook_path=/mock/callback` → 400。legacy 路径是启动时用 env 全局凭据挂载的，
-  绑定行自带凭据却挂在那条路径上会「看起来权威、实际验签从不读它」。
-- `config` 里出现未知字段 → 400。`config` 会原样写进审计明细，一个未被通道识别的键（比如明文
-  `secret`）会**既进审计又不生效**。
-- `channel=wecomws` 但 `config` 缺 `bot_id` 或 `secret_ref`，或 `webhook_path` 不匹配
-  `^/wecomws/[A-Za-z0-9_-]+$` → 400。
-- 密钥字段只收**引用名**（如 `wecom-secret`），不要填明文。
-
-### 其他常用调用
-
-```bash
-curl -s -H "$H" $A/admin/tenants                        # 列租户
-curl -s -H "$H" $A/admin/tenants/$T                     # 租户详情
-curl -s -H "$H" $A/admin/tenants/$T/apps                # 列应用
-curl -s -X POST $A/admin/apps/$APP/rollback -H "$H" -H 'Content-Type: application/json' -d '{"version":1}'
-curl -s -H "$H" "$A/admin/audit?tenant_id=$T&decision=deny"
-curl -s -X DELETE $A/admin/apps/$APP/bindings/$B -H "$H"
-```
-
-不带 token → **401**；未挂载的回调路径 → **404**；同 `msg_id` 重发 → `{"status":"duplicate"}`。
-
-→ 下一步：[第 5 章](#5-危险工具二次确认)：让模型在动手前先问一句。
-
----
-
-## 5. 危险工具二次确认
+## 1. 危险工具二次确认
 
 **目标**：完整走一遍「模型想调危险工具 → 平台拦下并问用户 → 用户确认 → 工具放行」。
 
@@ -362,11 +82,11 @@ curl -s -X POST 127.0.0.1:8080/callback/mock/$B -H 'Content-Type: application/js
 > 治理链第 3 步直接返回回复、不进 Runner（`agent/guardrail.go:126` 的注释就是这个意思）。
 > 副作用是模型下一轮也看不到「确认」这句话。这一轮只在 `audit_log`（`decision=allow`）和日志里可见。
 
-→ 下一步：[第 8 章](#8-写一个自己的工具)：把你自己的危险工具接进来。
+→ 下一步：[§4 写一个自己的工具](#4-写一个自己的工具)：把你自己的危险工具接进来。
 
 ---
 
-## 6. 观测：指标、队列、追踪
+## 2. 观测：指标、队列、追踪
 
 **目标**：掌握「消息没回复」时第一手该看什么。
 
@@ -400,11 +120,11 @@ UI 在 <http://localhost:16686>。这个变量**不是必需的**——不设也
 Prometheus 在 <http://localhost:9090>，抓取配置是 `deploy/prometheus/prometheus.yml`
 （默认抓 `host.docker.internal:8082`；你若改了 metrics 端口，这里也要跟着改）。
 
-→ 下一步：[第 7 章](#7-接真实企业微信) 或 [第 10 章](#10-像生产那样按角色拆进程)。
+→ 下一步：[§3 接真实企业微信](#3-接真实企业微信) 或 [§6 按角色拆进程](#6-像生产那样按角色拆进程)。
 
 ---
 
-## 7. 接真实企业微信
+## 3. 接真实企业微信
 
 **目标**：把消息来源从 mock 换成真实 IM。
 
@@ -461,11 +181,11 @@ echo -n '你的BotSecret' > data/secrets/wecomws-bot-secret
 
 四类通道的差异（连接方向、应答时限、媒体能力等）见 [`docs/README.md` §6](./README.md)。
 
-→ 下一步：[第 9 章](#9-接一个新的-im-通道)：照着现有适配器写一个自己的通道。
+→ 下一步：[§5 接一个新的 IM 通道](#5-接一个新的-im-通道)：照着现有适配器写一个自己的通道。
 
 ---
 
-## 8. 写一个自己的工具
+## 4. 写一个自己的工具
 
 **目标**：新增一个业务工具，让模型在对话中真实调用它，并受租户白名单约束。
 
@@ -526,18 +246,18 @@ curl -s -X POST $A/admin/tenants/$T/apps -H "$H" -H 'Content-Type: application/j
          "tools":{"allow":["query_order","refund_order"]}}}'
 ```
 
-**验证**：重新构建启动 → 发布应用 → 发一句「查一下订单 A-1001 到哪了」→ 用第 2 章的 SQL 看
-`session_event`，会出现工具调用与结果事件；再说「给它退款」会先被拦下走第 5 章的审批流程。
+**验证**：重新构建启动 → 发布应用 → 发一句「查一下订单 A-1001 到哪了」→ 用[快速开始](./quickstart.md)第 2 章的 SQL 看
+`session_event`，会出现工具调用与结果事件；再说「给它退款」会先被拦下走[§1 危险工具二次确认](#1-危险工具二次确认)的流程。
 
 > **注意**：工具名一旦被写进租户白名单就成了配置的一部分。改名或删除工具时，老租户的
 > `allow` 里会留下一个不存在的名字——`Registry.Allowed` 对未知名字是**忽略**而不是报错，
 > 所以表现为「这个工具突然消失了」，而不是报错。
 
-→ 下一步：[第 9 章](#9-接一个新的-im-通道)。
+→ 下一步：[§5 接一个新的 IM 通道](#5-接一个新的-im-通道)。
 
 ---
 
-## 9. 接一个新的 IM 通道
+## 5. 接一个新的 IM 通道
 
 **目标**：写一个自定义通道，让它出现在绑定列表里并能收发消息。
 
@@ -629,11 +349,11 @@ curl -s -X POST $A/admin/apps/$APP/bindings -H "$H" -H 'Content-Type: applicatio
 >    出站错误记得过一遍 `channels.ScrubError`，它会把 URL 里的 `access_token` 打码——
 >    字段级日志脱敏看不见字符串内部的东西。
 
-→ 下一步：[第 10 章](#10-像生产那样按角色拆进程)。
+→ 下一步：[§6 按角色拆进程](#6-像生产那样按角色拆进程)。
 
 ---
 
-## 10. 像生产那样按角色拆进程
+## 6. 像生产那样按角色拆进程
 
 **目标**：三进程部署，并亲身体会「worker 无状态」这件事。
 
@@ -651,6 +371,49 @@ TRPC_ADMIN_TOKEN=dev-insecure                        ./bin/trpc-service serve ad
 
 生产部署（Deployment / HPA / Ingress / db-init Job / Secret 挂载）见
 [`deploy/k8s/README.md`](../deploy/k8s/README.md)。
+
+---
+
+## 7. Admin API 速查
+
+建租户 / 应用 / 绑定的请求体字段：
+
+| 接口 | 必填 | 可选 |
+|---|---|---|
+| `POST /admin/tenants` | `name` | `model_config` `tool_policy` `audit_policy` `guardrail_policy` `rate_policy` `storage_config` |
+| `POST /admin/tenants/{id}/apps` | `name` `agent_type` `config` | — |
+| `POST /admin/apps/{id}/publish` | `version` | — |
+| `POST /admin/apps/{id}/bindings` | `channel` | `webhook_path` `token_ref` `aeskey_ref` `config` |
+| `POST /admin/tenants/{id}/storage-migrations` | `resource` `to_backend` | — |
+| `POST /admin/apps/{id}/knowledge/documents` | `name` `content` | — |
+
+### 会被 400 拒掉的写法（都是有意的，不是 bug）
+
+- `webhook_path` 填一个平台没挂载的路径 → 400。否则绑定建成功、列表里也正常，但 IM 每次回调都在
+  mux 上 404，**是个静默黑洞**。留空让系统自动填充最安全。
+- `channel=mock` 却填 `webhook_path=/mock/callback` → 400。legacy 路径是启动时用 env 全局凭据挂载的，
+  绑定行自带凭据却挂在那条路径上会「看起来权威、实际验签从不读它」。
+- `config` 里出现未知字段 → 400。`config` 会原样写进审计明细，一个未被通道识别的键（比如明文
+  `secret`）会**既进审计又不生效**。
+- `channel=wecomws` 但 `config` 缺 `bot_id` 或 `secret_ref`，或 `webhook_path` 不匹配
+  `^/wecomws/[A-Za-z0-9_-]+$` → 400。
+- 密钥字段只收**引用名**（如 `wecom-secret`），不要填明文。
+
+### 其他常用调用
+
+```bash
+H='Authorization: Bearer dev-insecure'
+A=127.0.0.1:8081
+
+curl -s -H "$H" $A/admin/tenants                        # 列租户
+curl -s -H "$H" $A/admin/tenants/$T                     # 租户详情
+curl -s -H "$H" $A/admin/tenants/$T/apps                # 列应用
+curl -s -X POST $A/admin/apps/$APP/rollback -H "$H" -H 'Content-Type: application/json' -d '{"version":1}'
+curl -s -H "$H" "$A/admin/audit?tenant_id=$T&decision=deny"
+curl -s -X DELETE $A/admin/apps/$APP/bindings/$B -H "$H"
+```
+
+不带 token → **401**；未挂载的回调路径 → **404**；同 `msg_id` 重发 → `{"status":"duplicate"}`。
 
 ---
 
@@ -720,7 +483,7 @@ channel_binding.token_ref = "wecom-token"      ← 这是引用，不是密钥
 | 发消息返回 `accepted` 但一直没有回复 | ① worker 没起（all-in-one 模式下看日志有无 `worker` 相关行）② 队列积压 ③ 模型调用失败 | 依次查 `XLEN stream:inbound`、`grep -a 'process .* failed' data/trpc-service.log`、`XLEN stream:deadletter` |
 | 回复变成「服务繁忙请稍后再试」 | 模型超时（默认 60s）或报错，重试 1 次后降级 | 查日志里的 `ModelError`；确认 `data/secrets/deepseek-apikey` 有效、`TRPC_MODEL_NAME` 正确 |
 | 消息进了 `stream:deadletter` | 出站发送连续失败超过 5 次 | 查日志定位（多为 IM 凭据或限流），修好后需人工重放 |
-| PG 里查不到会话 | `TRPC_SESSION_BACKEND=redis`（默认） | 切 `postgres`，或按第 2 章末尾去 Redis 查 |
+| PG 里查不到会话 | `TRPC_SESSION_BACKEND=redis`（默认） | 切 `postgres`，或按[快速开始](./quickstart.md)第 2 章末尾去 Redis 查 |
 | 企微回调一直 404 | 通道没挂载（`TRPC_WECOM_CORP_ID` 未设）或 `webhook_path` 与后台填的 URL 不一致 | 查启动日志的通道挂载行；核对 `channel_binding.webhook_path` |
 
 看日志的几个常用姿势：
@@ -789,6 +552,7 @@ make migrate   # ./deploy/db/migrate.sh up（增量 schema 迁移）
 
 | 想了解 | 去哪 |
 |---|---|
+| 从头跑一遍：安装、跑通、查回复、建租户 | [`docs/quickstart.md`](./quickstart.md) |
 | 架构、数据模型、多后端一致性、幂等与迁移、风险清单 | [`docs/README.md`](./README.md) |
 | 完整技术方案：选型对比、容量推算、协议细节、取舍论证 | [`docs/design.md`](./design.md) |
 | 数据库 schema 与演示数据 | `deploy/db/init.sql`、`deploy/db/seed.sql` |
