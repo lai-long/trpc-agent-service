@@ -305,26 +305,17 @@ func TestWatchInvalidations(t *testing.T) {
 		t.Fatalf("want 1 load, got %d", n)
 	}
 
-	// Pub/sub is fire-and-forget: publish until the subscriber is attached
-	// (Publish reports the receiver count), then the notification must land.
+	// Pub/sub is fire-and-forget: the watcher may attach a beat after the
+	// first publish, and a receiver count ≥1 does not mean OUR subscriber got
+	// the message — the dev Redis is shared with whatever else subscribes to
+	// this channel (e.g. a running service). Keep publishing while polling
+	// for the reload; the TTL above makes invalidation the only way the
+	// reload can happen, so extra publishes are harmless no-ops.
 	deadline := time.Now().Add(3 * time.Second)
-	for {
-		n, err := rdb.Publish(ctx, tenant.InvalidationChannel, "1").Result()
-		if err != nil {
+	for time.Now().Before(deadline) {
+		if _, err := rdb.Publish(ctx, tenant.InvalidationChannel, "1").Result(); err != nil {
 			t.Fatal(err)
 		}
-		if n >= 1 {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("watcher never subscribed within 3s")
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-
-	// The notification triggers an asynchronous reload; poll for it.
-	deadline = time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
 		if _, err := r.Resolve(ctx, "/mock/callback"); err != nil {
 			t.Fatal(err)
 		}
