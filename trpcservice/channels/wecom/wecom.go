@@ -369,9 +369,9 @@ func (c *Channel) receive(w http.ResponseWriter, r *http.Request, crypt *wxbizms
 		writeSuccess(w)
 		return
 	}
-	// Only text, media and recall events enter the pipeline; other events
-	// (enter_agent, ...) are acked and skipped. Messages without a MsgId
-	// cannot be deduplicated — skip them too.
+	// Only text, media, recall events and placeholder-able types enter the
+	// pipeline; other events (enter_agent, ...) are acked and skipped.
+	// Messages without a MsgId cannot be deduplicated — skip them too.
 	switch {
 	case cm.MsgType == "text" && cm.MsgID != "":
 		// normal text path below
@@ -386,6 +386,15 @@ func (c *Channel) receive(w http.ResponseWriter, r *http.Request, crypt *wxbizms
 		return
 	case mediaTypes[cm.MsgType] != "" && cm.MsgID != "":
 		c.receiveMedia(r, w, h, &cm)
+		return
+	case placeholderTypes[cm.MsgType] != "" && cm.MsgID != "":
+		// No retrievable content (video/location/link): a placeholder text
+		// lets the agent answer "not supported yet" instead of the message
+		// vanishing silently.
+		msg := c.baseMessage(r, &cm)
+		msg.Type = channels.TypeText
+		msg.Text = "[" + placeholderTypes[cm.MsgType] + "]"
+		c.hand(ctxOf(r), w, h, msg, cm.MsgID)
 		return
 	default:
 		writeSuccess(w)
@@ -571,6 +580,15 @@ var mediaTypes = map[string]string{
 	"image": "图片",
 	"voice": "语音",
 	"file":  "文件",
+}
+
+// placeholderTypes are the callback msgtypes with no retrievable content;
+// they enter the pipeline as a bracketed placeholder text so the agent can
+// tell the user the type is unsupported instead of the message vanishing.
+var placeholderTypes = map[string]string{
+	"video":    "视频",
+	"location": "位置",
+	"link":     "链接",
 }
 
 func writeSuccess(w http.ResponseWriter) {

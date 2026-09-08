@@ -198,6 +198,42 @@ func TestCallbackDuplicateVersusFailure(t *testing.T) {
 	}
 }
 
+// Non-text callbacks without retrievable content (video/location/link) used to
+// be acked and silently dropped; they now enter the pipeline as a placeholder
+// text so the agent can tell the user the type is unsupported.
+func TestCallbackNonTextPlaceholder(t *testing.T) {
+	c := testChannel(t, "")
+	var got []channels.InboundMessage
+	mux := http.NewServeMux()
+	c.RegisterRoutes(mux, channels.HandlerFunc(func(_ context.Context, msg channels.InboundMessage) (channels.OutboundMessage, error) {
+		got = append(got, msg)
+		return channels.OutboundMessage{}, nil
+	}))
+
+	post := func(inner string) int {
+		body, query := forgeCallback(t, inner)
+		req := httptest.NewRequest(http.MethodPost, "/wecom/callback?"+query, strings.NewReader(string(body)))
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		return rec.Code
+	}
+
+	video := `<xml><ToUserName><![CDATA[ww1234567890]]></ToUserName><FromUserName><![CDATA[zhangsan]]></FromUserName><CreateTime>1700000000</CreateTime><MsgType><![CDATA[video]]></MsgType><MediaId><![CDATA[MEDIA456]]></MediaId><MsgId>9876543220</MsgId><AgentID>1000002</AgentID></xml>`
+	if code := post(video); code != http.StatusOK {
+		t.Fatalf("video callback status = %d", code)
+	}
+	if len(got) != 1 || got[0].Text != "[视频]" || got[0].Type != channels.TypeText || got[0].MsgID != "9876543220" {
+		t.Fatalf("video must become a placeholder text message: %+v", got)
+	}
+
+	// Unknown types (and placeholder types without a MsgId) stay acked and
+	// skipped.
+	unknown := `<xml><ToUserName><![CDATA[ww1234567890]]></ToUserName><FromUserName><![CDATA[zhangsan]]></FromUserName><CreateTime>1700000000</CreateTime><MsgType><![CDATA[emotion]]></MsgType><MsgId>9876543221</MsgId><AgentID>1000002</AgentID></xml>`
+	if code := post(unknown); code != http.StatusOK || len(got) != 1 {
+		t.Fatalf("unknown types must be acked and skipped, status=%d handled=%d", code, len(got))
+	}
+}
+
 func TestVerifyURL(t *testing.T) {
 	c := testChannel(t, "")
 	mux := http.NewServeMux()
