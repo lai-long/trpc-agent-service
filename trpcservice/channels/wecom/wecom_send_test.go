@@ -129,6 +129,53 @@ func TestSendSplitsLongText(t *testing.T) {
 	}
 }
 
+// A mid-split failure makes the sender retry the whole reply from segment 1;
+// the platform's touser+content duplicate check absorbs the already-delivered
+// prefix segments, so message/send must ask for it.
+func TestSendEnablesDuplicateCheck(t *testing.T) {
+	fake := &scriptWecomAPI{}
+	srv := httptest.NewServer(fake.handler())
+	defer srv.Close()
+	c := testChannel(t, srv.URL)
+
+	if err := c.Send(t.Context(), channels.OutboundMessage{
+		Channel: "wecom", MsgID: "1", UserID: "zhangsan", Text: "你好",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	sends := fake.sends()
+	if len(sends) != 1 {
+		t.Fatalf("want 1 send, got %d", len(sends))
+	}
+	if !strings.Contains(sends[0], `"enable_duplicate_check":1`) ||
+		!strings.Contains(sends[0], `"duplicate_check_interval":1800`) {
+		t.Fatalf("message/send must request the platform duplicate check: %s", sends[0])
+	}
+}
+
+// An empty reply must not reach the platform at all: no token fetch, no send,
+// no error.
+func TestSendEmptyTextSkipsAPI(t *testing.T) {
+	fake := &scriptWecomAPI{}
+	srv := httptest.NewServer(fake.handler())
+	defer srv.Close()
+	c := testChannel(t, srv.URL)
+
+	for _, text := range []string{"", "   ", "\n\t"} {
+		if err := c.Send(t.Context(), channels.OutboundMessage{
+			Channel: "wecom", MsgID: "1", UserID: "zhangsan", Text: text,
+		}); err != nil {
+			t.Fatalf("empty reply must succeed silently, got %v", err)
+		}
+	}
+	if n := fake.tokenCalls(); n != 0 {
+		t.Fatalf("empty replies must not fetch a token, got %d fetches", n)
+	}
+	if n := len(fake.sends()); n != 0 {
+		t.Fatalf("empty replies must not hit message/send, got %d sends", n)
+	}
+}
+
 func TestSendGroupUsesAppchat(t *testing.T) {
 	fake := &fakeWeComAPI{}
 	srv := httptest.NewServer(fake.handler())

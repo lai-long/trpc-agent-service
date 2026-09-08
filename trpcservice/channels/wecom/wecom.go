@@ -544,10 +544,18 @@ func writeSuccess(w http.ResponseWriter) {
 // Send implements channels.Channel: direct chats go to message/send, group
 // chats to appchat/send. Long texts are split into sequential segments within
 // this one call, so concurrent senders cannot interleave segments of the same
-// reply. The WeCom message/send API accepts no caller idempotency key, so
-// duplicate suppression relies on the sender's sent: marker window, and a
-// crash inside that window can surface a duplicate.
+// reply. An empty (whitespace-only) text is skipped without any API call.
+// message/send accepts no caller idempotency key, so duplicate suppression
+// relies on the sender's sent: marker window plus the platform's
+// touser+content duplicate check (see postMessage) — the latter also absorbs
+// the prefix segments of a retried mid-split failure.
 func (c *Channel) Send(ctx context.Context, msg channels.OutboundMessage) error {
+	// An empty reply carries nothing the platform accepts; sending it would
+	// surface as an errcode, so skip it quietly.
+	if strings.TrimSpace(msg.Text) == "" {
+		plog.Debugf("wecom send: empty reply for msg %s skipped", msg.MsgID)
+		return nil
+	}
 	// One identity lookup for the whole reply: every segment of one message
 	// goes out under the same binding identity.
 	id, err := c.outboundIDFor(ctx, msg)
@@ -616,6 +624,13 @@ func (c *Channel) postMessage(ctx context.Context, token string, agentID int, ms
 			"msgtype":  msgType,
 			"agentid":  agentID,
 			contentKey: map[string]string{"content": text},
+			// message/send accepts no caller idempotency key, but the
+			// platform's duplicate check dedups by touser+content within the
+			// interval: when a mid-split failure makes the sender retry the
+			// whole reply, the already-delivered prefix segments are absorbed
+			// instead of reaching the user twice.
+			"enable_duplicate_check":   1,
+			"duplicate_check_interval": 1800,
 		}
 	}
 	body, err := json.Marshal(payload)
