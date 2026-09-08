@@ -473,27 +473,64 @@ func (c *Channel) fetchMedia(ctx context.Context, cm *callbackMessage) (string, 
 	if err != nil {
 		return "", err
 	}
-	apiURL := c.cfg.APIBase + "/cgi-bin/media/get?access_token=" + url.QueryEscape(token) +
-		"&media_id=" + url.QueryEscape(cm.MediaID)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
+	data, mime, errcode, err := c.getMedia(ctx, token, cm.MediaID)
 	if err != nil {
 		return "", err
+	}
+	if errcode == 40014 || errcode == 42001 { // token expired/invalid: refresh once and retry
+		c.invalidateToken(c.cfg.CorpID, c.cfg.SecretRef)
+		if token, err = c.getAccessToken(ctx, c.cfg.CorpID, c.cfg.SecretRef); err != nil {
+			return "", err
+		}
+		if data, mime, errcode, err = c.getMedia(ctx, token, cm.MediaID); err != nil {
+			return "", err
+		}
+	}
+	if errcode != 0 {
+		return "", fmt.Errorf("wecom media get: errcode %d", errcode)
+	}
+	filename := cm.MsgID + "." + mediaFileExt(cm.MsgType, mime)
+	return c.media.SaveMedia(ctx, c.Name(), cm.MsgID, filename, mime, data)
+}
+
+// getMedia downloads one media_id. The platform reports failures as HTTP 200
+// with a JSON error body, so the content type — never the status code —
+// decides what the body is: application/json decodes into an errcode (which
+// must NOT be stored as media bytes), anything else is the media itself.
+func (c *Channel) getMedia(ctx context.Context, token, mediaID string) (data []byte, mime string, errcode int, err error) {
+	apiURL := c.cfg.APIBase + "/cgi-bin/media/get?access_token=" + url.QueryEscape(token) +
+		"&media_id=" + url.QueryEscape(mediaID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
+	if err != nil {
+		return nil, "", 0, err
 	}
 	resp, err := c.client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("wecom media get: %w", channels.ScrubError(err))
+		return nil, "", 0, fmt.Errorf("wecom media get: %w", channels.ScrubError(err))
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("wecom media get: status %d", resp.StatusCode)
+		return nil, "", 0, fmt.Errorf("wecom media get: status %d", resp.StatusCode)
 	}
-	data, err := io.ReadAll(http.MaxBytesReader(nil, resp.Body, 20<<20))
+	mime = resp.Header.Get("Content-Type")
+	if strings.Contains(mime, "application/json") {
+		var result struct {
+			ErrCode int    `json:"errcode"`
+			ErrMsg  string `json:"errmsg"`
+		}
+		if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&result); err != nil {
+			return nil, "", 0, fmt.Errorf("wecom media get decode: %w", err)
+		}
+		if result.ErrCode == 0 {
+			return nil, "", 0, fmt.Errorf("wecom media get: unexpected json body %q", result.ErrMsg)
+		}
+		return nil, "", result.ErrCode, nil
+	}
+	data, err = io.ReadAll(http.MaxBytesReader(nil, resp.Body, 20<<20))
 	if err != nil {
-		return "", err
+		return nil, "", 0, err
 	}
-	mime := resp.Header.Get("Content-Type")
-	filename := cm.MsgID + "." + mediaFileExt(cm.MsgType, mime)
-	return c.media.SaveMedia(ctx, c.Name(), cm.MsgID, filename, mime, data)
+	return data, mime, 0, nil
 }
 
 // mediaFileExt picks a file extension from the message type / content type.

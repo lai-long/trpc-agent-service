@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/sbzhu/weworkapi_golang/wxbizmsgcrypt"
@@ -436,6 +437,97 @@ func TestMediaFetchFailures(t *testing.T) {
 		}), mediaInner)
 		if !strings.Contains(got.Text, "素材拉取失败") {
 			t.Fatalf("oversized media must degrade to the placeholder: %+v", got)
+		}
+	})
+}
+
+// media/get reports failures as HTTP 200 with a JSON error body; the JSON must
+// never be stored as media bytes (only the placeholder goes through), and a
+// 40014 invalidates the cached token and retries the download once.
+func TestMediaGetJSONErrorBody(t *testing.T) {
+	t.Run("json error body is not stored", func(t *testing.T) {
+		store := &fakeMediaStore{}
+		api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case strings.HasPrefix(r.URL.Path, "/cgi-bin/gettoken"):
+				_, _ = w.Write([]byte(`{"access_token":"t-1","expires_in":7200}`))
+			case strings.HasPrefix(r.URL.Path, "/cgi-bin/media/get"):
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"errcode":40005,"errmsg":"invalid media_id hint"}`))
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		defer api.Close()
+		c, err := New(Config{
+			CorpID: testCorpID, AgentID: 1000002,
+			TokenRef: "tok", AESKeyRef: "aes", SecretRef: "secret", APIBase: api.URL,
+			Media: store,
+		}, mapResolver{"tok": testToken, "aes": testAESKey, "secret": "corp-secret"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got channels.InboundMessage
+		rec := postForged(t, c, channels.HandlerFunc(func(_ context.Context, msg channels.InboundMessage) (channels.OutboundMessage, error) {
+			got = msg
+			return channels.OutboundMessage{}, nil
+		}), mediaInner)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("media callback status = %d", rec.Code)
+		}
+		if !strings.Contains(got.Text, "素材拉取失败") || got.MediaRef != "" {
+			t.Fatalf("a json error body must degrade to the placeholder: %+v", got)
+		}
+		if len(store.refs) != 0 {
+			t.Fatalf("the json error body must never reach the artifact store, got %v", store.refs)
+		}
+	})
+
+	t.Run("40014 refreshes the token and retries once", func(t *testing.T) {
+		store := &fakeMediaStore{}
+		var tokenCalls, mediaCalls int32
+		api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case strings.HasPrefix(r.URL.Path, "/cgi-bin/gettoken"):
+				n := atomic.AddInt32(&tokenCalls, 1)
+				_, _ = fmt.Fprintf(w, `{"access_token":"t-%d","expires_in":7200}`, n)
+			case strings.HasPrefix(r.URL.Path, "/cgi-bin/media/get"):
+				if atomic.AddInt32(&mediaCalls, 1) == 1 {
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = w.Write([]byte(`{"errcode":40014,"errmsg":"invalid access_token"}`))
+					return
+				}
+				w.Header().Set("Content-Type", "image/jpeg")
+				_, _ = w.Write([]byte("jpeg-bytes"))
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		defer api.Close()
+		c, err := New(Config{
+			CorpID: testCorpID, AgentID: 1000002,
+			TokenRef: "tok", AESKeyRef: "aes", SecretRef: "secret", APIBase: api.URL,
+			Media: store,
+		}, mapResolver{"tok": testToken, "aes": testAESKey, "secret": "corp-secret"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got channels.InboundMessage
+		rec := postForged(t, c, channels.HandlerFunc(func(_ context.Context, msg channels.InboundMessage) (channels.OutboundMessage, error) {
+			got = msg
+			return channels.OutboundMessage{}, nil
+		}), mediaInner)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("media callback status = %d", rec.Code)
+		}
+		if got.MediaRef == "" {
+			t.Fatalf("the retried download must land in the artifact store: %+v", got)
+		}
+		if n := atomic.LoadInt32(&tokenCalls); n != 2 {
+			t.Fatalf("40014 must trigger exactly one token refresh, got %d fetches", n)
+		}
+		if n := atomic.LoadInt32(&mediaCalls); n != 2 {
+			t.Fatalf("40014 must trigger exactly one media retry, got %d downloads", n)
 		}
 	})
 }
