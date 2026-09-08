@@ -710,6 +710,16 @@ func (c *Channel) refreshAccessToken(ctx context.Context, corpID, secretRef stri
 	}
 	c.tokenMu.Lock()
 	defer c.tokenMu.Unlock()
+	// Refreshing a cached identity reuses its LRU node: pushing a new one
+	// would orphan the old node (list growth without a matching map entry), and
+	// a later eviction popping the orphan would delete the LIVE entry. Only a
+	// new identity runs the eviction loop — refreshing a cached key while the
+	// cache is full must not evict an innocent identity.
+	if e, ok := c.tokens[key]; ok && e.elem != nil {
+		c.tokenOrder.MoveToFront(e.elem)
+		c.tokens[key] = tokenEntry{token: result.AccessToken, expiry: time.Now().Add(ttl), elem: e.elem}
+		return result.AccessToken, nil
+	}
 	// Evict the least recently used identity when full: a wholesale reset
 	// would re-authenticate every live binding at once.
 	for len(c.tokens) >= maxTokenCacheEntries {
