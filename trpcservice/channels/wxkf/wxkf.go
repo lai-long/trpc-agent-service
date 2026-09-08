@@ -90,6 +90,20 @@ const originCustomer = 3
 // eventKfMsgOrEvent is the only callback event this channel acts on.
 const eventKfMsgOrEvent = "kf_msg_or_event"
 
+// msgPlaceholders maps customer-sent non-text msgtypes to the placeholder
+// text entering the pipeline, so the agent can answer "not supported yet".
+// msgtypes absent here (event, ...) stay skipped.
+var msgPlaceholders = map[string]string{
+	"image":       "[图片]",
+	"voice":       "[语音]",
+	"video":       "[视频]",
+	"file":        "[文件]",
+	"link":        "[链接]",
+	"location":    "[位置]",
+	"miniprogram": "[小程序]",
+	"merged_msg":  "[聊天记录]",
+}
+
 // Config holds the WeChat KF channel configuration. Secret material is
 // carried as references and resolved through the SecretResolver, never logged.
 type Config struct {
@@ -543,15 +557,27 @@ func (c *Channel) pullMessages(ctx context.Context, ev kfEvent, creds channels.B
 			return fmt.Errorf("wxkf sync_msg for %s: errcode %d", openKfID, result.ErrCode)
 		}
 		for _, m := range result.MsgList {
-			if m.Origin != originCustomer || m.MsgType != "text" || m.MsgID == "" {
-				continue // servicer/system entries, media and events are follow-ups
+			if m.Origin != originCustomer || m.MsgID == "" {
+				continue // servicer/system entries never enter the pipeline
+			}
+			text := m.Text.Content
+			if m.MsgType != "text" {
+				// A customer-sent non-text message (image/voice/video/...)
+				// carries no readable content in msg_list; a placeholder lets
+				// the agent answer "not supported yet" instead of the message
+				// vanishing. Event entries stay skipped.
+				placeholder, ok := msgPlaceholders[m.MsgType]
+				if !ok {
+					continue
+				}
+				text = placeholder
 			}
 			msg := channels.InboundMessage{
 				Channel:     c.Name(),
 				MsgID:       m.MsgID,
 				SessionKey:  channels.SessionKey(c.Name(), m.ExternalUserID, ""), // KF is direct-chat only
 				UserID:      m.ExternalUserID,
-				Text:        m.Text.Content,
+				Text:        text,
 				Type:        channels.TypeText,
 				WebhookPath: webhookPath,
 				ReceivedAt:  time.Unix(m.SendTime, 0),

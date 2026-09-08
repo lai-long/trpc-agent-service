@@ -284,9 +284,10 @@ func TestCallbackCursorPagination(t *testing.T) {
 	}
 }
 
-// TestCallbackPullFiltersNonCustomerAndNonText: only origin-3 (customer) text
-// entries enter the pipeline — servicer replies and system pushes would feed
-// the agent its own output — and the cursor advances past them regardless.
+// TestCallbackPullFiltersNonCustomerAndNonText: servicer replies and system
+// pushes (origin 4/5) never enter the pipeline — they would feed the agent its
+// own output — while a customer-sent non-text becomes a placeholder text and
+// the cursor advances past every entry regardless.
 func TestCallbackPullFiltersNonCustomerAndNonText(t *testing.T) {
 	fake := &scriptKfAPI{onSync: func(int) string {
 		return fmt.Sprintf(`{"errcode":0,"errmsg":"ok","next_cursor":"next-1","has_more":0,"msg_list":[`+
@@ -298,10 +299,10 @@ func TestCallbackPullFiltersNonCustomerAndNonText(t *testing.T) {
 	srv := httptest.NewServer(fake.handler())
 	defer srv.Close()
 	c, store := testChannel(t, srv.URL)
-	called := 0
+	var got []channels.InboundMessage
 	mux := http.NewServeMux()
 	c.RegisterRoutes(mux, channels.HandlerFunc(func(_ context.Context, msg channels.InboundMessage) (channels.OutboundMessage, error) {
-		called++
+		got = append(got, msg)
 		return channels.OutboundMessage{}, nil
 	}))
 
@@ -309,11 +310,47 @@ func TestCallbackPullFiltersNonCustomerAndNonText(t *testing.T) {
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/wxkf/callback?"+query, strings.NewReader(string(body))))
 
-	if rec.Code != http.StatusOK || called != 1 {
-		t.Fatalf("only the customer text must be handled, status=%d handled=%d", rec.Code, called)
+	if rec.Code != http.StatusOK || len(got) != 2 {
+		t.Fatalf("only the customer's entries must be handled, status=%d handled=%d", rec.Code, len(got))
+	}
+	// The customer-sent image becomes a placeholder text; event entries and
+	// servicer replies stay skipped.
+	if got[0].MsgID != "s3" || got[0].Text != "[图片]" || got[0].Type != channels.TypeText {
+		t.Fatalf("customer image must become a placeholder text message: %+v", got[0])
+	}
+	if got[1].MsgID != "m1" || got[1].Text != "你好" {
+		t.Fatalf("customer text must pass through unchanged: %+v", got[1])
 	}
 	if saved := store.saved(); len(saved) != 1 {
 		t.Fatalf("cursor must advance past the skipped entries, got %v", saved)
+	}
+}
+
+// Event-type entries never become placeholders, whichever side they came
+// from: an enter_session is a session signal, not user content.
+func TestCallbackPullSkipsCustomerEvents(t *testing.T) {
+	fake := &scriptKfAPI{onSync: func(int) string {
+		return fmt.Sprintf(`{"errcode":0,"errmsg":"ok","next_cursor":"next-1","has_more":0,"msg_list":[`+
+			`{"msgid":"e1","external_userid":%q,"origin":3,"msgtype":"event","event":{"event_type":"enter_session"}}]}`, testKFUser)
+	}}
+	srv := httptest.NewServer(fake.handler())
+	defer srv.Close()
+	c, store := testChannel(t, srv.URL)
+	mux := http.NewServeMux()
+	c.RegisterRoutes(mux, channels.HandlerFunc(func(context.Context, channels.InboundMessage) (channels.OutboundMessage, error) {
+		t.Error("event entries must never enter the pipeline")
+		return channels.OutboundMessage{}, nil
+	}))
+
+	body, query := forgeEvent(t, testEvent("evt-token-1"))
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/wxkf/callback?"+query, strings.NewReader(string(body))))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("callback status = %d", rec.Code)
+	}
+	if saved := store.saved(); len(saved) != 1 {
+		t.Fatalf("cursor must still advance past the event entry, got %v", saved)
 	}
 }
 
