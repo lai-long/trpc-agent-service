@@ -466,6 +466,49 @@ func TestCallbackCursorSaveFailureIsNotAcked(t *testing.T) {
 	}
 }
 
+// TestCallbackEmptyNextCursorKeepsSaved: an empty next_cursor must not
+// overwrite the persisted position — saving "" would make the next pull resume
+// from scratch and re-pull three days of history.
+func TestCallbackEmptyNextCursorKeepsSaved(t *testing.T) {
+	fake := &scriptKfAPI{onSync: func(int) string {
+		return fmt.Sprintf(`{"errcode":0,"errmsg":"ok","next_cursor":"","has_more":0,"msg_list":[%s]}`,
+			customerMsg("msgid-1", "你好"))
+	}}
+	srv := httptest.NewServer(fake.handler())
+	defer srv.Close()
+	c, store := testChannel(t, srv.URL)
+	if err := store.Set(t.Context(), testKfAccount, "cur-old"); err != nil {
+		t.Fatal(err)
+	}
+	var got []channels.InboundMessage
+	mux := http.NewServeMux()
+	c.RegisterRoutes(mux, channels.HandlerFunc(func(_ context.Context, msg channels.InboundMessage) (channels.OutboundMessage, error) {
+		got = append(got, msg)
+		return channels.OutboundMessage{}, nil
+	}))
+
+	body, query := forgeEvent(t, testEvent("evt-token-1"))
+	req := httptest.NewRequest(http.MethodPost, "/wxkf/callback?"+query, strings.NewReader(string(body)))
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK || len(got) != 1 {
+		t.Fatalf("the page must still be handled, status=%d handled=%d", rec.Code, len(got))
+	}
+	saved, err := store.Get(t.Context(), testKfAccount)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saved != "cur-old" {
+		t.Fatalf("an empty next_cursor must keep the saved cursor, got %q", saved)
+	}
+	for _, s := range store.saved() {
+		if s == testKfAccount+"=" {
+			t.Fatalf("an empty cursor must never be persisted, sets=%v", store.saved())
+		}
+	}
+}
+
 // postCallback serves one forged event on a binding-scoped handler.
 func postCallback(t *testing.T, c *Channel, h channels.Handler) *httptest.ResponseRecorder {
 	t.Helper()

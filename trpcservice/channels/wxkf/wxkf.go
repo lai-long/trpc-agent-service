@@ -567,7 +567,12 @@ func (c *Channel) pullMessages(ctx context.Context, ev kfEvent, creds channels.B
 				return fmt.Errorf("wxkf handle msg %s: %w", m.MsgID, err)
 			}
 		}
-		if err := c.cursors.Set(ctx, openKfID, result.NextCursor); err != nil {
+		// An empty next_cursor must not overwrite the saved position: persisting
+		// it would make the next pull resume from "" — a full three-day history
+		// re-pull. Keep the old cursor and let the next event retry.
+		if result.NextCursor == "" {
+			plog.Warnf("wxkf sync_msg for %s returned an empty next_cursor; keeping the saved cursor", openKfID)
+		} else if err := c.cursors.Set(ctx, openKfID, result.NextCursor); err != nil {
 			return fmt.Errorf("wxkf: save cursor for %s: %w", openKfID, err)
 		}
 		if result.HasMore == 0 {
