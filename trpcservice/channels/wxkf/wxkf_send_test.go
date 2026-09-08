@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
 )
@@ -143,6 +144,82 @@ func TestSendErrorSurfaces(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "95020") {
 		t.Fatalf("platform rejection must surface as an error, got %v", err)
+	}
+}
+
+// Refreshing an already-cached identity must reuse its LRU node: the old code
+// pushed a second node, so the list grew unboundedly and an eviction popping
+// the orphan deleted the LIVE token entry. Two refreshes of one identity keep
+// exactly one node, and evictions afterwards never drop the refreshed identity.
+func TestTokenRefreshReusesLRUNode(t *testing.T) {
+	fake := &scriptKfAPI{}
+	srv := httptest.NewServer(fake.handler())
+	defer srv.Close()
+	c, _ := testChannel(t, srv.URL)
+	ctx := t.Context()
+
+	get := func(corpID, secretRef string) {
+		t.Helper()
+		if _, err := c.getAccessToken(ctx, corpID, secretRef); err != nil {
+			t.Fatal(err)
+		}
+	}
+	expire := func(key string) {
+		t.Helper()
+		c.tokenMu.Lock()
+		defer c.tokenMu.Unlock()
+		e := c.tokens[key]
+		e.expiry = time.Now().Add(-time.Minute)
+		c.tokens[key] = e
+	}
+	state := func() (listLen, mapLen int) {
+		t.Helper()
+		c.tokenMu.Lock()
+		defer c.tokenMu.Unlock()
+		return c.tokenOrder.Len(), len(c.tokens)
+	}
+	cached := func(key string) bool {
+		t.Helper()
+		c.tokenMu.Lock()
+		defer c.tokenMu.Unlock()
+		_, ok := c.tokens[key]
+		return ok
+	}
+
+	key := testCorpID + "|secret"
+	get(testCorpID, "secret")
+	expire(key)
+	get(testCorpID, "secret") // refresh path
+	if listLen, mapLen := state(); listLen != 1 || mapLen != 1 {
+		t.Fatalf("refreshing one identity must keep one LRU node, got list=%d map=%d", listLen, mapLen)
+	}
+
+	// Fill the cache to capacity with other identities.
+	for i := 0; i < maxTokenCacheEntries-1; i++ {
+		get(fmt.Sprintf("corp-%d", i), "secret")
+	}
+	// Refreshing the original identity while full must not evict an innocent
+	// one — the eviction loop only runs for a NEW identity.
+	expire(key)
+	get(testCorpID, "secret")
+	if listLen, mapLen := state(); listLen != maxTokenCacheEntries || mapLen != maxTokenCacheEntries {
+		t.Fatalf("a refresh must not grow or shrink the cache, got list=%d map=%d", listLen, mapLen)
+	}
+	if !cached("corp-0|secret") {
+		t.Fatal("refreshing a cached identity at capacity must not evict another identity")
+	}
+
+	// One genuinely new identity evicts the LRU back (corp-0), never the
+	// just-refreshed identity.
+	get("corp-new", "secret")
+	if listLen, mapLen := state(); listLen != maxTokenCacheEntries || mapLen != maxTokenCacheEntries {
+		t.Fatalf("eviction must keep the cache bounded, got list=%d map=%d", listLen, mapLen)
+	}
+	if !cached(key) {
+		t.Fatal("eviction must not drop the recently refreshed identity")
+	}
+	if cached("corp-0|secret") {
+		t.Fatal("the least recently used identity must be the eviction victim")
 	}
 }
 
