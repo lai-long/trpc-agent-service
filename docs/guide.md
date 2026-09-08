@@ -126,76 +126,24 @@ Prometheus 在 <http://localhost:9090>，抓取配置是 `deploy/prometheus/prom
 
 ## 3. 接真实企业微信
 
-**目标**：把消息来源从 mock 换成真实 IM。
+**目标**：把消息来源从 mock 换成真实 IM。平台有三个真实通道，各一篇文档：
 
-> **实测状态（2026-09-07）**：本节的 **wecomws（智能机器人 WebSocket）已在真实机器人上端到端实测**
-> ——订阅、心跳、收发、审批全链路验证通过。**wecom（自建应用 webhook）与 wxkf（微信客服）未实测**：
-> wecom 的协议逐项对照官方文档无发现，但需要公网 HTTPS 回调地址和真实 corp 才能验证；wxkf 的
-> inbound 实现与官方协议**不符**（官方是「XML 事件回调 + `kf/sync_msg` 拉取消息」，不是「JSON 加密
-> 直推消息体」），按当前代码**收不到任何消息**，接入前需先重写。
+| 通道 | 文档 | 一句话选型 |
+|---|---|---|
+| `wecom` 企微自建应用 | [`channels/wecom.md`](./channels/wecom.md) | webhook 回调（需公网 HTTPS），支持群聊/媒体/markdown |
+| `wxkf` 微信客服 | [`channels/wxkf.md`](./channels/wxkf.md) | 面向微信外部用户的客服单聊，「事件通知 + sync_msg 拉取」，48h 窗口 |
+| `wecomws` 企微智能机器人 | [`channels/wecomws.md`](./channels/wecomws.md) | WS 长连接（免公网入口），每 bot 单连接、Redis leader 锁保证单持有者 |
+
+> **实测状态（2026-09-07）**：**wecomws 已在真实机器人上端到端实测**——订阅、心跳、收发、
+> 审批全链路验证通过。**wecom 与 wxkf 未实测**：wecom 的协议逐项对照官方文档无发现，但需要
+> 公网 HTTPS 回调地址和真实 corp 才能验证；wxkf 按官方「XML 事件回调 + `kf/sync_msg` 拉取」
+> 协议实现（游标持久化、48h 窗口出站），同样需要真实客服账号验证。
 >
 > 三个通道共有的经验教训（wecomws 实测踩出来的，另两个接入时值得先对照）：
 > 平台的协议细节和直觉经常不一致——WS 握手头对大小写敏感、ack 帧没有 `cmd` 字段、`errcode` 在帧顶层、
 > 心跳 `req_id` 必须带 `ping_` 前缀否则平台沉默、`aibot_respond_msg` 拒收 `text` 类型（必须
 > `stream`，errcode 40008）。接新通道时建议先用探针抓原始帧核对协议，再对照官方 SDK 源码，
 > 最后把测试替身改成和真实帧一致的形状。
-
-需要三样东西：**密钥文件**、**env 开关**、**公网 HTTPS 回调地址**。
-
-```bash
-# ① 密钥文件（文件名 = 下面的 *_REF 默认值，改了就同步改 env）
-echo -n '你的Token'            > data/secrets/wecom-token
-echo -n '你的EncodingAESKey'   > data/secrets/wecom-aeskey
-echo -n '你的corpsecret'       > data/secrets/wecom-secret
-chmod 600 data/secrets/wecom-*
-
-# ② 启动时加通道开关（不设 = 该通道不挂载）
-TRPC_ADMIN_TOKEN=dev-insecure \
-TRPC_METRICS_ADDR=127.0.0.1:8083 \
-TRPC_SESSION_BACKEND=postgres \
-TRPC_WECOM_CORP_ID=ww你的corpid \
-TRPC_WECOM_AGENT_ID=1000002 \
-./start.sh
-
-# ③ 企微管理后台「接收消息」里填的回调 URL
-#    https://你的域名/wecom/callback               ← env 配置的单绑定默认路径
-#    https://你的域名/callback/wecom/{binding_id}  ← 多租户路径，每个绑定用自己的密钥验签
-```
-
-**验证**：日志里出现 `gateway listening {"addr":":8080"}` 且没有 `wecom channel disabled` 之类的 WARN。
-
-### 微信客服（wxkf）
-
-`TRPC_WXKF_CORP_ID` + `TRPC_WXKF_KF_ACCOUNT`，密钥文件默认名 `wxkf-token` / `wxkf-aeskey` / `wxkf-secret`。
-注意它**只处理 text 消息**（媒体是后续工作），且主动发送受 48 小时窗口限制。
-
-> **⚠️ 当前不可用，接入前需先修代码**：官方协议是「回调只推一个 XML 事件
-> （`MsgType=event`、`Event=kf_msg_or_event`，带 `Token`/`OpenKfId`），消息本体要用
-> `kf/sync_msg` 接口带 cursor 主动拉取（用户 ID 是 `external_userid`，`next_cursor` 必须持久化）」；
-> 而当前实现假设「JSON 加密直推、解密即消息体」，该协议形态不存在，**收不到任何消息**
-> （出站 `kf/send_msg` 本身与文档一致）。详见 `docs/README.md` §10「通道实测状态」。
-
-### 企微智能机器人（wecomws，免公网回调）
-
-适合内网/无域名场景，由平台**主动**连企微 WS 网关：
-
-```bash
-TRPC_WECOMWS_ADDR=wss://openws.work.weixin.qq.com ./start.sh
-```
-
-BotID / Secret 不放 env，放 `channel_binding.config`：
-
-```bash
-curl -s -X POST $A/admin/apps/$APP/bindings -H "$H" -H 'Content-Type: application/json' \
-  -d '{"channel":"wecomws",
-       "webhook_path":"/wecomws/你的botid",
-       "config":{"bot_id":"你的botid","secret_ref":"wecomws-bot-secret"}}'
-echo -n '你的BotSecret' > data/secrets/wecomws-bot-secret
-```
-
-> **你可能会撞上**：企微每 bot 同时只允许一条连接、新连接踢旧连接。所以多副本部署时由
-> `lock:leader:wecomws` 选出全局单 leader 持有全部连接，其余副本待命——你看到某些副本
-> 「没动静」是正常的。
 
 四类通道的差异（连接方向、应答时限、媒体能力等）见 [`docs/README.md` §6](./README.md)。
 
@@ -437,7 +385,7 @@ curl -s -X DELETE $A/admin/apps/$APP/bindings/$B -H "$H"
 
 ## 附录 A：配置与密钥机制
 
-**配置只来自环境变量**（约 65 个 `TRPC_*`），仓库里没有配置文件。
+**配置只来自环境变量**（60 个 `TRPC_*`，全量见 [configuration.md](./configuration.md)），仓库里没有配置文件。
 全部由 `trpcservice/config/config.go` 的 `Load()` 集中读取，未设则取默认值。
 
 **密钥永远不出现在配置和数据库里**，只存**引用名**：
@@ -488,30 +436,9 @@ channel_binding.token_ref = "wecom-token"      ← 这是引用，不是密钥
 
 ## 附录 B：故障排查
 
-按「你看到的症状」查。前四条是实测遇到过的。
-
-| 症状 | 原因 | 解法 |
-|---|---|---|
-| 启动日志 `metrics listener failed … address already in use` | 8082 被别的程序占用 | 加 `TRPC_METRICS_ADDR=127.0.0.1:8083`。服务不会崩，只是没指标 |
-| 一启动就刷 `worker … process … failed: unknown agent app: a1` / `tenant route inactive: tenant t1` | **Redis 里有集成测试残留消息**。Worker 串行消费，你的消息排在它们后面 | 见附录 C 重置，或 `XTRIM stream:inbound MAXLEN 0` |
-| `/callback/mock/{binding_id}` 返回 `unknown binding` | 你的库是用**旧版 `seed.sql`** 灌的（initdb.d 只在空卷首次启动时跑），后来新增的绑定行从没进过库 | 见附录 C 重置，或手工 INSERT 那条 binding |
-| `make test` 之后开发库多出一堆 `pgstore-…` 之类的租户、Redis 里多出队列消息 | `testenv.go` 的默认值就指向开发依赖：`TRPC_TEST_PG_DSN` 默认 = `TRPC_PG_DSN`（同一个 `trpc` 库），`TRPC_TEST_REDIS_ADDR` 默认 = `localhost:6380`（同一个 Redis）。CI 用全新 service container，所以只有本地会这样 | 给测试单独建库再跑：<br>`docker compose exec -T postgres psql -U trpc -d postgres -c 'CREATE DATABASE trpc_test'`<br>`docker compose exec -T postgres psql -U trpc -d trpc_test -v ON_ERROR_STOP=1 < deploy/db/init.sql`<br>`TRPC_TEST_PG_DSN='postgres://trpc:trpc-dev-only@localhost:5432/trpc_test?sslmode=disable' make test`<br>Redis 侧**没有等价开关**（配置只有 host:port，不支持 db index），队列残留只能按附录 C 清理或另起一个 Redis 实例 |
-| 进程启动即退出，日志说 admin token 相关 | `TRPC_ADMIN_TOKEN` 未设（fail-closed） | 本地用 `dev-insecure`，生产用真 token |
-| `resolve … no such file` 类错误 | `data/secrets/` 下缺对应引用名的文件 | 按附录 A 补齐，文件名必须与 `*_REF` 一致 |
-| 发消息返回 `accepted` 但一直没有回复 | ① worker 没起（all-in-one 模式下看日志有无 `worker` 相关行）② 队列积压 ③ 模型调用失败 | 依次查 `XLEN stream:inbound`、`grep -a 'process .* failed' data/trpc-service.log`、`XLEN stream:deadletter` |
-| 回复变成「服务繁忙请稍后再试」 | 模型超时（默认 60s）或报错，重试 1 次后降级 | 查日志里的 `ModelError`；确认 `data/secrets/deepseek-apikey` 有效、`TRPC_MODEL_NAME` 正确 |
-| 消息进了 `stream:deadletter` | 出站发送连续失败超过 5 次 | 查日志定位（多为 IM 凭据或限流），修好后需人工重放 |
-| PG 里查不到会话 | `TRPC_SESSION_BACKEND=redis`（默认） | 切 `postgres`，或按[快速开始](./quickstart.md)第 2 章末尾去 Redis 查 |
-| 企微回调一直 404 | 通道没挂载（`TRPC_WECOM_CORP_ID` 未设）或 `webhook_path` 与后台填的 URL 不一致 | 查启动日志的通道挂载行；核对 `channel_binding.webhook_path` |
-
-看日志的几个常用姿势：
-
-```bash
-grep -a 'reply sent'          data/trpc-service.log | tail    # 回复下发成功
-grep -a 'process .* failed'   data/trpc-service.log | tail    # worker 处理失败
-grep -a 'duplicate message'   data/trpc-service.log | tail    # 去重命中
-grep -ac ERROR                data/trpc-service.log           # 错误总数
-```
+已搬到运维手册：按「消息没回复」的标准排查路径、按症状速查表、日志关键字见
+[`docs/operations.md` §5 故障排查 runbook](./operations.md#5-故障排查-runbook)；
+告警的逐条处置见同篇 [§4 告警手册](./operations.md#4-告警手册)。
 
 ---
 
@@ -562,7 +489,7 @@ make migrate   # ./deploy/db/migrate.sh up（增量 schema 迁移）
 
 跑测试需要 PG / Redis / MinIO 在线（`make deps`）。**依赖不在线时集成测试会 skip，
 覆盖率会从 87.5% 掉到约 55%**——那不是有效测量，CI 的 zero-skip 门禁也会因此失败。
-建议给测试指定独立库，避免污染开发数据（见附录 B）。
+建议给测试指定独立库，避免污染开发数据（见[运维手册 §5.2](./operations.md#52-按症状查)）。
 
 ---
 

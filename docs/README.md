@@ -18,7 +18,7 @@ Deployment 分别扩缩。三个监听口彼此分离，这本身是安全设计
 指标带 `tenant_id` 维度，故单独内网监听、不挂公网回调口。Admin token 未配置时进程**拒绝启动**
 （fail-closed），本地须显式写哨兵值 `dev-insecure`，且仅绑 loopback 时接受。
 
-配置全部来自环境变量（`config.Load()` 集中读约 65 个 `TRPC_*`），仓库内无配置文件。密钥不落库、
+配置全部来自环境变量（`config.Load()` 集中读 60 个 `TRPC_*`，全量参考见 `docs/configuration.md`），仓库内无配置文件。密钥不落库、
 不落配置，只存**引用**（`token_ref`/`aeskey_ref`/`dsn_ref`/`TRPC_MODEL_APIKEY_REF`），运行时经
 `config.SecretResolver` 解析：本地 `FileResolver`（读 `data/secrets/`）、生产 `KMSResolver`，
 两者都套 `CachedResolver`（TTL 1m）。
@@ -182,9 +182,9 @@ Schema 见 `deploy/db/init.sql`——冻结的 **000001 基线**，12 张业务�
 | Redis Key | 类型 | TTL | 用途 |
 |---|---|---|---|
 | `stream:inbound`/`outbound`/`deadletter` | Stream | MAXLEN ~100000 | 入站、出站、死信队列 |
-| `dedup:{channel}:{binding}:{msg_id}` | String | 24h | 入口幂等，挡 IM 重推 |
-| `done:{channel}:{binding}:{msg_id}` | String | 24h | 执行层幂等，挡 Stream 重投 |
-| `sent:{channel}:{binding}:{msg_id}` | String | 24h | 出站幂等，防重复回复 |
+| `dedup:{channel}:{binding}:{msg_id}` | String | 24h（wxkf 4 天） | 入口幂等，挡 IM 重推 |
+| `done:{channel}:{binding}:{msg_id}` | String | 24h（wxkf 4 天） | 执行层幂等，挡 Stream 重投 |
+| `sent:{channel}:{binding}:{msg_id}` | String | 24h（wxkf 4 天） | 出站幂等，防重复回复 |
 | `lock:sess:{app_id}:{session_id}` | String | 10s | 会话锁，watchdog 每 TTL/3 续期 |
 | `lock:leader:{name}` | String | 15s | wecomws leader 竞选 |
 | `approval:{app_id}:{session_key}` | Hash | 5min | 危险工具待审批 |
@@ -215,7 +215,7 @@ TTL/3 续期（长工具调用不掉锁），Worker 崩溃则锁随 TTL 过期�
 再 DEL，防误删他人锁。锁失效的极端场景由 `(session_id,event_seq)` 唯一约束兜住。
 
 **三层幂等，职责不同**：入口层 `dedup:` 挡 IM 重推（企微重推间隔可达分钟级、最多 3 次，TTL 24h
-覆盖全窗口）；执行层 `done:` 挡 Stream 重投——重投会触发全新 LLM 运行和全新事件 ID，事件唯一约束在
+覆盖全窗口，wxkf 例外——游标丢失时 `sync_msg` 会重拉 3 天历史，其三层幂等键 TTL 加宽到 4 天）；执行层 `done:` 挡 Stream 重投——重投会触发全新 LLM 运行和全新事件 ID，事件唯一约束在
 这种场景数学上永远拦不住，`done` 标记才是真正实现，唯一约束只兜「同一事件对象被重复追加」；出站层
 `sent:` 发送成功先写标记再 XACK，「发送成功但 ACK 前崩溃」的重投不会让用户收到重复回复。
 
@@ -242,16 +242,17 @@ user_id、内容类型、reply_token），差异收敛在适配器内部：
 | 应答约束 | **5 秒内应答**，重推 ≤3 次 | 返回 200 即可，无业务时限 | 无（且无平台重推） | — |
 | 回复方式 | `message/send`（单聊）/`appchat/send`（群聊） | `kf/send_msg`，48h 窗口内 | `aibot_respond_msg` **stream** 类型，须透传回调 `req_id` | 内存收件箱 |
 | 会话形态 | 单聊 + 群聊 | 仅单聊 | 单聊 + 群聊 | 任意 |
-| 媒体 | 已支持（`media/get` → Artifact） | 仅 text（媒体是 follow-up） | 降级为占位文本 | — |
+| 媒体 | 已支持（`media/get` → Artifact） | 非文本降级为占位文本（媒体拉取是 follow-up） | 降级为占位文本 | — |
 | 启用条件 | 配 `TRPC_WECOM_CORP_ID` | 配 `TRPC_WXKF_CORP_ID`+`KF_ACCOUNT` | 配 `TRPC_WECOMWS_ADDR` | **默认关闭** |
-| **实测状态** | 未实测；协议与官方文档逐项核对无发现 | **未实测，且实现与官方协议不符**（见 §10 第 14 条） | **已端到端实测**（2026-09-07：订阅、心跳、收发、审批外链路均验证） | 实测（全链路） |
+| **实测状态** | 未实测；协议与官方文档逐项核对无发现 | 未实测；inbound 已重写为官方 event+pull 协议 | **已端到端实测**（2026-09-07：订阅、心跳、收发、审批外链路均验证） | 实测（全链路） |
 
 > **实测状态说明**：`wecomws` 在真实企微智能机器人上完整走通（发现并修复了 5 个协议 bug：
 > 握手头大小写、订阅 ack 无 cmd、errcode 位置、心跳 req_id 前缀约定、回复必须是 stream 类型——
 > 明文 `text` 回复被平台以 errcode 40008 拒收）。`wecom` 的加解密、URL 验证、5s 应答、
 > `message/send`/`appchat/send`（均支持 markdown、内容 ≤2048B）、`media/get`、撤回事件
-> 逐项对照官方文档无发现，但**没有真实 corp 验证过**。`wxkf` 按官方文档核对后发现 inbound
-> 协议与实现假设不符，**当前实现收不到消息**，未实测。
+> 逐项对照官方文档无发现，但**没有真实 corp 验证过**。`wxkf` 初版曾误判 inbound 为「加密 JSON
+> 直推」，已重写为官方「`kf_msg_or_event` 事件回调 + `kf/sync_msg` 拉取」协议（游标持久化、
+> 幂等 TTL 加宽到 4 天），未经真实客服账号实测。
 
 四类通道统一走「异步消费 + 主动发送」：LLM 生成 P95 远超企微 5s 应答时限，且被动回复一次回调只能回
 一条，覆盖不了分段与审批等多轮场景。
@@ -299,7 +300,8 @@ token 预算 → 内层 Processor → 输出脱敏与拒绝词 → 审计落库�
 `worker_process_error_total`、`llm_tokens_total`、`gateway_rejected_total`、
 `send_rate_limited_total`、`audit_dropped_total`，队列采集器每 15s 产出 `stream_length`、
 `stream_pending`、`stream_oldest_pending_seconds`。`deploy/prometheus/alerts.yml` 提供 10 条告警
-规则（积压、pending 卡死、`senders-ws` 积压、死信、端到端 P95>15s、错误率>1%、投递成功率<99%）。
+规则（积压、pending 卡死、死信、端到端 P95、错误率、投递成功率等；逐条处置手册见
+`docs/operations.md` §4）。
 
 **审计**分两路：常规 `allow` 事件走内存缓冲异步批量写（满 100 条或 1 秒触发），不在关键路径上；
 `deny`/`review`/`review_timeout`/危险工具调用等关键决策**同步写入**，宁可增加毫秒级延迟也不接受丢失
@@ -338,17 +340,14 @@ LLM 生成时长而非 CPU，单节点 200 并发 session × 10 节点 = 2000 �
 月度归档控制在线量（保留 1 个月约 1.3TB）。HPA 按 Stream 积压扩容，CPU 仅兜底——负载大头是等 LLM 的
 IO，CPU 低不代表有余量。
 
-**部署**：最小可运行用 `docker-compose.yml`（pgvector:pg16、redis:7 映射宿主 6380、MinIO、Jaeger、
-Prometheus 五个依赖容器 + 本机 `./start.sh` 跑 all-in-one）。生产用 `deploy/k8s/`：ConfigMap + Secret
-（`*_REF` 引用，KMS bootstrap token 挂 `/etc/trpc/secrets`，漏挂即 CrashLoop）、gateway/worker/admin
-三个 Deployment、worker HPA（2–10 副本）、幂等 `db-init` Job，以及唯一的公网入口 `ingress.yaml`
-（gateway Service 为 ClusterIP，TLS 在 Ingress 终止，只放行回调路径）。详见 `deploy/k8s/README.md`。
+**部署**：最小可运行 = `docker-compose.yml` 起五个依赖容器 + 本机 `./start.sh` 跑 all-in-one；
+生产用 `deploy/k8s/`（三角色 Deployment、worker HPA 2–10 副本、幂等 db-init Job、Ingress 唯一公网
+入口，KMS bootstrap token 挂 `/etc/trpc/secrets`）。部署与回滚的操作手册见 `docs/operations.md`，
+K8s 清单说明见 `deploy/k8s/README.md`。
 
-**质量门禁**：CI（`.github/workflows/test.yml`）起真实 pgvector + Redis + MinIO 服务容器跑全量
-`go test -race`，门禁依次为 gofmt → `go vet` → golangci-lint v2.13.2（8 个 linter，含 `gosec`）→
-`go mod tidy` 干净度 → schema 初始化 → **zero skips**（任何 `--- SKIP` 即失败）→ 覆盖率 ≥85% →
-PR 增量覆盖率 ≥85%。覆盖率是**只升不降的棘轮**，当前实测 87.5%（0 skip）。基线以 CI 口径为准：
-本地不带依赖服务跑 `coverage.sh` 会因集成测试跳过而只报约 55%，那不是有效测量。
+**质量门禁**：CI（`.github/workflows/test.yml`）起真实 pgvector + Redis + MinIO 跑全量
+`go test -race`，zero-skip、总覆盖率 ≥85% 且只升不降、PR 增量 ≥85%（实测 87.5%）；
+检查项细节与本地自查方式见 `docs/development.md` §2。
 
 ## 9. 风险清单
 
@@ -378,14 +377,13 @@ PR 增量覆盖率 ≥85%。覆盖率是**只升不降的棘轮**，当前实测
   用于验证审批链路）；未接 MCP。README 目录树中的 `skill/`、`workspace/` 未交付，已从代码树移除。
 - **存储后端**实际只有 Redis + PostgreSQL + S3：session 支持 redis/pg，memory/knowledge/audit 仅 PG；
   MySQL/MongoDB/Qdrant/Milvus 未实现（Qdrant 仅接口预留）。
-- **通道**为 wecom/wxkf/wecomws/mock 四类，无 Telegram 与微信公众号；`wxkf` 仅处理 text，`wecomws`
-  入站媒体降级为占位文本。
-- **通道实测状态**（2026-09-07）：`wecomws` 已在真实企微智能机器人上端到端实测（收发、心跳、审批）；
-  `mock` 全链路实测；`wecom` 未实测（协议逐项对照官方文档无发现，需真实 corp 验证）；`wxkf` **未实测
-  且 inbound 与官方协议不符**——官方协议是「XML 事件回调（`kf_msg_or_event`）+ `kf/sync_msg` 拉取
-  消息（`external_userid`、`next_cursor` 需持久化）」，当前实现假设「JSON 加密直推、解密即消息体
-  （`openid`/`text`）」，该形态不存在，**收不到任何消息**，需重写 inbound；出站 `kf/send_msg` 与
-  文档一致。协议细节见 `docs/guide.md` §3。
+- **通道**为 wecom/wxkf/wecomws/mock 四类，无 Telegram 与微信公众号；`wxkf` 与 `wecomws`
+  的非文本入站均降级为占位文本（媒体内容拉取是 follow-up）。
+- **通道实测状态**（2026-09-08）：`wecomws` 已在真实企微智能机器人上端到端实测（收发、心跳、审批）；
+  `mock` 全链路实测；`wecom` 未实测（协议逐项对照官方文档无发现，需真实 corp 验证）；`wxkf` 未实测——
+  inbound 已重写为官方「`kf_msg_or_event` 事件回调 + `kf/sync_msg` 拉取」协议（`next_cursor` 经
+  Redis 持久化、三层幂等 TTL 加宽到 4 天以覆盖 3 天重拉窗口），需真实客服账号验证；出站
+  `kf/send_msg` 与文档一致。协议细节见 `docs/channels/wxkf.md`。
 - **出站发送密钥为通道级**：wecom/wxkf 发送侧 corpsecret 逐字段回退 env 全局配置（回调验签已按 binding
   隔离），同通道接多个 corp 时需补绑定级密钥；企微入站素材拉取仍用全局 token。
 - **预算窗口**为「首次使用后 48h 滑动窗」而非自然日，消息粒度前置拦截、run 中无中断点；Allow/Record
@@ -397,14 +395,25 @@ PR 增量覆盖率 ≥85%。覆盖率是**只升不降的棘轮**，当前实测
 
 ## 11. 索引
 
+阅读顺序建议：**新接触项目**按 `quickstart` → `guide` → `design`（跑通 → 会用 → 懂原理）；
+**接入 IM 通道**直接看 `channels/` 下对应通道的接入文档；**运维与上线**看 `operations`。
+
 | 内容 | 位置 |
 |---|---|
 | **第一次使用：跑通第一条消息 → 看到回复 → 建自己的租户** | `docs/quickstart.md` |
 | **使用与开发指南：危险工具审批、观测、接真实 IM、自定义工具与通道、按角色部署 + Admin API 速查 / 配置 / 排查 / 重置附录** | `docs/guide.md` |
 | 完整技术方案、选型论证、容量推算、协议细节 | `docs/design.md` |
+| 开发手册：开发环境、测试与 CI 门禁、提交规范（给改代码的人） | `docs/development.md` |
+| 环境变量全量参考：每个变量的默认值、必填性与作用（给部署/配置的人） | `docs/configuration.md` |
+| Admin API 完整参考：全部端点的请求体、响应结构、错误码（给写管理端/运维脚本的人） | `docs/api.md` |
+| 通道接入·企业微信自建应用（webhook）：密钥、回调 URL、实测状态 | `docs/channels/wecom.md` |
+| 通道接入·微信客服：event+pull 协议、cursor 管理、48h 窗口 | `docs/channels/wxkf.md` |
+| 通道接入·企微智能机器人（WebSocket）：免公网回调、bot 绑定、leader 机制 | `docs/channels/wecomws.md` |
+| 运维手册：部署形态、监控告警、值班排查、备份归档（给 SRE/值班） | `docs/operations.md` |
+| 安全说明：威胁模型、密钥管理、鉴权与网络边界、合规设计（给安全评审） | `docs/security.md` |
 | 数据库 schema 基线 / 演示数据 | `deploy/db/init.sql`、`deploy/db/seed.sql` |
 | 增量 schema 迁移（约定、CI、接管老库） | `deploy/db/migrations/README.md`、`deploy/db/migrate.sh` |
 | K8s 部署（db-init Job、HPA、Secret 挂载、Ingress） | `deploy/k8s/README.md`、`deploy/k8s/ingress.yaml` |
 | 告警规则 / 抓取配置 | `deploy/prometheus/alerts.yml`、`prometheus.yml` |
 | 本地依赖编排 | `docker-compose.yml` |
-| 快速开始与安全默认值 | 仓库根 `README.md` |
+| 作业题目原文（本平台的任务要求） | 仓库根 `README.md` |

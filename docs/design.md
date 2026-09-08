@@ -550,7 +550,7 @@ SET dedup:{channel}:{binding_id}:{msg_id} {request_id} NX EX 86400
 
 幂等分三层，职责不同：
 
-- 入口层（`dedup:` key）：只挡 IM 平台的重推。企微/微信的重发通常几秒内到达，但应答失败后的重推间隔可达分钟级（最多 3 次），TTL 取 24h 覆盖全部重试窗口，与出站 `sent:` 对齐。
+- 入口层（`dedup:` key）：只挡 IM 平台的重推。企微/微信的重发通常几秒内到达，但应答失败后的重推间隔可达分钟级（最多 3 次），TTL 取 24h 覆盖全部重试窗口，与出站 `sent:` 对齐。wxkf 例外：游标丢失时 `sync_msg` 会重拉 3 天历史，其三层幂等键 TTL 加宽到 4 天（`storage.DedupTTLWxkf`）。
 - 执行层（`done:{channel}:{binding_id}:{msg_id}` 标记 + `(session_id, event_seq)` 唯一约束兜底）：挡 Stream 重投。
   Worker 在回复入队出站后写 done 标记（24h）；重投消息（崩溃接管、Ack 丢失）命中标记直接跳过处理——
   因为重投会触发新的 LLM 运行并产生全新的事件 ID，事件唯一约束在这种场景下数学上永远拦不住，
@@ -716,7 +716,7 @@ env 配置的 `/{channel}/callback` 旧路径保留为单绑定默认。
 
 | 维度 | 企业微信 | 微信客服 |
 |---|---|---|
-| 回调协议 | 加密 XML，AES-256-CBC + msg_signature 验签 | 加密 JSON，同算法族但字段结构不同 |
+| 回调协议 | 加密 XML，AES-256-CBC + msg_signature 验签 | 加密 XML 事件通知（`kf_msg_or_event`，仅通知不含内容）+ `kf/sync_msg` 主动拉取 |
 | 应答约束 | 5 秒内应答，超时/失败重推最多 3 次 | 返回 200 即可，无业务应答时限，重推策略不同 |
 | 回复方式 | 被动回复（回调内返回加密包，每次回调仅可回一条，支持 text/image/news 等类型）+ 应用消息主动发送 | 仅客服消息接口主动发送，且只能在用户发消息后的 48h 窗口内 |
 | 会话形态 | 单聊 + 群会话（群机器人），群聊 session_key 用 `chatid` | 仅单聊 |
