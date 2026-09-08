@@ -8,7 +8,8 @@ import (
 )
 
 // SentMarker implements outbound idempotency (key
-// sent:{channel}:{binding}:{msg_id}, TTL DedupTTL): the sender checks before
+// sent:{channel}:{binding}:{msg_id}, TTL dedupTTLFor(channel)): the sender
+// checks before
 // calling the IM API and marks after a successful send, so a redelivery after
 // "sent but not acked" cannot push the same reply to the user twice. The
 // binding dimension keeps two tenants' replies apart — msg_id uniqueness is
@@ -38,7 +39,7 @@ func (m *SentMarker) IsSent(ctx context.Context, channel, binding, msgID string)
 // MarkSent records the reply as delivered; imMsgID is the message ID returned
 // by the IM platform (empty for channels without one).
 func (m *SentMarker) MarkSent(ctx context.Context, channel, binding, msgID, imMsgID string) error {
-	if err := m.rdb.Set(ctx, sentKey(channel, binding, msgID), imMsgID, DedupTTL).Err(); err != nil {
+	if err := m.rdb.Set(ctx, sentKey(channel, binding, msgID), imMsgID, dedupTTLFor(channel)).Err(); err != nil {
 		return fmt.Errorf("mark sent %s:%s:%s: %w", channel, binding, msgID, err)
 	}
 	return nil

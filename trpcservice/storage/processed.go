@@ -8,7 +8,8 @@ import (
 )
 
 // ProcessedMarker is the execution-layer idempotency: the
-// worker marks a message done:{channel}:{binding}:{msg_id} (24h) after its
+// worker marks a message done:{channel}:{binding}:{msg_id} (dedupTTLFor TTL)
+// after its
 // reply is enqueued. A Stream redelivery (reaper takeover after a crash, or a
 // delayed Ack) finds the marker and skips reprocessing — without it a
 // redelivered message would run the LLM again, journal duplicate events, and
@@ -38,11 +39,11 @@ func (m *ProcessedMarker) IsDone(ctx context.Context, channel, binding, msgID st
 	return n > 0, nil
 }
 
-// MarkDone records the message as fully processed (24h TTL, matching the
-// inbound dedup window).
+// MarkDone records the message as fully processed (per-channel TTL matching
+// the inbound dedup window).
 func (m *ProcessedMarker) MarkDone(ctx context.Context, channel, binding, msgID string) error {
 	key := doneKey(channel, binding, msgID)
-	if err := m.rdb.Set(ctx, key, "1", DedupTTL).Err(); err != nil {
+	if err := m.rdb.Set(ctx, key, "1", dedupTTLFor(channel)).Err(); err != nil {
 		return fmt.Errorf("done mark: %w", err)
 	}
 	return nil

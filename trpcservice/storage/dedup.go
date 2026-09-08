@@ -12,6 +12,24 @@ import (
 // arrive minutes apart, 24h covers all of them.
 const DedupTTL = 24 * time.Hour
 
+// DedupTTLWxkf widens the window for the wxkf channel ("wxkf",
+// channels/wxkf.ChannelName — the literal keeps storage free of a channel
+// dependency): a lost sync_msg cursor re-pulls up to three days of history,
+// and a 24h window would let messages older than 24h pass dedup again and be
+// re-answered to the user. Four days leaves one day of headroom over the
+// re-pull window.
+const DedupTTLWxkf = 4 * 24 * time.Hour
+
+// dedupTTLFor picks the idempotency-marker TTL for a channel. All three marker
+// kinds (dedup:, sent:, done:) share it: the wxkf re-pull path is only covered
+// if every layer outlives the three-day history window.
+func dedupTTLFor(channel string) time.Duration {
+	if channel == "wxkf" {
+		return DedupTTLWxkf
+	}
+	return DedupTTL
+}
+
 // Deduper implements inbound idempotency: SET dedup:{channel}:{binding}:{msg_id}
 // NX EX 24h. The key is shared across replicas, so IM redeliveries are dropped
 // no matter which gateway instance receives them. The binding dimension keeps
@@ -28,10 +46,11 @@ func NewDeduper(rdb *redis.Client) *Deduper {
 }
 
 // Check reports whether the message arrives for the first time. SETNX is
-// atomic, so concurrent duplicates of the same msg_id race safely.
+// atomic, so concurrent duplicates of the same msg_id race safely. The TTL is
+// per channel (dedupTTLFor).
 func (d *Deduper) Check(ctx context.Context, channel, binding, msgID string) (bool, error) {
 	key := dedupKey(channel, binding, msgID)
-	ok, err := d.rdb.SetNX(ctx, key, 1, DedupTTL).Result()
+	ok, err := d.rdb.SetNX(ctx, key, 1, dedupTTLFor(channel)).Result()
 	if err != nil {
 		return false, fmt.Errorf("dedup %s: %w", key, err)
 	}

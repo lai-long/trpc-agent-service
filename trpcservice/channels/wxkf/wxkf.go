@@ -5,7 +5,9 @@
 // Token to fetch it with. The messages themselves are pulled with
 // kf/sync_msg, paged by a server-side cursor the adapter persists per KF
 // account (CursorStore): a lost cursor re-pulls up to three days of history
-// and inbound dedup absorbs the repeats, while sharing none would
+// and inbound dedup absorbs the repeats — for this channel the dedup/sent/done
+// marker TTLs are widened to four days (storage.DedupTTLWxkf) so the idempotency
+// window outlives the re-pull window — while sharing none would
 // double-pull them live. The pull runs inside the callback handler, so the
 // callback answer doubles as the pull's failure signal — 5xx makes the
 // platform redeliver the event and the next pull resumes from the last

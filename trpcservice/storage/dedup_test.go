@@ -113,3 +113,64 @@ func TestDeduperBindingScope(t *testing.T) {
 		t.Fatalf("redelivery on the same binding must be dropped: dup=%v err=%v", dup, err)
 	}
 }
+
+// The wxkf re-pull window after a lost cursor is three days, so that channel's
+// dedup key must outlive it (four days, one day of headroom); other channels
+// keep the 24h redelivery window. sent: and done: markers share the same
+// per-channel TTL or the re-pulled history would be re-processed/re-answered.
+func TestDeduperChannelTTL(t *testing.T) {
+	rdb := redisOrSkip(t)
+	ctx := context.Background()
+	suffix := fmt.Sprintf("ttl-%d", time.Now().UnixNano())
+	t.Cleanup(func() {
+		rdb.Del(ctx, dedupKey("wxkf", "", suffix))
+		rdb.Del(ctx, dedupKey("wecom", "", suffix))
+		rdb.Del(ctx, sentKey("wxkf", "", suffix))
+		rdb.Del(ctx, doneKey("wxkf", "", suffix))
+	})
+
+	d := NewDeduper(rdb)
+	if _, err := d.Check(ctx, "wxkf", "", suffix); err != nil {
+		t.Fatal(err)
+	}
+	ttl, err := rdb.TTL(ctx, dedupKey("wxkf", "", suffix)).Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ttl <= DedupTTL || ttl > DedupTTLWxkf {
+		t.Errorf("wxkf dedup ttl = %v, want (%v, %v]", ttl, DedupTTL, DedupTTLWxkf)
+	}
+
+	if _, err := d.Check(ctx, "wecom", "", suffix); err != nil {
+		t.Fatal(err)
+	}
+	ttl, err = rdb.TTL(ctx, dedupKey("wecom", "", suffix)).Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ttl <= 0 || ttl > DedupTTL {
+		t.Errorf("other channels keep the 24h window, ttl = %v", ttl)
+	}
+
+	if err := NewSentMarker(rdb).MarkSent(ctx, "wxkf", "", suffix, "im-1"); err != nil {
+		t.Fatal(err)
+	}
+	ttl, err = rdb.TTL(ctx, sentKey("wxkf", "", suffix)).Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ttl <= DedupTTL || ttl > DedupTTLWxkf {
+		t.Errorf("wxkf sent marker ttl = %v, want (%v, %v]", ttl, DedupTTL, DedupTTLWxkf)
+	}
+
+	if err := NewProcessedMarker(rdb).MarkDone(ctx, "wxkf", "", suffix); err != nil {
+		t.Fatal(err)
+	}
+	ttl, err = rdb.TTL(ctx, doneKey("wxkf", "", suffix)).Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ttl <= DedupTTL || ttl > DedupTTLWxkf {
+		t.Errorf("wxkf done marker ttl = %v, want (%v, %v]", ttl, DedupTTL, DedupTTLWxkf)
+	}
+}
