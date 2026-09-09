@@ -50,7 +50,7 @@ func (d BindingDispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ba, ok := ch.(channels.BindingAware)
 	if !ok {
 		// A channel without per-binding support keeps serving its
-		// env-configured legacy path only.
+		// env-configured callback path only.
 		http.Error(w, "channel does not support bindings", http.StatusNotFound)
 		return
 	}

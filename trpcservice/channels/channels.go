@@ -263,9 +263,7 @@ type BindingCredentials struct {
 // tenants, verifying each callback with the serving binding's own credentials.
 // The gateway dispatches /callback/{channel}/{binding_id} to the adapter;
 // the env-configured callback path stays mounted as the single-binding
-// default for deployments that have not moved to binding rows. The hardcoded
-// one-path-per-adapter model structurally limited the platform to one tenant
-// per channel.
+// default for deployments that have not moved to binding rows.
 type BindingAware interface {
 	// CallbackHandler returns the HTTP handler serving one binding's
 	// callbacks: GET answers the platform's URL-registration challenge, POST
@@ -288,8 +286,8 @@ type OutboundBinding struct {
 // BindingProvider answers binding-id → OutboundBinding for the outbound path.
 // Inbound credentials ride BindingCredentials through the dispatcher; a reply
 // only carries the BindingID, so the adapter resolves the row itself. A nil
-// provider keeps the adapter on its env-global identity — the legacy
-// single-binding deployment's path.
+// provider keeps the adapter on its env-global identity (the env-configured
+// single-binding default).
 type BindingProvider interface {
 	BindingByID(ctx context.Context, id string) (OutboundBinding, error)
 }

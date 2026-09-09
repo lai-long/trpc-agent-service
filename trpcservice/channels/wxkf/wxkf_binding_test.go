@@ -183,7 +183,7 @@ func TestSendBindingPartialConfigFallsBackPerField(t *testing.T) {
 	}
 }
 
-// An empty config keeps the legacy single-identity behavior.
+// An empty config keeps the env-global single-identity behavior.
 func TestSendEmptyBindingConfigUsesGlobalIdentity(t *testing.T) {
 	fake := newIdentityFake()
 	srv := httptest.NewServer(fake.handler())

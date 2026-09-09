@@ -28,8 +28,8 @@ func PublishInvalidation(ctx context.Context, rdb *redis.Client) error {
 }
 
 // DefaultCacheTTL bounds how long a snapshot is served before reloading.
-// The publish/rollback pub/sub invalidation arrives with the Admin API; until
-// then this TTL is the only refresh mechanism.
+// Pub/sub invalidation (PublishInvalidation) drops the cache on Admin API
+// writes; this TTL is the fallback refresh when a notification is lost.
 const DefaultCacheTTL = 30 * time.Second
 
 // DefaultReloadBackoff is how long a failed reload postpones the next attempt.

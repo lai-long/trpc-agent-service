@@ -198,9 +198,9 @@ func TestCallbackDuplicateVersusFailure(t *testing.T) {
 	}
 }
 
-// Non-text callbacks without retrievable content (video/location/link) used to
-// be acked and silently dropped; they now enter the pipeline as a placeholder
-// text so the agent can tell the user the type is unsupported.
+// Non-text callbacks without retrievable content (video/location/link) enter
+// the pipeline as a placeholder text so the agent can tell the user the type
+// is unsupported.
 func TestCallbackNonTextPlaceholder(t *testing.T) {
 	c := testChannel(t, "")
 	var got []channels.InboundMessage

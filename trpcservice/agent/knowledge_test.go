@@ -50,8 +50,8 @@ func docID(t *testing.T, s *agent.DocSource) string {
 }
 
 // The document ID is the pgvector upsert key, so it has to carry the tenant
-// scope: with the ID derived from name+content alone, two tenants ingesting
-// the same document landed on one row, and the second ingest rewrote the
+// scope: an ID derived from name+content alone would land two tenants
+// ingesting the same document on one row, the second ingest rewriting the
 // first's content, embedding and tenant_id.
 func TestDocSourceIDScopesByTenantAndApp(t *testing.T) {
 	doc := func(tenantID, appID, name, content string) *agent.DocSource {

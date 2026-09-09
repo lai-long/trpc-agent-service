@@ -194,9 +194,9 @@ func TestPGSessionUpdateStateAndDelete(t *testing.T) {
 	}
 }
 
-// Regression: session_event has a FK to session without ON DELETE CASCADE, so
-// deleting a session that already has events only works when the children go
-// first. An empty session hides the bug, hence this case.
+// session_event has a FK to session without ON DELETE CASCADE, so deleting a
+// session that already has events only works when the children go first. An
+// empty session would not exercise the constraint, hence this case.
 func TestPGSessionDeleteWithEvents(t *testing.T) {
 	svc, pool := pgSessionService(t)
 	ctx := context.Background()

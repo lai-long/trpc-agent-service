@@ -147,10 +147,11 @@ func TestSendErrorSurfaces(t *testing.T) {
 	}
 }
 
-// Refreshing an already-cached identity must reuse its LRU node: the old code
-// pushed a second node, so the list grew unboundedly and an eviction popping
-// the orphan deleted the LIVE token entry. Two refreshes of one identity keep
-// exactly one node, and evictions afterwards never drop the refreshed identity.
+// Refreshing an already-cached identity must reuse its LRU node: pushing a
+// second node would grow the list without a matching map entry, and an
+// eviction popping the orphan would delete the LIVE token entry. Two
+// refreshes of one identity keep exactly one node, and evictions afterwards
+// never drop the refreshed identity.
 func TestTokenRefreshReusesLRUNode(t *testing.T) {
 	fake := &scriptKfAPI{}
 	srv := httptest.NewServer(fake.handler())

@@ -86,7 +86,7 @@ type Config struct {
 	Media channels.MediaStore
 	// Bindings resolves the per-binding outbound identity (corp/agent/
 	// secret) at Send time; nil keeps every reply on the env-global identity
-	// above — the legacy single-binding deployment's path.
+	// above (the env-configured single-binding default).
 	Bindings channels.BindingProvider
 }
 
@@ -99,7 +99,8 @@ type Channel struct {
 	// media messages to a placeholder text.
 	media channels.MediaStore
 	// bindings resolves the outbound identity of a binding-scoped reply; nil
-	// (legacy single-binding deployment) keeps the env-global identity.
+	// keeps the env-global identity (the env-configured single-binding
+	// default).
 	bindings channels.BindingProvider
 
 	// crypts caches one WXBizMsgCrypt per credential set
@@ -137,8 +138,8 @@ type tokenEntry struct {
 
 // New creates the channel: the env callback token and AES key are resolved
 // and validated at startup (fail fast on misconfiguration). They remain the
-// single-binding default for the legacy /wecom/callback path; per-binding
-// credentials flow through CallbackHandler.
+// single-binding default for the env-configured /wecom/callback path;
+// per-binding credentials flow through CallbackHandler.
 func New(cfg Config, resolver config.SecretResolver) (*Channel, error) {
 	if cfg.CorpID == "" || cfg.AgentID == 0 {
 		return nil, fmt.Errorf("wecom: CorpID and AgentID are required")
@@ -169,8 +170,8 @@ func New(cfg Config, resolver config.SecretResolver) (*Channel, error) {
 // channel_binding.config: a binding whose replies must go out under its own
 // corp / self-built app carries them here. Every field falls back to the
 // env-global Config when absent, so an empty (or corp_id-only) config keeps
-// the legacy single-identity behavior. corp_id doubles as the inbound crypt
-// receiver id a callback verifies against.
+// the env-global single-identity behavior. corp_id doubles as the inbound
+// crypt receiver id a callback verifies against.
 type bindingConfig struct {
 	CorpID    string `json:"corp_id"`
 	AgentID   int    `json:"agent_id"`
@@ -204,7 +205,7 @@ type outboundID struct {
 
 // outboundIDFor resolves the identity for msg: the binding's own config when
 // the message is binding-scoped, field by field falling back to the
-// env-global identity (the legacy env path, and bindings that carry no
+// env-global identity (the env-configured default, and bindings that carry no
 // per-binding outbound config). An unresolvable binding or config fails the
 // send — replying under the global identity instead could deliver one
 // tenant's message as another corp's bot.
@@ -239,8 +240,8 @@ func (c *Channel) outboundIDFor(ctx context.Context, msg channels.OutboundMessag
 // keyed by the RESOLVED values (not the refs): rotation behind a ref
 // propagates within the secret resolver's cache TTL instead of living in a
 // ref-keyed cache until process restart. Empty refs fall back to the
-// env-configured single-binding default — the legacy path's privilege; the
-// dispatcher refuses binding-scoped callbacks with empty refs.
+// env-configured single-binding default — only the env path may rely on that
+// fallback; the dispatcher refuses binding-scoped callbacks with empty refs.
 func (c *Channel) cryptFor(corpID, tokenRef, aesKeyRef string) (*wxbizmsgcrypt.WXBizMsgCrypt, error) {
 	if corpID == "" {
 		corpID = c.cfg.CorpID
@@ -301,8 +302,8 @@ func (c *Channel) RegisterRoutes(mux *http.ServeMux, h channels.Handler) {
 // CallbackHandler implements channels.BindingAware. A binding-scoped callback
 // must verify under the binding's OWN credentials: empty refs are an error
 // here (the dispatcher answers 503), because falling back to the env-global
-// keys would let whoever holds them forge this tenant's callbacks. The
-// legacy env path passes its refs explicitly via RegisterRoutes.
+// keys would let whoever holds them forge this tenant's callbacks. The env
+// path passes its refs explicitly via RegisterRoutes.
 func (c *Channel) CallbackHandler(h channels.Handler, creds channels.BindingCredentials) (http.HandlerFunc, error) {
 	if creds.TokenRef == "" || creds.AESKeyRef == "" {
 		return nil, fmt.Errorf("wecom: binding %s lacks callback credentials", creds.BindingID)

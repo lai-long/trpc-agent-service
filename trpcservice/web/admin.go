@@ -388,7 +388,7 @@ func (a *AdminAPI) updateApp(w http.ResponseWriter, r *http.Request) {
 }
 
 // publishApp atomically switches the (tenant, name) published version: the
-// previously published version leaves published status and the target takes
+// currently published version leaves published status and the target takes
 // it, guarded by the partial unique index.
 func (a *AdminAPI) publishApp(w http.ResponseWriter, r *http.Request) {
 	before := a.rowJSON(r.Context(), "agent_app", "id", r.PathValue("id"))
@@ -542,7 +542,7 @@ func (a *AdminAPI) createBinding(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, msg)
 			return
 		}
-		// A legacy callback path is mounted once at startup under the
+		// The env-configured callback path is mounted once at startup under the
 		// env-global credentials, so a binding row carrying its own refs on
 		// that path would look authoritative while inbound verification
 		// never consults them. Own credentials must ride the auto-filled

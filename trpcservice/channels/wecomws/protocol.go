@@ -74,15 +74,14 @@ func pingFrame(reqID string) envelope {
 	return envelope{Cmd: cmdPing, Headers: frameHeaders{ReqID: reqID}}
 }
 
-// respondFrame builds the reply to one callback: the callback's req_id rides
-// the headers verbatim — the platform correlates a reply to its question by
-// it and rejects (or drops) mismatches. msgType doubles as the content key
-// ("markdown": {...} / "text": {...}).
-// respondFrame builds one aibot_respond_msg frame. The platform rejects a
-// plain "text" respond with errcode 40008 ("invalid message type") — the only
-// text-shaped reply it accepts is a stream segment, so every reply rides
-// msgtype "stream". Segments of one reply share streamID; only the last sets
-// finish, which is what makes the platform render the message as complete.
+// respondFrame builds one aibot_respond_msg frame replying to one callback:
+// the callback's req_id rides the headers verbatim — the platform correlates
+// a reply to its question by it and rejects (or drops) mismatches. The
+// platform rejects a plain "text" respond with errcode 40008 ("invalid
+// message type") — the only text-shaped reply it accepts is a stream segment,
+// so every reply rides msgtype "stream". Segments of one reply share
+// streamID; only the last sets finish, which is what makes the platform
+// render the message as complete.
 func respondFrame(reqID, streamID, content string, finish bool) (envelope, error) {
 	body, err := json.Marshal(map[string]any{
 		"msgtype": "stream",

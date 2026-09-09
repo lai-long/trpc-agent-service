@@ -266,7 +266,7 @@ func serve(role string) error {
 		// with the binding's own credential references, so each tenant's
 		// webhook verifies under its own token/AES key. Bindings created
 		// after startup become reachable on the next resolver refresh — no
-		// restart, no mux surgery. The legacy env-configured paths above stay
+		// restart, no mux surgery. The env-configured paths above stay
 		// mounted as the single-binding default.
 		if resolver != nil {
 			bindingDispatch := web.BindingDispatcher{
@@ -978,7 +978,7 @@ func buildSummarizer(ctx context.Context, cfg config.Config, secrets config.Secr
 // instanceID names this replica for consumer-group and lock-owner tokens.
 // The PID alone is not enough: a container runs its entrypoint as PID 1, so
 // every replica of the same image would share one name and the session lock
-// could no longer tell which replica holds a lease. Hostname separates
+// could not tell which replica holds a lease. Hostname separates
 // replicas (the pod name under k8s); the random fallback covers hosts that
 // have none, where several processes may also start at once.
 func instanceID() string {
@@ -1103,8 +1103,9 @@ func buildEmbedder(ctx context.Context, cfg config.Config, secrets config.Secret
 // buildKnowledge builds the pgvector-backed knowledge base when an
 // embeddings-capable endpoint is configured; otherwise it returns nil and the
 // agent runs without knowledge retrieval. It also kicks off the one-shot
-// re-key of pre-scoping legacy document IDs — every replica runs it, the pass
-// is idempotent and converges under concurrency.
+// agent.RekeyLegacyDocuments pass over document IDs written before tenant
+// scoping — every replica runs it; the pass is idempotent and converges
+// under concurrency.
 func buildKnowledge(ctx context.Context, cfg config.Config, secrets config.SecretResolver) *knowledge.BuiltinKnowledge {
 	emb, dim, err := buildEmbedder(ctx, cfg, secrets)
 	if err != nil {

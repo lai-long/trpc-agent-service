@@ -231,7 +231,7 @@ func TestTwoTenantCallbackRouting(t *testing.T) {
 }
 
 // legacyChannel implements channels.Channel without BindingAware: it keeps
-// serving its env-configured legacy path only, so a binding-style dispatch
+// serving its env-configured callback path only, so a binding-style dispatch
 // is a 404 rather than a silent fallback onto the env credentials.
 type legacyChannel struct{}
 

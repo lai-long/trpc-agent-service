@@ -670,8 +670,8 @@ func (usageFailProcessor) Process(_ context.Context, msg channels.InboundMessage
 }
 
 // A fresh dangerous-tool interception attaches a card to the confirmation
-// notice — for card-capable channels (wecom direct chats) — while the Text
-// fallback stays byte-identical to the pre-card notice.
+// notice for card-capable channels (wecom direct chats); channels without
+// cards read Text, which carries the complete confirmation notice.
 func TestGuardedSignalCreatedAttachesCard(t *testing.T) {
 	aud := &fakeAuditor{}
 	ap := NewApprover(nil, testRegistry(), 0)

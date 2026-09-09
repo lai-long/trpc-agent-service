@@ -225,7 +225,7 @@ func TestAdminLifecycle(t *testing.T) {
 		t.Fatalf("create binding: %d %v", code, out)
 	}
 	bindingID, _ = out["id"].(string)
-	// The legacy mount verifies under the env-global credentials, so a
+	// The env-configured mount verifies under the env-global credentials, so a
 	// binding naming its own refs there would store credentials inbound
 	// never consults.
 	code, _ = doJSON(t, mux, http.MethodPost, "/admin/apps/"+appV1+"/bindings",
@@ -640,7 +640,7 @@ func TestValidateWecomwsBinding(t *testing.T) {
 // A webhook_path no route is mounted on is invisible from the Admin API: the
 // create answers 201 and listBindings shows an active row, while every
 // callback the IM posts to that path 404s at the gateway mux. Only two shapes
-// are served — the adapter's own legacy mount, and the binding-scoped
+// are served — the adapter's own env-configured mount, and the binding-scoped
 // /callback/{channel}/{binding_id} whose last segment BindingDispatcher looks
 // up as a binding id, so it has to be the DB-generated one.
 func TestCreateBindingRejectsUnmountedWebhookPath(t *testing.T) {
@@ -678,7 +678,7 @@ func TestCreateBindingRejectsUnmountedWebhookPath(t *testing.T) {
 	}{
 		// The shape this rule exists for: plausible, pretty, unroutable.
 		{"pretty path", `{"channel":"wecom","webhook_path":"/wecom/tenant-a"}`},
-		// A legacy mount belongs to the channel that mounts it; the seeded
+		// An env-configured mount belongs to the channel that mounts it; the seeded
 		// wecom row would make this a 409 if the check ran after the insert.
 		{"another channel's mount", `{"channel":"mock","webhook_path":"/wecom/callback"}`},
 		// Mounted, but the dispatcher resolves the last segment as a binding
