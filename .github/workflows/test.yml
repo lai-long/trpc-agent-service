@@ -1,21 +1,29 @@
-# CI gate (review P0-4): the integration tests run against real services and
-# a run with skips > 0 or coverage below baseline fails. Skips are visible
-# failures here, not green shrugs — the platforms' core paths (PG session/
-# memory, stream redelivery, locks, migration, S3, admin) must execute.
+# CI gate: the integration tests run against real services and a run with
+# skips > 0 or coverage below baseline fails. Skips are visible failures
+# here, not green shrugs — the platform's core paths (PG session/memory,
+# stream redelivery, locks, migration, S3, admin) must execute.
 #
 # Gate inventory: gofmt, go vet, golangci-lint, go mod tidy cleanliness,
 # the full suite under -race, zero skips, total coverage floor, and (on PRs)
 # diff coverage of the changed lines.
 #
 # The vendored wxbizmsgcrypt module (Tencent's official callback crypto
-# library) is deliberately out of scope for vet/lint: patching it would
-# diverge from upstream.
+# library) is out of scope for every gate: it is a separate Go module, so
+# vet/lint/test never cross into it, and the gofmt gate excludes it
+# explicitly. Patching it would diverge from upstream.
 name: test
 
 on:
   push:
-    branches: [main]
+    branches: [main, 'feature/**']
   pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
@@ -70,7 +78,8 @@ jobs:
 
       - name: "Gate: gofmt"
         run: |
-          unformatted=$(gofmt -l .)
+          # wxbizmsgcrypt/ is a vendored module and out of scope (see header).
+          unformatted=$(gofmt -l . | grep -v '^wxbizmsgcrypt/' || true)
           if [ -n "$unformatted" ]; then
             echo "::error::files not gofmt-clean:"
             echo "$unformatted"
@@ -111,7 +120,7 @@ jobs:
         # any .up.sql so an empty migrations/ is not an error.
         run: |
           if ls deploy/db/migrations/*.up.sql >/dev/null 2>&1; then
-            go install -tags 'postgres' github.com/golang-migrate/migrate/v4/cmd/migrate@latest
+            go install -tags 'postgres' github.com/golang-migrate/migrate/v4/cmd/migrate@v4.19.1
             "$(go env GOPATH)/bin/migrate" -path deploy/db/migrations -database "$TRPC_TEST_PG_DSN" up
           else
             echo "no incremental migrations yet; the init.sql baseline is the whole schema"
