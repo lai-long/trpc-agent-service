@@ -240,7 +240,7 @@ user_id、内容类型、reply_token），差异收敛在适配器内部：
 | 连接方向 | IM 回调平台 | IM 回调平台 | **平台主动出站长连接** | 本地 HTTP |
 | 协议 | 加密 XML，AES-256-CBC + msg_signature（`wxbizmsgcrypt`） | XML 事件回调 + `kf/sync_msg` 拉取（见下方实测状态） | WS 帧，BotID/Secret 订阅鉴权 | 明文 JSON |
 | 应答约束 | **5 秒内应答**，重推 ≤3 次 | 返回 200 即可，无业务时限 | 无（且无平台重推） | — |
-| 回复方式 | `message/send`（单聊）/`appchat/send`（群聊） | `kf/send_msg`，48h 窗口内 | `aibot_respond_msg` **stream** 类型，须透传回调 `req_id` | 内存收件箱 |
+| 回复方式 | `message/send`（单聊，审批通知渲染 template_card 卡片）/`appchat/send`（群聊） | `kf/send_msg`，48h 窗口内 | `aibot_respond_msg` **stream** 类型，须透传回调 `req_id` | 内存收件箱 |
 | 会话形态 | 单聊 + 群聊 | 仅单聊 | 单聊 + 群聊 | 任意 |
 | 媒体 | 已支持（`media/get` → Artifact） | 非文本降级为占位文本（媒体拉取是 follow-up） | 降级为占位文本 | — |
 | 启用条件 | 配 `TRPC_WECOM_CORP_ID` | 配 `TRPC_WXKF_CORP_ID`+`KF_ACCOUNT` | 配 `TRPC_WECOMWS_ADDR` | **默认关闭** |
@@ -298,10 +298,14 @@ token 预算 → 内层 Processor → 输出脱敏与拒绝词 → 审计落库�
 **指标**（OTel + Prometheus exporter，带 `channel`/`tenant_id` 标签）：`im_inbound_total`、
 `im_dedup_dropped_total`、`im_outbound_total`、`im_end_to_end_duration`、`worker_process_duration`、
 `worker_process_error_total`、`llm_tokens_total`、`gateway_rejected_total`、
-`send_rate_limited_total`、`audit_dropped_total`，队列采集器每 15s 产出 `stream_length`、
-`stream_pending`、`stream_oldest_pending_seconds`。`deploy/prometheus/alerts.yml` 提供 10 条告警
-规则（积压、pending 卡死、死信、端到端 P95、错误率、投递成功率等；逐条处置手册见
-`docs/operations.md` §4）。
+`send_rate_limited_total`、`audit_dropped_total`，执行链路细分指标 `llm_call_duration`
+（模型调用耗时，tenant_id/model/result）、`tool_call_duration`（工具调用耗时，
+tenant_id/tool/result，经框架 tool/model Callbacks 埋点）、`session_store_duration`
+（Session 后端读写延迟，backend/op/result，存储装饰器埋点）、`llm_cost_usd_total`
+（每租户成本，tenant_id/model），队列采集器每 15s 产出 `stream_length`、
+`stream_pending`、`stream_oldest_pending_seconds`。`deploy/prometheus/alerts.yml` 提供 12 条告警
+规则（积压、pending 卡死、死信、端到端 P95、错误率、投递成功率、模型调用 P95、Session 后端
+错误率等；逐条处置手册见 `docs/operations.md` §4）。
 
 **审计**分两路：常规 `allow` 事件走内存缓冲异步批量写（满 100 条或 1 秒触发），不在关键路径上；
 `deny`/`review`/`review_timeout`/危险工具调用等关键决策**同步写入**，宁可增加毫秒级延迟也不接受丢失

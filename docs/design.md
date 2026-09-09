@@ -174,11 +174,11 @@ sequenceDiagram
   | `trpcservice/metrics` | OTel trace/metrics 初始化与通用埋点（复用框架 Telemetry Hooks） | 基于框架扩展点实现 |
   | `trpcservice/log` | 结构化日志，密钥脱敏中间件 | 新建 |
   | `cmd/trpc-service` | 进程入口：按启动参数以 gateway / worker / admin / all-in-one 角色启动 | 新建 |
+  | `trpcservice/storage` | Storage Adapter：Session/Memory/Knowledge/Artifact 四类框架接口的多后端实现（Redis/PG），含审计日志 PG 写入；租户级可配 | 新建，实现框架已有接口 |
+  | Guardrail 链 | 输入白名单/脱敏、输出预算/敏感词，产出审计事件 | 自建包装链（`agent.Guarded`）；审批拦截与模型/工具指标埋点挂框架 tool/model Callbacks 扩展点 |
 
   注：设计中的 `skill`（租户级能力包）与 `workspace`（Artifact 落盘中转）两个目录当前未交付实现，
   已从代码树移除；框架自带 skill 加载能力，需要时按 `llmagent` skill 扩展点接入即可。
-  | `trpcservice/storage` | Storage Adapter：Session/Memory/Knowledge/Artifact 四类框架接口的多后端实现（Redis/PG），含审计日志 PG 写入；租户级可配 | 新建，实现框架已有接口 |
-  | Guardrail 链 | 输入白名单/脱敏、输出预算/敏感词，产出审计事件 | 基于框架 Plugin/Guardrail 扩展点实现 |
 
 ## 4. 重点技术与选型
 
@@ -233,7 +233,7 @@ sequenceDiagram
 | 执行入口 | ① | `runner.Runner`（流式 Event、context 取消） | 无状态 Worker 调度、队列消费、并发控制 | `cmd` + `agent` |
 | Session/Memory/Knowledge/Artifact | ② | `session`/`memory`/`knowledge`/`artifact` 接口及多后端实现 | 租户级后端选择与路由、数据隔离、迁移 | `storage` |
 | Tool / MCP / Skill | ② | `tool`、MCP Tool、`skill` | 租户工具白名单、密钥注入、危险工具审批 | `tool`、`skill` |
-| 治理 Guardrail | ② | Plugin / Guardrail / Callbacks | 输入白名单与脱敏、输出预算与敏感词、审计事件产出 | `agent`（Guardrail 链） |
+| 治理 Guardrail | ②+③ | tool/model Callbacks（审批拦截、指标埋点） | Guardrail 包装链（`agent.Guarded`）自建：输入白名单与脱敏、输出预算与敏感词、审计事件产出 | `agent`（Guardrail 链） |
 | 服务化 | ② | `server/openai`、`server/agui`、`server/a2a` | 统一 Gateway（鉴权/路由/限流）、Admin API | `web` |
 | IM 接入 | ②+③ | OpenClaw Channel 模型（仅通道抽象） | 企微/微信客服适配器主体自建（验签/AES 加解密/5s 应答/主动发送），挂在 Channel 扩展点上；租户绑定 | `channels` |
 | 可观测 | ① | OpenTelemetry tracing / metrics Hooks | Gateway、队列、Guardrail 三处补 span；租户维度成本统计 | `metrics` |
@@ -756,7 +756,8 @@ env 配置的 `/{channel}/callback` 旧路径保留为单绑定默认。
 Guardrail 命中需审批的工具调用时走带内确认，不引入带外审批系统：
 
 1. Guardrail 拦截工具调用，当前执行轮次收尾：经 Outbound 向用户发送确认消息（工具名、
-   参数摘要、有效期），写入待审批记录（工具调用 ID + 截止时间），审计记 `decision=review`，
+   参数摘要、有效期；企微单聊渲染为 `template_card` 卡片，其余通道回退纯文本），写入待审批记录
+   （工具调用 ID + 截止时间），审计记 `decision=review`，
    随后释放会话锁——挂起期间不持锁，Worker 保持无状态。
    （实现注：待审批记录存 Redis `approval:{app_id}:{session_key}` 而非 `session.state`——键带 app 维度，两个租户的用户即使携带相同 `channel:user` 会话键也互不可见、互不可确认（跨租户越权回归测试覆盖）；同为节点共享
    持久化，但带原生 TTL、无需加载整个 session 即可读，且不占事件序列；语义等价。）
@@ -966,7 +967,7 @@ updateApp / publish 事务内）与 Worker 装配时双重校验——会话原�
 | 3 | 说明至少两种 IM 通道的接入差异，至少含微信或企微 | 5.3.1 通道差异对比表、第 3 节（Channel Adapter）、5.1.3 `channel_binding.config` 渠道专有字段 |
 | 4 | 说明至少三类后端的存储与同步策略 | 4.2 选型对比与一致性取舍总览表、第 3 节图例表、5.1.1 租户级后端策略 |
 | 5 | 完整消息链路时序说明，`trace_id` 贯穿 | 第 3 节时序图 |
-| 6 | 至少 8 个生产风险及缓解措施 | 第 8 节（9 条 + 回滚方案） |
+| 6 | 至少 8 个生产风险及缓解措施 | 第 8 节（12 条 + 回滚方案） |
 | 7 | 明确哪些能力复用 tRPC-Agent-Go、哪些需新增平台层模块 | 4.3 框架能力映射表 |
 
 ## 7. 时间规划与工作量

@@ -122,7 +122,7 @@ type Config struct {
 	// process cache (TRPC_SECRET_CACHE_TTL). KMSTokenRef's default names the
 	// bootstrap token file the deployed KMS sidecar reads, so a dropped env
 	// var still resolves.
-SecretResolverType string // TRPC_SECRET_RESOLVER
+	SecretResolverType string // TRPC_SECRET_RESOLVER
 	KMSEndpoint        string // TRPC_KMS_ENDPOINT
 	KMSTokenRef        string // TRPC_KMS_TOKEN_REF
 	SecretCacheTTL     string // TRPC_SECRET_CACHE_TTL
