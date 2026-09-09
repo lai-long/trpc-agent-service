@@ -34,7 +34,7 @@ webhook 与 WS 的根本取舍：**webhook 需要公网入口**，企微侧会�
 ## 3. 密钥文件与平台配置
 
 密钥不落库、不进 env 明文，只存**引用名**，文件名必须等于 `*_REF` 的值
-（机制见 [guide 附录 A](../guide.md#附录-a-配置与密钥机制)）：
+（机制见 [guide 附录 A](../guide.md#附录-a配置与密钥机制)）：
 
 ```bash
 echo -n '你的Token'            > data/secrets/wecom-token    # = TRPC_WECOM_TOKEN_REF 默认值

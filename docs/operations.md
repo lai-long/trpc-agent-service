@@ -1,7 +1,7 @@
 # 运维手册
 
 面向部署、发布、告警处置和故障排查。开发期日常命令（`make *`、`./start.sh`）见
-[guide 附录 D](./guide.md#附录-d-日常命令)；通道各自的错误码与日志关键字见
+[guide 附录 D](./guide.md#附录-d日常命令)；通道各自的错误码与日志关键字见
 [`channels/`](./channels/wecom.md) 下的三篇通道文档。
 
 | 章节 | 什么时候来看 |
@@ -275,11 +275,11 @@ grep -a 'send rejected' data/trpc-service.log | tail
 | 症状 | 原因 | 解法 |
 |---|---|---|
 | 启动日志 `metrics listener failed … address already in use` | 8082 被别的程序占用 | 加 `TRPC_METRICS_ADDR=127.0.0.1:8083`。服务不会崩，只是没指标 |
-| 一启动就刷 `worker … process … failed: unknown agent app: a1` / `tenant route inactive: tenant t1` | **Redis 里有集成测试残留消息**。Worker 串行消费，你的消息排在它们后面 | 见 [guide 附录 C](./guide.md#附录-c-重置开发环境) 重置，或 `XTRIM stream:inbound MAXLEN 0` |
+| 一启动就刷 `worker … process … failed: unknown agent app: a1` / `tenant route inactive: tenant t1` | **Redis 里有集成测试残留消息**。Worker 串行消费，你的消息排在它们后面 | 见 [guide 附录 C](./guide.md#附录-c重置开发环境) 重置，或 `XTRIM stream:inbound MAXLEN 0` |
 | `/callback/mock/{binding_id}` 返回 `unknown binding` | 库是用**旧版 `seed.sql`** 灌的（initdb.d 只在空卷首次启动时跑），后来新增的绑定行从没进过库 | 见 guide 附录 C 重置，或手工 INSERT 那条 binding |
 | `make test` 之后开发库多出一堆 `pgstore-…` 之类的租户、Redis 里多出队列消息 | `testenv.go` 的默认值就指向开发依赖：`TRPC_TEST_PG_DSN` 默认 = `TRPC_PG_DSN`（同一个 `trpc` 库），`TRPC_TEST_REDIS_ADDR` 默认 = `localhost:6380`（同一个 Redis）。CI 用全新 service container，所以只有本地会这样 | 给测试单独建库再跑：<br>`docker compose exec -T postgres psql -U trpc -d postgres -c 'CREATE DATABASE trpc_test'`<br>`docker compose exec -T postgres psql -U trpc -d trpc_test -v ON_ERROR_STOP=1 < deploy/db/init.sql`<br>`TRPC_TEST_PG_DSN='postgres://trpc:trpc-dev-only@localhost:5432/trpc_test?sslmode=disable' make test`<br>Redis 侧**没有等价开关**（配置只有 host:port，不支持 db index），队列残留只能按 guide 附录 C 清理或另起一个 Redis 实例 |
 | 进程启动即退出，日志说 admin token 相关 | `TRPC_ADMIN_TOKEN` 未设（fail-closed） | 本地用 `dev-insecure`，生产用真 token |
-| `resolve … no such file` 类错误 | `data/secrets/` 下缺对应引用名的文件 | 按 [guide 附录 A](./guide.md#附录-a-配置与密钥机制) 补齐，文件名必须与 `*_REF` 一致 |
+| `resolve … no such file` 类错误 | `data/secrets/` 下缺对应引用名的文件 | 按 [guide 附录 A](./guide.md#附录-a配置与密钥机制) 补齐，文件名必须与 `*_REF` 一致 |
 | 回复变成「服务繁忙请稍后再试」 | 模型超时（默认 60s）或报错，重试 1 次后降级 | 查日志里的 `ModelError`；确认 `data/secrets/deepseek-apikey` 有效、`TRPC_MODEL_NAME` 正确 |
 | 消息进了 `stream:deadletter` | 出站发送连续失败超过 5 次 | 见 §4 DeadLetterPresent |
 | PG 里查不到会话 | `TRPC_SESSION_BACKEND=redis`（默认） | 切 `postgres`，或按[快速开始](./quickstart.md)第 2 章末尾去 Redis 查 |

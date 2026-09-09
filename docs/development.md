@@ -30,7 +30,7 @@ PG 空卷首次启动时自动执行 `deploy/db/init.sql`（建表）和 `deploy
 ### 密钥文件
 
 服务配置只来自环境变量；**密钥一律走引用名 + 文件**（`data/secrets/<引用名>`，
-机制见 [guide.md 附录 A](./guide.md#附录-a-配置与密钥机制)）。本地最少需要一个模型密钥：
+机制见 [guide.md 附录 A](./guide.md#附录-a配置与密钥机制)）。本地最少需要一个模型密钥：
 
 ```bash
 mkdir -p data/secrets
@@ -93,7 +93,7 @@ TRPC_TEST_PG_DSN='postgres://trpc:trpc-dev-only@localhost:5432/trpc_test?sslmode
 ```
 
 Redis 侧没有 db index 开关（配置只有 host:port），队列残留按
-[guide.md 附录 C](./guide.md#附录-c-重置开发环境) 清理。
+[guide.md 附录 C](./guide.md#附录-c重置开发环境) 清理。
 
 ### CI 三道硬门禁（`.github/workflows/test.yml`）
 

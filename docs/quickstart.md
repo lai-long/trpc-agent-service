@@ -33,7 +33,7 @@ cd trpc-agent-service
 # ① 起依赖：pgvector(PG16) / redis(宿主 6380) / minio / jaeger / prometheus
 docker compose up -d
 
-# ② 放模型密钥（文件名必须叫这个，见 [指南附录 A](./guide.md#附录-a-配置与密钥机制)）
+# ② 放模型密钥（文件名必须叫这个，见 [指南附录 A](./guide.md#附录-a配置与密钥机制)）
 mkdir -p data/secrets
 echo -n 'sk-你的模型APIKey' > data/secrets/deepseek-apikey
 
