@@ -51,18 +51,6 @@ jobs:
           --health-interval 3s
           --health-timeout 3s
           --health-retries 10
-      minio:
-        image: minio/minio
-        env:
-          MINIO_ROOT_USER: trpc
-          MINIO_ROOT_PASSWORD: trpc-dev-only
-        ports:
-          - 9000:9000
-        options: >-
-          --health-cmd "mc ready local"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
     env:
       TRPC_TEST_PG_DSN: postgres://trpc:trpc-dev-only@localhost:5432/trpc?sslmode=disable
       TRPC_TEST_REDIS_ADDR: localhost:6379
@@ -105,6 +93,26 @@ jobs:
             echo "::error::go.mod/go.sum are not tidy - run 'go mod tidy'"
             exit 1
           fi
+
+      - name: Start MinIO
+        # The minio/minio image has no default start command and GitHub
+        # service containers cannot specify one, so MinIO runs as an explicit
+        # docker step instead of a job service. Readiness is probed from the
+        # runner (the image carries neither mc nor curl).
+        run: |
+          docker run -d --name minio -p 9000:9000 \
+            -e MINIO_ROOT_USER=trpc \
+            -e MINIO_ROOT_PASSWORD=trpc-dev-only \
+            minio/minio server /data
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:9000/minio/health/live >/dev/null; then
+              exit 0
+            fi
+            sleep 2
+          done
+          docker logs minio
+          echo "::error::MinIO did not become healthy within 60s"
+          exit 1
 
       - name: Init DB schema
         run: |
