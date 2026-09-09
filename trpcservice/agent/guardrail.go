@@ -312,6 +312,17 @@ func (g *Guarded) deliverSignal(ctx context.Context, span trace.Span, msg channe
 		g.denyOutput(span, msg, deniedWord, sig.ToolName)
 		return out
 	}
+	// Card-capable channels render the confirmation notice as a card; the rest
+	// read Text. Every "created" signal gets a card — including a redelivery
+	// re-hit (Fresh=false), where a duplicate card is harmless. The card is
+	// attached only AFTER the output filters, and its Desc reuses the filtered
+	// text verbatim: the raw tool arguments may embed sensitive words that
+	// redaction just stripped, and a desc built from sig.Args directly would
+	// smuggle them past the denylist. Conflict and timeout notices stay plain
+	// text — they carry no pending action to highlight.
+	if sig.Kind == "created" {
+		out.Card = &channels.Card{Title: "危险操作待确认", Desc: out.Text}
+	}
 	span.SetAttributes(attribute.String("decision", signalDecision(sig).decision))
 	g.syncAudit(msg, signalDecision(sig))
 	return out

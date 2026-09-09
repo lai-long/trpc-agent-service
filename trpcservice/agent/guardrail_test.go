@@ -668,3 +668,117 @@ func (usageFailProcessor) Process(_ context.Context, msg channels.InboundMessage
 	}
 	return out, &ModelError{Err: errors.New("upstream 502")}
 }
+
+// A fresh dangerous-tool interception attaches a card to the confirmation
+// notice — for card-capable channels (wecom direct chats) — while the Text
+// fallback stays byte-identical to the pre-card notice.
+func TestGuardedSignalCreatedAttachesCard(t *testing.T) {
+	aud := &fakeAuditor{}
+	ap := NewApprover(nil, testRegistry(), 0)
+	ap.setSignal(approvalScope{"test-app", "dm:mock:u1"}, Signal{
+		Kind: "created", ToolName: "op_a", Args: `{"x":"1"}`,
+		Deadline: time.Now().Add(5 * time.Minute), Fresh: true,
+	})
+	g := &Guarded{Inner: EchoProcessor{}, Approver: ap, Auditor: aud}
+	out, err := g.Process(context.Background(), testMsg("执行操作"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The Text fallback is the untouched confirmation notice.
+	if !strings.Contains(out.Text, "危险操作") || !strings.Contains(out.Text, "op_a") ||
+		!strings.Contains(out.Text, "确认") || !strings.Contains(out.Text, "拒绝") {
+		t.Fatalf("the text fallback must be the unchanged notice, got %q", out.Text)
+	}
+	if out.Card == nil {
+		t.Fatal("a created signal must attach a card")
+	}
+	if !strings.Contains(out.Card.Title, "危险操作") {
+		t.Fatalf("unexpected card title: %q", out.Card.Title)
+	}
+	// The desc reuses the filtered notice text: tool, args summary, deadline
+	// hint and the confirm/reject instruction all ride it.
+	if out.Card.Desc != out.Text {
+		t.Fatalf("the card desc must carry the filtered notice verbatim, got %q vs %q", out.Card.Desc, out.Text)
+	}
+	// The interception is still audited as a review, exactly once.
+	evs := aud.syncDecisions()
+	if len(evs) != 1 || evs[0].Decision != "review" || evs[0].ToolName != "op_a" {
+		t.Fatalf("want sync review for op_a, got %+v", evs)
+	}
+}
+
+// Conflict and timeout notices carry no pending action to highlight, so they
+// stay plain text.
+func TestGuardedSignalConflictAndTimeoutHaveNoCard(t *testing.T) {
+	for _, sig := range []Signal{
+		{Kind: "conflict", ToolName: "op_b", Pending: "op_a"},
+		{Kind: "timeout", ToolName: "op_a"},
+	} {
+		t.Run(sig.Kind, func(t *testing.T) {
+			ap := NewApprover(nil, testRegistry(), 0)
+			ap.setSignal(approvalScope{"test-app", "dm:mock:u1"}, sig)
+			g := &Guarded{Inner: EchoProcessor{}, Approver: ap}
+			out, err := g.Process(context.Background(), testMsg("执行操作"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if out.Card != nil {
+				t.Fatalf("a %s notice must not carry a card: %+v", sig.Kind, out.Card)
+			}
+			if out.Text == "" {
+				t.Fatalf("a %s notice must keep its text, got %q", sig.Kind, out.Text)
+			}
+		})
+	}
+}
+
+// The card desc must never smuggle content the output filters stripped: when
+// the notice trips the tenant denylist, the reply is the redacted denial and
+// no card is attached.
+func TestGuardedSignalCardDroppedOnOutputDeny(t *testing.T) {
+	aud := &fakeAuditor{}
+	ap := NewApprover(nil, testRegistry(), 0)
+	ap.setSignal(approvalScope{"test-app", "dm:mock:u1"}, Signal{
+		Kind: "created", ToolName: "op_a", Args: `{"x":"内部名单"}`,
+		Deadline: time.Now().Add(5 * time.Minute), Fresh: true,
+	})
+	g := &Guarded{
+		Inner: EchoProcessor{}, Approver: ap, Auditor: aud,
+		PolicyFor: policyStub(tenant.GuardrailPolicy{OutputDenyWords: []string{"内部"}}),
+	}
+	out, err := g.Process(context.Background(), testMsg("执行操作"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Text != outputDeniedReply {
+		t.Fatalf("the notice must trip the tenant denylist, got %q", out.Text)
+	}
+	if out.Card != nil {
+		t.Fatalf("a denied notice must not carry a card leaking the raw args: %+v", out.Card)
+	}
+}
+
+// The platform redaction also reaches the card: the desc reuses the filtered
+// text, so a phone number in the tool args is masked there too.
+func TestGuardedSignalCardDescIsRedacted(t *testing.T) {
+	aud := &fakeAuditor{}
+	ap := NewApprover(nil, testRegistry(), 0)
+	ap.setSignal(approvalScope{"test-app", "dm:mock:u1"}, Signal{
+		Kind: "created", ToolName: "op_a", Args: `{"x":"13800138000"}`,
+		Deadline: time.Now().Add(5 * time.Minute), Fresh: true,
+	})
+	g := &Guarded{
+		Inner: EchoProcessor{}, Approver: ap, Auditor: aud,
+		Output: []OutputChecker{RedactOutput()},
+	}
+	out, err := g.Process(context.Background(), testMsg("执行操作"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Card == nil {
+		t.Fatal("a created signal must attach a card")
+	}
+	if strings.Contains(out.Card.Desc, "13800138000") {
+		t.Fatalf("the phone number must be masked in the card desc too: %q", out.Card.Desc)
+	}
+}

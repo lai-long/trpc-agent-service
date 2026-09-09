@@ -88,6 +88,10 @@ curl -s -X POST $A/admin/apps/$APP/bindings -H "$H" -H 'Content-Type: applicatio
   在同一次 `Send` 内**串行**分段下发；中间段失败报 partial delivery，留待出站重试。
   单聊 `message/send` 带 `enable_duplicate_check=1`（30 分钟窗口），重试已发出的前缀段
   会被企微侧吸收，不会重复送达。
+- **卡片消息**：单聊回复可渲染 `template_card`（`card_type: text_notice`）——`OutboundMessage.Card`
+  非空且单聊时整卡一次发送（不参与分段），当前由危险操作待确认通知使用（`guardrail.go`），
+  卡片描述复用脱敏后的文案。群聊 `appchat/send` 不支持 template_card，自动回退纯文本；
+  其余通道始终用 `Text` 兜底，因此生产者必须始终填好 `Text`。
 - **应答时间窗**：回调签名不过期，平台侧防重放靠消息自带 `CreateTime`——偏离当前时间
   ±5 分钟（`channels.CallbackTimestampWindow`）的回调直接丢弃并 ack。
 - **消息类型**：text 正常进 LLM；image/voice/file 先经 `/cgi-bin/media/get` 拉素材落

@@ -68,6 +68,16 @@ func LooksMarkdown(s string) bool {
 	return false
 }
 
+// Card is a normalized rich-message card (WeCom template_card and friends).
+// It is an OPTIONAL rendering of a reply: Text must always carry the full
+// fallback content, because channels without card support (wxkf, wecomws,
+// group chats on wecom) deliver the text as-is.
+type Card struct {
+	Title string // card headline
+	Desc  string // secondary description under the title
+	URL   string // optional jump target; empty renders a non-clickable card
+}
+
 // OutboundMessage is a normalized outbound reply, produced by the Handler and
 // delivered through the Channel's Send.
 type OutboundMessage struct {
@@ -92,6 +102,11 @@ type OutboundMessage struct {
 	// TextType is the reply markup: "" or "markdown". Channels without
 	// markdown support (e.g. WeChat KF) downgrade via RenderPlain.
 	TextType string
+
+	// Card, when non-nil, asks card-capable channels to render the reply as a
+	// rich card (wecom direct chats → template_card). Every other channel and
+	// group chat falls back to Text, so producers MUST always fill Text too.
+	Card *Card
 
 	// ReceivedAt is the inbound callback's arrival time, carried through so
 	// the sender can record the end-to-end latency.

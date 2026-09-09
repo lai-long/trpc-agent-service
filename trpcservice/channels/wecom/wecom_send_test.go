@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
 )
@@ -18,6 +19,7 @@ type fakeWeComAPI struct {
 	tokenCalls  atomic.Int32
 	sendCalls   atomic.Int32
 	lastBodies  []string
+	groupBodies []string
 	failNextTok bool // answer the next send with errcode 40014 (expired token)
 }
 
@@ -45,9 +47,10 @@ func (f *fakeWeComAPI) handler() http.Handler {
 	})
 	mux.HandleFunc("/cgi-bin/appchat/send", func(w http.ResponseWriter, r *http.Request) {
 		f.sendCalls.Add(1)
-		var body map[string]any
+		var body json.RawMessage
 		_ = json.NewDecoder(r.Body).Decode(&body)
-		if body["chatid"] == nil {
+		f.groupBodies = append(f.groupBodies, string(body))
+		if !strings.Contains(string(body), `"chatid"`) {
 			_, _ = w.Write([]byte(`{"errcode":40013,"errmsg":"missing chatid"}`))
 			return
 		}
@@ -278,5 +281,255 @@ func TestSplitTextRespectsRuneBoundaries(t *testing.T) {
 	}
 	if strings.Join(segs, "") != s {
 		t.Fatal("segments must reassemble losslessly")
+	}
+}
+
+// A card reply to a direct chat goes out as one template_card (text_notice)
+// message; the URL turns it into a jump link (card_action type 1).
+func TestSendCardDirectChat(t *testing.T) {
+	fake := &fakeWeComAPI{}
+	srv := httptest.NewServer(fake.handler())
+	defer srv.Close()
+	c := testChannel(t, srv.URL)
+
+	err := c.Send(t.Context(), channels.OutboundMessage{
+		Channel: "wecom", MsgID: "1", UserID: "zhangsan",
+		Text: "兜底文案",
+		Card: &channels.Card{Title: "危险操作待确认", Desc: "工具：op_a", URL: "https://example.com/detail"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := fake.sendCalls.Load(); n != 1 {
+		t.Fatalf("a card must be one send, got %d", n)
+	}
+	body := fake.lastBodies[0]
+	var payload struct {
+		ToUser  string `json:"touser"`
+		MsgType string `json:"msgtype"`
+		AgentID int    `json:"agentid"`
+		Card    struct {
+			CardType  string `json:"card_type"`
+			MainTitle struct {
+				Title string `json:"title"`
+				Desc  string `json:"desc"`
+			} `json:"main_title"`
+			CardAction struct {
+				Type int    `json:"type"`
+				URL  string `json:"url"`
+			} `json:"card_action"`
+		} `json:"template_card"`
+	}
+	if err := json.Unmarshal([]byte(body), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.MsgType != "template_card" || payload.Card.CardType != "text_notice" {
+		t.Fatalf("want a text_notice template_card, got %s", body)
+	}
+	if payload.ToUser != "zhangsan" || payload.AgentID != 1000002 {
+		t.Fatalf("routing fields lost: %s", body)
+	}
+	if payload.Card.MainTitle.Title != "危险操作待确认" || payload.Card.MainTitle.Desc != "工具：op_a" {
+		t.Fatalf("main_title mismatch: %s", body)
+	}
+	if payload.Card.CardAction.Type != 1 || payload.Card.CardAction.URL != "https://example.com/detail" {
+		t.Fatalf("card_action mismatch: %s", body)
+	}
+	if !strings.Contains(body, `"enable_duplicate_check":1`) {
+		t.Fatalf("the card send must keep the platform duplicate check: %s", body)
+	}
+}
+
+// Without a URL the card is a plain notice: no card_action key at all.
+func TestSendCardWithoutURL(t *testing.T) {
+	fake := &fakeWeComAPI{}
+	srv := httptest.NewServer(fake.handler())
+	defer srv.Close()
+	c := testChannel(t, srv.URL)
+
+	err := c.Send(t.Context(), channels.OutboundMessage{
+		Channel: "wecom", MsgID: "1", UserID: "zhangsan",
+		Text: "兜底文案",
+		Card: &channels.Card{Title: "危险操作待确认", Desc: "工具：op_a"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := fake.lastBodies[0]
+	if !strings.Contains(body, `"msgtype":"template_card"`) {
+		t.Fatalf("want a template_card send, got %s", body)
+	}
+	if strings.Contains(body, "card_action") {
+		t.Fatalf("a URL-less card must not carry card_action: %s", body)
+	}
+}
+
+// A card is atomic: however long the fallback text is, the card goes out as a
+// single unsegmented send.
+func TestSendCardIsNotSplit(t *testing.T) {
+	fake := &fakeWeComAPI{}
+	srv := httptest.NewServer(fake.handler())
+	defer srv.Close()
+	c := testChannel(t, srv.URL)
+
+	long := strings.Repeat("汉", 1500) // 4500 bytes, would split into 3 text segments
+	err := c.Send(t.Context(), channels.OutboundMessage{
+		Channel: "wecom", MsgID: "1", UserID: "zhangsan",
+		Text: long,
+		Card: &channels.Card{Title: "危险操作待确认", Desc: "工具：op_a"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := fake.sendCalls.Load(); n != 1 {
+		t.Fatalf("a card must not be segmented, got %d sends", n)
+	}
+	if !strings.Contains(fake.lastBodies[0], `"msgtype":"template_card"`) {
+		t.Fatalf("want a template_card send, got %s", fake.lastBodies[0])
+	}
+}
+
+// appchat/send has no template_card: a card addressed to a group chat falls
+// back to the plain text payload, which is why producers must always fill Text.
+func TestSendCardGroupFallsBackToText(t *testing.T) {
+	fake := &fakeWeComAPI{}
+	srv := httptest.NewServer(fake.handler())
+	defer srv.Close()
+	c := testChannel(t, srv.URL)
+
+	err := c.Send(t.Context(), channels.OutboundMessage{
+		Channel: "wecom", MsgID: "1", ChatID: "roomA",
+		Text: "群兜底文案",
+		Card: &channels.Card{Title: "危险操作待确认", Desc: "工具：op_a"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := fake.sendCalls.Load(); n != 1 {
+		t.Fatalf("want 1 appchat send, got %d", n)
+	}
+	if len(fake.groupBodies) != 1 {
+		t.Fatalf("the group reply must ride appchat/send, got %d group sends", len(fake.groupBodies))
+	}
+	body := fake.groupBodies[0]
+	if !strings.Contains(body, `"msgtype":"text"`) || !strings.Contains(body, "群兜底文案") {
+		t.Fatalf("a group card must fall back to the text payload: %s", body)
+	}
+	if strings.Contains(body, "template_card") {
+		t.Fatalf("appchat/send must never carry a template_card: %s", body)
+	}
+}
+
+// A message without a Card is untouched by the card path: text msgtype, no
+// template_card key.
+func TestSendWithoutCardUnaffected(t *testing.T) {
+	fake := &fakeWeComAPI{}
+	srv := httptest.NewServer(fake.handler())
+	defer srv.Close()
+	c := testChannel(t, srv.URL)
+
+	if err := c.Send(t.Context(), channels.OutboundMessage{
+		Channel: "wecom", MsgID: "1", UserID: "zhangsan", Text: "你好",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	body := fake.lastBodies[0]
+	if !strings.Contains(body, `"msgtype":"text"`) || strings.Contains(body, "template_card") {
+		t.Fatalf("a card-less reply must stay a plain text send: %s", body)
+	}
+}
+
+// A direct-chat card renders without any text, so an empty fallback Text
+// (contract-violating input) must not silently drop the card.
+func TestSendCardWithEmptyText(t *testing.T) {
+	fake := &fakeWeComAPI{}
+	srv := httptest.NewServer(fake.handler())
+	defer srv.Close()
+	c := testChannel(t, srv.URL)
+
+	err := c.Send(t.Context(), channels.OutboundMessage{
+		Channel: "wecom", MsgID: "1", UserID: "zhangsan",
+		Card: &channels.Card{Title: "危险操作待确认", Desc: "工具：op_a"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := fake.sendCalls.Load(); n != 1 {
+		t.Fatalf("a direct-chat card with empty text must still be sent, got %d sends", n)
+	}
+	if !strings.Contains(fake.lastBodies[0], `"msgtype":"template_card"`) {
+		t.Fatalf("want a template_card send, got %s", fake.lastBodies[0])
+	}
+}
+
+// appchat/send has no template_card: a group-chat card falls back to the text
+// payload, so an empty Text must still skip the API like any empty reply.
+func TestSendCardGroupEmptyTextSkipped(t *testing.T) {
+	fake := &fakeWeComAPI{}
+	srv := httptest.NewServer(fake.handler())
+	defer srv.Close()
+	c := testChannel(t, srv.URL)
+
+	err := c.Send(t.Context(), channels.OutboundMessage{
+		Channel: "wecom", MsgID: "1", ChatID: "roomA",
+		Card: &channels.Card{Title: "危险操作待确认", Desc: "工具：op_a"},
+	})
+	if err != nil {
+		t.Fatalf("an empty group reply must succeed silently, got %v", err)
+	}
+	if n := fake.tokenCalls.Load(); n != 0 {
+		t.Fatalf("an empty group reply must not fetch a token, got %d fetches", n)
+	}
+	if n := fake.sendCalls.Load(); n != 0 {
+		t.Fatalf("an empty group reply must not hit the send API, got %d sends", n)
+	}
+}
+
+// template_card fields are byte-capped by the platform; cardPayload must
+// truncate title/desc on rune boundaries and drop an over-long URL.
+func TestCardPayloadTruncates(t *testing.T) {
+	card := &channels.Card{
+		Title: strings.Repeat("汉", 100), // 300 bytes > 128
+		Desc:  strings.Repeat("汉", 300), // 900 bytes > 512
+		URL:   "https://example.com/" + strings.Repeat("a", 2000),
+	}
+	payload := cardPayload(card)
+	mainTitle := payload["main_title"].(map[string]string)
+	if len(mainTitle["title"]) > maxCardTitleBytes {
+		t.Fatalf("title exceeds %d bytes: %d", maxCardTitleBytes, len(mainTitle["title"]))
+	}
+	if len(mainTitle["desc"]) > maxCardDescBytes {
+		t.Fatalf("desc exceeds %d bytes: %d", maxCardDescBytes, len(mainTitle["desc"]))
+	}
+	if !utf8.ValidString(mainTitle["title"]) || !utf8.ValidString(mainTitle["desc"]) {
+		t.Fatal("truncation must not split a UTF-8 sequence")
+	}
+	if !strings.HasPrefix(card.Title, mainTitle["title"]) || !strings.HasPrefix(card.Desc, mainTitle["desc"]) {
+		t.Fatal("truncated fields must be prefixes of the originals")
+	}
+	if _, ok := payload["card_action"]; ok {
+		t.Fatalf("an over-long URL must be dropped, not truncated: %v", payload["card_action"])
+	}
+}
+
+// A markdown TextType only steers the text path; a card still wins on a
+// direct chat.
+func TestSendCardMarkdownPrefersCard(t *testing.T) {
+	fake := &fakeWeComAPI{}
+	srv := httptest.NewServer(fake.handler())
+	defer srv.Close()
+	c := testChannel(t, srv.URL)
+
+	err := c.Send(t.Context(), channels.OutboundMessage{
+		Channel: "wecom", MsgID: "1", UserID: "zhangsan",
+		Text: "兜底文案", TextType: "markdown",
+		Card: &channels.Card{Title: "危险操作待确认", Desc: "工具：op_a"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := fake.lastBodies[0]
+	if !strings.Contains(body, `"msgtype":"template_card"`) || strings.Contains(body, `"markdown"`) {
+		t.Fatalf("a card must take priority over the markdown text path: %s", body)
 	}
 }

@@ -53,6 +53,15 @@ const defaultAPIBase = "https://qyapi.weixin.qq.com"
 // longer replies are split into sequential segments.
 const maxTextBytes = 2048
 
+// template_card field limits, in bytes. Over-long fields are rejected by the
+// platform with an errcode, which the sender would retry forever, so
+// cardPayload enforces the caps before sending.
+const (
+	maxCardTitleBytes = 128
+	maxCardDescBytes  = 512
+	maxCardURLBytes   = 1024
+)
+
 // tokenExpiryMargin refreshes the access token ahead of its stated TTL.
 const tokenExpiryMargin = 5 * time.Minute
 
@@ -600,14 +609,22 @@ func writeSuccess(w http.ResponseWriter) {
 // chats to appchat/send. Long texts are split into sequential segments within
 // this one call, so concurrent senders cannot interleave segments of the same
 // reply. An empty (whitespace-only) text is skipped without any API call.
+// A card reply to a direct chat goes out as ONE template_card message —
+// appchat/send has no template_card, so group chats keep the text segments.
 // message/send accepts no caller idempotency key, so duplicate suppression
 // relies on the sender's sent: marker window plus the platform's
 // touser+content duplicate check (see postMessage) — the latter also absorbs
 // the prefix segments of a retried mid-split failure.
 func (c *Channel) Send(ctx context.Context, msg channels.OutboundMessage) error {
 	// An empty reply carries nothing the platform accepts; sending it would
-	// surface as an errcode, so skip it quietly.
-	if strings.TrimSpace(msg.Text) == "" {
+	// surface as an errcode, so skip it quietly. A direct-chat card is the
+	// exception: the template_card renders without any text, so it is sent
+	// even when the fallback Text is empty. channels.Card still requires
+	// producers to always fill Text; this exemption only keeps the sender
+	// robust against contract-violating input. A group-chat card with an
+	// empty Text is NOT exempt — appchat/send would fall back to the empty
+	// text path and get rejected.
+	if strings.TrimSpace(msg.Text) == "" && (msg.Card == nil || msg.ChatID != "") {
 		plog.Debugf("wecom send: empty reply for msg %s skipped", msg.MsgID)
 		return nil
 	}
@@ -616,6 +633,11 @@ func (c *Channel) Send(ctx context.Context, msg channels.OutboundMessage) error 
 	id, err := c.outboundIDFor(ctx, msg)
 	if err != nil {
 		return err
+	}
+	// A card is an atomic unit: splitting it into 2048-byte text segments
+	// would destroy the rendering, so it skips the segmentation loop entirely.
+	if msg.Card != nil && msg.ChatID == "" {
+		return c.sendSegment(ctx, id, msg, msg.Text)
 	}
 	segments := splitText(msg.Text, maxTextBytes)
 	for i, seg := range segments {
@@ -656,7 +678,9 @@ func (c *Channel) sendSegment(ctx context.Context, id outboundID, msg channels.O
 
 // postMessage calls the send API and returns the platform errcode. Markdown
 // replies use the markdown msgtype (WeCom renders it; channels without
-// markdown downgrade upstream via channels.RenderPlain). agentID is the
+// markdown downgrade upstream via channels.RenderPlain). A Card on a direct
+// chat renders as a template_card (text_notice); appchat/send has no
+// template_card, so group chats always take the text path. agentID is the
 // resolved outbound identity's app, not necessarily the env-global one.
 func (c *Channel) postMessage(ctx context.Context, token string, agentID int, msg channels.OutboundMessage, text string) (int, error) {
 	msgType, contentKey := "text", "text"
@@ -665,14 +689,26 @@ func (c *Channel) postMessage(ctx context.Context, token string, agentID int, ms
 	}
 	var apiURL string
 	var payload map[string]any
-	if msg.ChatID != "" {
+	switch {
+	case msg.ChatID != "":
 		apiURL = c.cfg.APIBase + "/cgi-bin/appchat/send?access_token=" + url.QueryEscape(token)
 		payload = map[string]any{
 			"chatid":   msg.ChatID,
 			"msgtype":  msgType,
 			contentKey: map[string]string{"content": text},
 		}
-	} else {
+	case msg.Card != nil:
+		apiURL = c.cfg.APIBase + "/cgi-bin/message/send?access_token=" + url.QueryEscape(token)
+		payload = map[string]any{
+			"touser":        msg.UserID,
+			"msgtype":       "template_card",
+			"agentid":       agentID,
+			"template_card": cardPayload(msg.Card),
+			// Same duplicate-suppression rationale as the text path below.
+			"enable_duplicate_check":   1,
+			"duplicate_check_interval": 1800,
+		}
+	default:
 		apiURL = c.cfg.APIBase + "/cgi-bin/message/send?access_token=" + url.QueryEscape(token)
 		payload = map[string]any{
 			"touser":   msg.UserID,
@@ -714,6 +750,32 @@ func (c *Channel) postMessage(ctx context.Context, token string, agentID int, ms
 			zap.Int("errcode", result.ErrCode), zap.String("errmsg", result.ErrMsg))
 	}
 	return result.ErrCode, nil
+}
+
+// cardPayload builds the template_card (text_notice) body of a message/send
+// call. A URL turns the whole card into a jump link (card_action type 1);
+// without one the card is a plain notice. Title and desc are truncated to
+// their platform byte caps on rune boundaries; an over-long URL is dropped
+// rather than truncated — a cut URL almost never resolves, while a missing
+// one merely degrades the card to a plain notice, which the platform accepts.
+func cardPayload(card *channels.Card) map[string]any {
+	payload := map[string]any{
+		"card_type": "text_notice",
+		"main_title": map[string]string{
+			"title": truncateCardField(card.Title, maxCardTitleBytes),
+			"desc":  truncateCardField(card.Desc, maxCardDescBytes),
+		},
+	}
+	if card.URL != "" && len(card.URL) <= maxCardURLBytes {
+		payload["card_action"] = map[string]any{"type": 1, "url": card.URL}
+	}
+	return payload
+}
+
+// truncateCardField caps s at n bytes without splitting inside a UTF-8
+// sequence, reusing the first segment of splitText.
+func truncateCardField(s string, n int) string {
+	return splitText(s, n)[0]
 }
 
 // getAccessToken returns the cached token for one (corpID, secretRef)
