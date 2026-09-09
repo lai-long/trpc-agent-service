@@ -97,3 +97,25 @@ groups:
         labels: {severity: warning}
         annotations:
           summary: "gateway rejecting callbacks: reason={{ $labels.reason }}"
+
+      # Model call p95 beyond 20s per tenant/model: at that point the model,
+      # not the platform, is eating the 15s end-to-end budget on every slow
+      # request (the worker timeout is the only backstop left).
+      - alert: ModelCallSlow
+        expr: histogram_quantile(0.95, sum by (le, tenant_id, model) (rate(llm_call_duration_milliseconds_bucket[5m]))) > 20000
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "model {{ $labels.model }} p95 {{ $value }}ms for tenant {{ $labels.tenant_id }}"
+
+      # Session backend error rate above 1% per backend: history reads/writes
+      # are failing, which surfaces as lost context or failed runs. Grouped by
+      # backend so a low-traffic backend is not diluted by the global rate.
+      - alert: SessionStoreErrorRateHigh
+        expr: |
+          sum by (backend) (rate(session_store_duration_milliseconds_count{result="error"}[5m]))
+            / clamp_min(sum by (backend) (rate(session_store_duration_milliseconds_count[5m])), 1) > 0.01
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "session backend {{ $labels.backend }} error rate {{ $value }} > 1%"

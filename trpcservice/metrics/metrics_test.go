@@ -55,6 +55,10 @@ func TestInitMetrics(t *testing.T) {
 	EndToEndDuration.Record(ctx, 100)
 	GatewayRejectedTotal.Add(ctx, 1)
 	SendRateLimitedTotal.Add(ctx, 1)
+	LLMCallDuration.Record(ctx, 42)
+	ToolCallDuration.Record(ctx, 7)
+	SessionStoreDuration.Record(ctx, 3)
+	CostUSDTotal.Add(ctx, 0.5)
 
 	if got := gaugeOrCounter(t, "im_inbound_total", nil); got != 1 {
 		t.Fatalf("im_inbound_total = %v, want 1", got)
@@ -73,6 +77,13 @@ func TestInitMetrics(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "worker_process_duration") {
 		t.Fatal("/metrics must expose worker_process_duration")
+	}
+	for _, name := range []string{
+		"llm_call_duration", "tool_call_duration", "session_store_duration", "llm_cost_usd_total",
+	} {
+		if !strings.Contains(rec.Body.String(), name) {
+			t.Fatalf("/metrics must expose %s", name)
+		}
 	}
 }
 

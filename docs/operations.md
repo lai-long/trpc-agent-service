@@ -240,6 +240,23 @@ IM 投递成功率 <99%（分母只计真正发送的结果，跳过其他消费
 平台默认 `TRPC_GATEWAY_RATE_QPS`/`_BURST`（默认 50/100）；`backpressure` → 按
 StreamBacklogHigh 的处置走。被拒的消息由 IM 重推兜底，不是丢失。
 
+### ModelCallSlow（warning）
+
+模型调用 P95 >20s 持续 5 分钟，按 tenant_id/model 分组。**含义**：模型端在吃端到端
+15s 预算，worker 超时成了唯一兜底。**处置**：先看是该模型普遍慢还是单租户异常——
+模型端慢（上游负载/超时）就切换备用模型后端或降模型档位；单租户慢检查其提示词长度
+与工具调用轮次；确属正常长任务再调 `TRPC_MODEL_TIMEOUT`（默认 60s），但不要为了
+压告警而下调阈值。
+
+### SessionStoreErrorRateHigh（warning）
+
+Session 后端读写错误率 >1%，按 backend 分组（PG/Redis 各自计算，低流量后端不被
+全局稀释）。**含义**：会话历史读写在失败，表现为丢上下文或 run 失败。**处置**：按
+`backend` 标签定位是 PG 还是 Redis——PG 查连接池是否耗尽、实例是否故障切换；
+Redis 查连接与内存（OOM 会拒绝写）；错误会以 infra 错误的形式出现在
+`process .* failed` 日志里（`grep -a 'process .* failed' data/trpc-service.log`），
+对端恢复后告警自愈，已失败的请求由调用侧重试兜底。
+
 ---
 
 ## 5. 故障排查 runbook

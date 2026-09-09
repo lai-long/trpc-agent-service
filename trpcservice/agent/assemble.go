@@ -11,15 +11,20 @@ import (
 	"sync"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+	otelmetric "go.opentelemetry.io/otel/metric"
+	tagent "trpc.group/trpc-go/trpc-agent-go/agent"
 	"trpc.group/trpc-go/trpc-agent-go/artifact"
 	"trpc.group/trpc-go/trpc-agent-go/knowledge"
 	"trpc.group/trpc-go/trpc-agent-go/memory"
+	"trpc.group/trpc-go/trpc-agent-go/model"
 	"trpc.group/trpc-go/trpc-agent-go/session"
 	ttool "trpc.group/trpc-go/trpc-agent-go/tool"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/config"
 	plog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/metrics"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/storage"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tool"
@@ -380,7 +385,8 @@ func (a *Assembler) assemble(ctx context.Context, app tenant.AgentApp, t tenant.
 		Timeout:         a.cfg.Timeout,
 		Retries:         a.cfg.Retries,
 		Tools:           tools,
-		ToolCallbacks:   a.cfg.Callbacks,
+		ToolCallbacks:   toolTimingCallbacks(a.cfg.Callbacks, t.ID),
+		ModelCallbacks:  modelTimingCallbacks(t.ID, spec.Name),
 		MemoryService:   a.cfg.Memory,
 		Knowledge:       a.cfg.Knowledge,
 		KnowledgeFilter: filter,
@@ -478,4 +484,161 @@ func fingerprint(parts ...json.RawMessage) []byte {
 		out = append(out, p...)
 	}
 	return out
+}
+
+// timingStaleTTL bounds how long an unmatched callback start timestamp is
+// kept: a Before whose After never fires (the model call failed before any
+// response was produced, so the framework skips the After callback) would
+// otherwise accumulate one map entry per failed call forever. Ten minutes is
+// far past any per-run deadline (RunnerConfig.Timeout).
+const timingStaleTTL = 10 * time.Minute
+
+// callTimer hands a start timestamp from a Before callback to its After
+// counterpart. Starts are keyed per in-flight call and deleted on After, so
+// the map holds only in-flight calls plus the rare unmatched entries the
+// opportunistic sweep in begin has not reaped yet.
+type callTimer struct {
+	starts sync.Map // call key -> time.Time
+}
+
+func (t *callTimer) begin(key string) {
+	now := time.Now()
+	t.starts.Range(func(k, v any) bool {
+		if ts, ok := v.(time.Time); ok && now.Sub(ts) > timingStaleTTL {
+			t.starts.Delete(k)
+		}
+		return true
+	})
+	t.starts.Store(key, now)
+}
+
+// end reports the elapsed time for a begun call, false when the key is
+// unknown. Unknown means After without a matching Before — e.g. a second
+// After for a response stream that yielded several responses records only
+// once, and an approval-blocked tool call never began.
+func (t *callTimer) end(key string) (time.Duration, bool) {
+	v, ok := t.starts.LoadAndDelete(key)
+	if !ok {
+		return 0, false
+	}
+	ts, ok := v.(time.Time)
+	if !ok {
+		return 0, false
+	}
+	return time.Since(ts), true
+}
+
+// pending counts the in-flight (or not-yet-reaped) starts; tests use it to
+// assert the map drains back to zero.
+func (t *callTimer) pending() int {
+	n := 0
+	t.starts.Range(func(_, _ any) bool { n++; return true })
+	return n
+}
+
+// modelTimer measures per-call model latency (metrics.LLMCallDuration) for
+// one assembled runner; tenant and model are baked in at assembly time
+// because the callback context does not carry the tenant ID. Calls are keyed
+// by invocation ID: one invocation's tool loop runs its model calls
+// sequentially, so the key is never shared by overlapping calls. A Before
+// whose After never fires (the call failed before any response was produced)
+// leaves no duration point; its start entry is reaped by the sweep.
+type modelTimer struct {
+	tenantID string
+	model    string
+	starts   callTimer
+}
+
+func (t *modelTimer) before(ctx context.Context, _ *model.BeforeModelArgs) (*model.BeforeModelResult, error) {
+	inv, ok := tagent.InvocationFromContext(ctx)
+	if !ok || inv == nil {
+		return nil, nil
+	}
+	t.starts.begin(inv.InvocationID)
+	return nil, nil
+}
+
+func (t *modelTimer) after(ctx context.Context, args *model.AfterModelArgs) (*model.AfterModelResult, error) {
+	inv, ok := tagent.InvocationFromContext(ctx)
+	if !ok || inv == nil {
+		return nil, nil
+	}
+	elapsed, ok := t.starts.end(inv.InvocationID)
+	if !ok {
+		return nil, nil
+	}
+	metrics.LLMCallDuration.Record(ctx,
+		float64(elapsed)/float64(time.Millisecond),
+		callDurationAttrs(t.tenantID, "model", t.model, args.Error))
+	return nil, nil
+}
+
+// modelTimingCallbacks registers a modelTimer as the runner's model callbacks.
+func modelTimingCallbacks(tenantID, modelName string) *model.Callbacks {
+	t := &modelTimer{tenantID: tenantID, model: modelName}
+	return model.NewCallbacks().
+		RegisterBeforeModel(model.BeforeModelCallbackStructured(t.before)).
+		RegisterAfterModel(model.AfterModelCallbackStructured(t.after))
+}
+
+// toolTimer measures tool execution latency (metrics.ToolCallDuration) for
+// one assembled runner. Calls are keyed by ToolCallID, which the framework
+// guarantees to be unique per tool call issued by the model; an empty ID is
+// not timed — such calls would share one map key and overwrite each other's
+// start time.
+type toolTimer struct {
+	tenantID string
+	starts   callTimer
+}
+
+func (t *toolTimer) before(_ context.Context, args *ttool.BeforeToolArgs) (*ttool.BeforeToolResult, error) {
+	if args.ToolCallID == "" {
+		return nil, nil
+	}
+	t.starts.begin(args.ToolCallID)
+	return nil, nil
+}
+
+func (t *toolTimer) after(ctx context.Context, args *ttool.AfterToolArgs) (*ttool.AfterToolResult, error) {
+	elapsed, ok := t.starts.end(args.ToolCallID)
+	if !ok {
+		return nil, nil
+	}
+	metrics.ToolCallDuration.Record(ctx,
+		float64(elapsed)/float64(time.Millisecond),
+		callDurationAttrs(t.tenantID, "tool", args.ToolName, args.Error))
+	return nil, nil
+}
+
+// toolTimingCallbacks appends a toolTimer to the shared tool callbacks (which
+// carry the approval Approver's BeforeTool), cloned so the shared instance is
+// never mutated. The timing Before is appended AFTER the approver and always
+// returns (nil, nil): a blocked call's CustomResult short-circuits the Before
+// chain before the timer starts, so pass-through and interception semantics
+// are unchanged — and since the framework skips After on a Before
+// short-circuit, a blocked call has no duration point (by design: it never
+// executed).
+func toolTimingCallbacks(base *ttool.Callbacks, tenantID string) *ttool.Callbacks {
+	cbs := base.Clone()
+	if cbs == nil {
+		cbs = ttool.NewCallbacks()
+	}
+	t := &toolTimer{tenantID: tenantID}
+	return cbs.
+		RegisterBeforeTool(ttool.BeforeToolCallbackStructured(t.before)).
+		RegisterAfterTool(ttool.AfterToolCallbackStructured(t.after))
+}
+
+// callDurationAttrs tags a call-latency sample by tenant, the named subject
+// (model name or tool name under the given label key) and the result.
+func callDurationAttrs(tenantID, subjectKey, subject string, callErr error) otelmetric.MeasurementOption {
+	result := "ok"
+	if callErr != nil {
+		result = "error"
+	}
+	return otelmetric.WithAttributes(
+		attribute.String("tenant_id", tenantID),
+		attribute.String(subjectKey, subject),
+		attribute.String("result", result),
+	)
 }

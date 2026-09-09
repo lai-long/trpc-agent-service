@@ -1,6 +1,14 @@
 package agent
 
-import "sync/atomic"
+import (
+	"context"
+	"sync/atomic"
+
+	"go.opentelemetry.io/otel/attribute"
+	otelmetric "go.opentelemetry.io/otel/metric"
+
+	"github.com/liuzengh/trpc-agent-service/trpcservice/metrics"
+)
 
 // Model pricing for cost accounting (audit_log.cost). The table maps a model
 // name to USD per 1M tokens, [input, output]; it is process-wide static
@@ -22,4 +30,18 @@ func CostUSD(model string, promptTokens, completionTokens int) float64 {
 		return 0
 	}
 	return (float64(promptTokens)*price[0] + float64(completionTokens)*price[1]) / 1e6
+}
+
+// recordCostUSD meters one message's LLM spend (metrics.CostUSDTotal) from
+// the usage accumulated across all its attempts — a retried run is billed for
+// every attempt's tokens, whether the message finally succeeded or failed
+// terminally. Unknown models meter 0: TokensTotal already carries the raw
+// counts, so spend can be re-derived offline once a price appears in the
+// table.
+func recordCostUSD(ctx context.Context, tenantID, model string, promptTokens, completionTokens int) {
+	metrics.CostUSDTotal.Add(ctx, CostUSD(model, promptTokens, completionTokens),
+		otelmetric.WithAttributes(
+			attribute.String("tenant_id", tenantID),
+			attribute.String("model", model),
+		))
 }

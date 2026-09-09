@@ -367,7 +367,14 @@ func serve(role string) error {
 		// Storage migration executor: advances active
 		// migrations through backfilling → read switch → observation → done.
 		if pgPool != nil && len(sessByType) > 0 {
-			migrator := storage.NewMigrator(pgPool, rdb, sessByType,
+			// The migrator type-asserts the concrete *PGSessionService for its
+			// full-journal reads (storage/migrate.go), so it is handed the
+			// undecorated backends; its batch path is not latency-metered.
+			backends := make(map[string]session.Service, len(sessByType))
+			for typ, svc := range sessByType {
+				backends[typ] = storage.UnwrapSessionService(svc)
+			}
+			migrator := storage.NewMigrator(pgPool, rdb, backends,
 				parseDuration(cfg.MigrationObserve, 24*time.Hour))
 			g.Go(func() error { migrator.Run(gctx); return nil })
 		}
@@ -782,13 +789,20 @@ func buildSessionServices(ctx context.Context, cfg config.Config, pgPool *pgxpoo
 	if err != nil {
 		return nil, "", fmt.Errorf("redis session service: %w", err)
 	}
-	byType["redis"] = rs
+	// Each backend is wrapped with per-op latency metrics at creation, so the
+	// assembler's migration fanout composes already-metered services and
+	// per-backend attribution survives a migration. The migrator itself gets
+	// the undecorated services (see its construction below).
+	byType["redis"] = &storage.MetricsSessionService{Backend: "redis", Inner: rs}
 	if pgPool != nil {
 		var sessOpts []storage.PGSessionOption
 		if sm := buildSummarizer(ctx, cfg, secrets); sm != nil {
 			sessOpts = append(sessOpts, storage.WithSummarizer(sm))
 		}
-		byType["postgres"] = storage.NewPGSessionService(pgPool, sessOpts...)
+		byType["postgres"] = &storage.MetricsSessionService{
+			Backend: "postgres",
+			Inner:   storage.NewPGSessionService(pgPool, sessOpts...),
+		}
 	} else if cfg.SessionBackend == "postgres" {
 		plog.Warnf("TRPC_SESSION_BACKEND=postgres but PG is unreachable, defaulting to redis")
 	}

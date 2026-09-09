@@ -64,6 +64,18 @@ var (
 	// AuditDroppedTotal counts audit events lost (queue overload, rows the
 	// schema rejected): a non-zero rate means the compliance trail has holes.
 	AuditDroppedTotal otelmetric.Int64Counter
+	// LLMCallDuration is one model call's latency by result (ok / error),
+	// measured between the framework's before/after model callbacks.
+	LLMCallDuration otelmetric.Float64Histogram
+	// ToolCallDuration is one tool execution's latency by result (ok / error),
+	// measured between the framework's before/after tool callbacks.
+	ToolCallDuration otelmetric.Float64Histogram
+	// SessionStoreDuration is the session backend's latency per operation by
+	// result (ok / error).
+	SessionStoreDuration otelmetric.Float64Histogram
+	// CostUSDTotal counts per-tenant LLM spend in USD by model (the priced
+	// counterpart of TokensTotal).
+	CostUSDTotal otelmetric.Float64Counter
 )
 
 func init() {
@@ -99,6 +111,21 @@ func init() {
 		panic(err)
 	}
 	if AuditDroppedTotal, err = meter.Int64Counter("audit_dropped_total"); err != nil {
+		panic(err)
+	}
+	if LLMCallDuration, err = meter.Float64Histogram("llm_call_duration",
+		otelmetric.WithUnit("ms")); err != nil {
+		panic(err)
+	}
+	if ToolCallDuration, err = meter.Float64Histogram("tool_call_duration",
+		otelmetric.WithUnit("ms")); err != nil {
+		panic(err)
+	}
+	if SessionStoreDuration, err = meter.Float64Histogram("session_store_duration",
+		otelmetric.WithUnit("ms")); err != nil {
+		panic(err)
+	}
+	if CostUSDTotal, err = meter.Float64Counter("llm_cost_usd_total"); err != nil {
 		panic(err)
 	}
 }

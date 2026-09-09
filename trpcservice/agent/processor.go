@@ -65,6 +65,9 @@ type RunnerConfig struct {
 	// guardrail's dangerous-tool interception into the agent.
 	Tools         []tool.Tool
 	ToolCallbacks *tool.Callbacks
+	// ModelCallbacks, when set, hooks per-call model latency timing into the
+	// agent (assembled per app with the tenant/model labels baked in).
+	ModelCallbacks *model.Callbacks
 	// MemoryService, when set, is injected into invocations (the memory tools
 	// resolve it from context) and its tool set joins the agent's tools.
 	MemoryService memory.Service
@@ -104,6 +107,9 @@ func NewRunnerProcessor(cfg RunnerConfig) *RunnerProcessor {
 	}
 	if cfg.ToolCallbacks != nil {
 		opts = append(opts, llmagent.WithToolCallbacks(cfg.ToolCallbacks))
+	}
+	if cfg.ModelCallbacks != nil {
+		opts = append(opts, llmagent.WithModelCallbacks(cfg.ModelCallbacks))
 	}
 	if cfg.Knowledge != nil {
 		opts = append(opts, llmagent.WithKnowledge(cfg.Knowledge))
@@ -178,6 +184,10 @@ func (p *RunnerProcessor) Process(ctx context.Context, msg channels.InboundMessa
 			if channels.LooksMarkdown(reply) {
 				out.TextType = channels.TextTypeMarkdown
 			}
+			// Cost is metered once per message, from the usage accumulated
+			// across every attempt; the terminal-failure path below does the
+			// same for a message that never succeeded.
+			recordCostUSD(ctx, msg.TenantID, p.model, out.PromptTokens, out.CompletionTokens)
 			zap.L().Debug("runner replied",
 				zap.String(plog.FieldSessionKey, msg.SessionKey),
 				zap.String(plog.FieldTraceID, msg.TraceID),
@@ -194,6 +204,12 @@ func (p *RunnerProcessor) Process(ctx context.Context, msg channels.InboundMessa
 			// it raw so the message stays pending for redelivery.
 			return out, ctx.Err()
 		}
+	}
+	// Terminal failure: TokensTotal already counted every attempt's tokens,
+	// so meter the spend once from the accumulated usage too — otherwise
+	// retried-then-failed messages would understate llm_cost_usd_total.
+	if out.PromptTokens > 0 || out.CompletionTokens > 0 {
+		recordCostUSD(ctx, msg.TenantID, p.model, out.PromptTokens, out.CompletionTokens)
 	}
 	return out, &ModelError{Err: lastErr}
 }

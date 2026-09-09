@@ -291,6 +291,9 @@ func TestBuildSessionServicesWithoutPG(t *testing.T) {
 	if len(byType) != 1 {
 		t.Fatalf("expected only the redis backend, got %v", byType)
 	}
+	if _, ok := byType["redis"].(*storage.MetricsSessionService); !ok {
+		t.Fatalf("session services must be latency-metered, got %T", byType["redis"])
+	}
 	if def != "redis" {
 		t.Fatalf("unavailable postgres backend must default to redis, got %q", def)
 	}
@@ -327,6 +330,18 @@ func TestBuildSessionServicesWithPG(t *testing.T) {
 	}
 	if _, ok := byType["postgres"]; !ok {
 		t.Fatal("postgres session service must be built with a live pool")
+	}
+	// Both backends are metered, and the decorator unwraps back to the
+	// concrete service the migrator type-asserts.
+	pgWrapped, ok := byType["postgres"].(*storage.MetricsSessionService)
+	if !ok {
+		t.Fatalf("session services must be latency-metered, got %T", byType["postgres"])
+	}
+	if pgWrapped.Backend != "postgres" {
+		t.Fatalf("backend label = %q, want postgres", pgWrapped.Backend)
+	}
+	if _, ok := storage.UnwrapSessionService(pgWrapped).(*storage.PGSessionService); !ok {
+		t.Fatalf("unwrap must restore *PGSessionService, got %T", storage.UnwrapSessionService(pgWrapped))
 	}
 	if def != "postgres" {
 		t.Fatalf("default must follow TRPC_SESSION_BACKEND, got %q", def)
